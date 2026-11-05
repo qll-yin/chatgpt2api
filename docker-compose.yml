@@ -10,7 +10,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: chatgpt2api:local
+    image: chatgpt2api:latest
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
