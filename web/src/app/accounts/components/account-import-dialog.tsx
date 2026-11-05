@@ -61,6 +61,41 @@ function splitTokens(value: string) {
     .filter(Boolean);
 }
 
+// 代理分隔符。四连横线而不是单横线：access_token 是 JWT（base64url），
+// 字符集只有 A-Za-z0-9-_，单横线会和 base64url 里的 '-' 撞车；
+// 四连横线在 JWT 和代理 URL（host:port / user:pass@host:port）里都不会出现。
+const PROXY_SEPARATOR = "----";
+
+type ParsedTokenLine = {
+  access_token: string;
+  proxy?: string;
+};
+
+/**
+ * 解析 Access Token 文本，每行支持两种形态：
+ *
+ *   eyJhbGciOi...                                  仅 token
+ *   eyJhbGciOi...----http://1.2.3.4:8080           token + 专属代理
+ *   eyJhbGciOi...----socks5://user:pass@5.6.7.8:1080
+ *
+ * 分隔符取**第一个** "----"，之后整段都当代理（代理里不会再有 "----"）。
+ * 末尾分隔符但没有代理内容 → 视为无代理，不报错。
+ */
+function parseTokenLines(value: string): ParsedTokenLine[] {
+  return splitTokens(value).map((line) => {
+    const index = line.indexOf(PROXY_SEPARATOR);
+    if (index < 0) {
+      return { access_token: line };
+    }
+    const accessToken = line.slice(0, index).trim();
+    const proxy = line.slice(index + PROXY_SEPARATOR.length).trim();
+    if (!accessToken || !proxy) {
+      return { access_token: line };
+    }
+    return { access_token: accessToken, proxy };
+  });
+}
+
 function getSessionAccessToken(value: unknown) {
   const token = (value as { accessToken?: unknown })?.accessToken;
   return typeof token === "string" ? token.trim() : "";
@@ -221,7 +256,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const submitTokens = async (tokens: string[], successText?: string, accountPayloads: AccountImportPayload[] = []) => {
     const normalizedTokens = tokens.map((item) => item.trim()).filter(Boolean);
 
-    if (normalizedTokens.length === 0) {
+    // 校验要看两边的总量：带代理的账号走 accountPayloads 分支，
+    // 如果这一批 token 全部都配了代理，normalizedTokens 会是空数组，
+    // 只看它会把"有内容"误判成"没填"。
+    if (normalizedTokens.length === 0 && accountPayloads.length === 0) {
       toast.error("请先提供至少一个可用 Token");
       return;
     }
@@ -252,7 +290,15 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   };
 
   const handleImportTokenText = async () => {
-    await submitTokens(splitTokens(tokenInput), "Access Token 导入完成");
+    const parsed = parseTokenLines(tokenInput);
+    // 带代理的行走 accounts 分支（后端 add_account_items 原样保留 proxy 字段），
+    // 不带代理的走 tokens 分支 —— 两条路最终都落到同一个号池。
+    const plainTokens = parsed.filter((item) => !item.proxy).map((item) => item.access_token);
+    const accountPayloads: AccountImportPayload[] = parsed
+      .filter((item) => item.proxy)
+      .map((item) => ({ access_token: item.access_token, proxy: item.proxy }));
+
+    await submitTokens(plainTokens, "Access Token 导入完成", accountPayloads);
   };
 
   // 起授权：拿 authorize URL，立刻在新窗口打开，方便用户登录
@@ -445,7 +491,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const renderMethodBody = () => {
     if (method === "token") {
-      const tokenCount = splitTokens(tokenInput).length;
+      const parsedLines = parseTokenLines(tokenInput);
+      const tokenCount = parsedLines.length;
+      const proxyCount = parsedLines.filter((item) => item.proxy).length;
 
       return (
         <div className="space-y-4">
@@ -458,22 +506,32 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               <ArrowLeft className="size-4" />
               返回导入方式
             </button>
-            <span className="text-xs text-stone-400">当前识别 {tokenCount} 个 Token</span>
+            <span className="text-xs text-stone-400">
+              当前识别 {tokenCount} 个 Token
+              {proxyCount > 0 ? `（其中 ${proxyCount} 个带专属代理）` : ""}
+            </span>
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium text-stone-700">Access Token 列表</label>
             <Textarea
-              placeholder="每行一个 Access Token..."
+              placeholder={"每行一个 Access Token，可用 ---- 追加该号专属代理\n例：eyJhbGciOi...----http://1.2.3.4:8080"}
               value={tokenInput}
               onChange={(event) => setTokenInput(event.target.value)}
               className="min-h-56 resize-none rounded-xl border-stone-200"
             />
+            <div className="text-xs leading-6 text-stone-500">
+              可选代理格式：http:// 或 socks5://，例如{" "}
+              <code className="rounded bg-stone-100 px-1">token----socks5://user:pass@host:1080</code>。
+              账号级代理优先级最高，会覆盖全局代理设置。
+            </div>
           </div>
           <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1">
                 <div className="text-sm font-medium text-stone-800">从 TXT 文件导入</div>
-                <div className="text-sm leading-6 text-stone-500">支持 `.txt`，文件内容也是一行一个 Token。</div>
+                <div className="text-sm leading-6 text-stone-500">
+                  支持 `.txt`，文件内容也是一行一个 Token，同样支持 ---- 追加代理。
+                </div>
               </div>
               <Button
                 type="button"
