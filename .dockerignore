@@ -10,5 +10,13 @@ __pycache__
 web/.next
 web/node_modules
 
+# ⚠️ 账号数据不要进镜像层 —— compose 里用 volume 挂载。
+#    进镜像层等于把凭证留在历史里（docker history 能看到）。
+data/
+
+# ⚠️ 本地真实配置含 auth-key / backup.secret_access_key，绝不能进镜像。
+#    镜像里用脱敏的 config.example.json（见 Dockerfile）。
+config.json
+
 assets
 README.md
