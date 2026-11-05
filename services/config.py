@@ -83,6 +83,7 @@ DEFAULT_THIRD_PARTY_APPS = {
 }
 
 DEFAULT_IMAGE_MODELS = [
+    "gpt-image-2.6",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
@@ -137,11 +138,27 @@ def _normalize_custom_image_models(value: object) -> list[str]:
 
 
 def _image_models_with_cache(cache: object, legacy_custom_models: object = None) -> list[str]:
+    """合并内置模型列表与上游拉取的缓存。
+
+    ⚠️ 内置模型**永远保留**，缓存只负责"追加"而不是"覆盖"。
+
+    为什么：上游目录不一定同步得这么快。官方刚发的新模型（比如
+    gpt-image-2.6）在 /backend-api/models 里可能还没出现，或者服务器上的
+    config.json 里存着**旧版本**写入的缓存（不含新模型）—— 如果让缓存
+    覆盖内置，用户就选不到刚加进去的新模型，只能等下一次刷新成功。
+    保留内置可以保证"代码里声明支持的模型"始终可选。
+
+    合并顺序：内置在前（保持稳定顺序），上游新发现的在后。
+    """
     cached = _normalize_image_model_list(cache)
-    if cached:
-        return cached
     legacy = _normalize_custom_image_models(legacy_custom_models)
-    return list(DEFAULT_IMAGE_MODELS) + legacy
+
+    models: list[str] = []
+    for item in [*DEFAULT_IMAGE_MODELS, *cached, *legacy]:
+        model = str(item or "").strip().lower()
+        if model and model not in models:
+            models.append(model)
+    return models
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:

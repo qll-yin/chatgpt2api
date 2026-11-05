@@ -94,6 +94,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(
                 store.image_models,
                 [
+                    "gpt-image-2.6",
                     "gpt-image-2.5-sunburst",
                     "gpt-image-2.5-flare",
                     "gpt-image-2",
@@ -108,6 +109,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertEqual(
                 store.get()["image_models"],
                 [
+                    "gpt-image-2.6",
                     "gpt-image-2.5-sunburst",
                     "gpt-image-2.5-flare",
                     "gpt-image-2",
@@ -132,7 +134,20 @@ class ConfigLoadingTests(unittest.TestCase):
                 "image_models_updated_at": "2026-09-20T12:00:00+00:00",
             })
 
-            self.assertEqual(saved["image_models"], ["gpt-image-2.5-sunburst", "gpt-image-2", "gpt-5-7"])
+            # 内置模型永远保留，缓存只做追加（见 _image_models_with_cache 的注释）
+            self.assertEqual(
+                saved["image_models"],
+                [
+                    "gpt-image-2.6",
+                    "gpt-image-2.5-sunburst",
+                    "gpt-image-2.5-flare",
+                    "gpt-image-2",
+                    "gpt-5-5-thinking",
+                    "gpt-5-5",
+                    "gpt-5-3",
+                    "gpt-5-7",
+                ],
+            )
             self.assertEqual(saved["image_models_source"], "upstream")
             self.assertEqual(saved["image_models_updated_at"], "2026-09-20T12:00:00+00:00")
 
