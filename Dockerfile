@@ -43,7 +43,10 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
-COPY config.json ./
+# 配置：镜像内只放脱敏的 config.example.json 作为兜底（真实 config.json
+# 已被 .gitignore 排除，且仓库里本来就没有这个文件）。
+# 运行时由 compose 挂载真实的 ./config.json 到 /app/config.json 覆盖。
+COPY config.example.json ./config.json
 COPY VERSION ./
 COPY api ./api
 COPY services ./services
