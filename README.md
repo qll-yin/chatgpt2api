@@ -17,19 +17,41 @@
 
 ## 快速开始
 
-### Docker 运行
+### Docker 运行（推荐）
+
+本仓库使用**本地源码构建**，不拉取预构建镜像（预构建镜像里的前端与本仓库代码不同源，本地改动不会生效）。
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/qll-yin/chatgpt2api.git
 cd chatgpt2api
-docker compose up -d
+
+# 1. 准备真实配置（仓库里只提交脱敏的 config.example.json）
+cp config.example.json config.json
+vi config.json          # 至少改掉 auth-key
+
+# 2. 构建并启动
+docker compose up -d --build
 ```
 
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`
-- 数据目录：`./data`
+- 数据目录：`./data`（compose 挂载到容器 `/app/data`）
+- 配置文件：`./config.json`（compose 挂载到容器 `/app/config.json`，**不进入镜像层**）
+
+> 镜像内已内置一份 `config.example.json` 作为兜底，容器即使没挂载配置也能启动；
+> 但**正式使用必须挂载自己的 `config.json`**，否则用的是默认 `auth-key`。
+
+**更新到新版本**：
+
+```bash
+cd chatgpt2api
+git pull
+docker compose up -d --build
+```
+
+`./data` 与 `./config.json` 都在宿主机上，`git pull` 与容器重建都不会丢数据。
 
 ### WARP / FlareSolverr 稳定代理部署
 
@@ -57,8 +79,9 @@ docker compose -f docker-compose.warp.yml up -d --build
 启动后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/qll-yin/chatgpt2api.git
 cd chatgpt2api
+cp config.example.json config.json   # 本地开发也需要一份 config.json
 uv sync
 uv run main.py
 ```
@@ -71,13 +94,11 @@ bun install
 bun run dev
 ```
 
-后续更新新版本：
+前端产物构建（Docker 镜像用的是 npm 锁文件，本地开发用 bun）：
 
 ```bash
-docker pull ghcr.io/basketikun/chatgpt2api:latest
-docker-compose down
-docker-compose up -d
-
+cd chatgpt2api/web
+bun install && bun run build
 ```
 
 ### 存储后端配置
@@ -105,18 +126,26 @@ environment:
 - 兼容 `POST /v1/images/edits` 图片编辑接口
 - 兼容面向图片场景的 `POST /v1/chat/completions`
 - 兼容面向图片场景的 `POST /v1/responses`
-- `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`
+- `GET /v1/models` 返回当前可用的图像模型列表（内置模型 + 上游目录自动拉取，见下）
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
 - 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
   `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
+### 图像模型目录
+
+- 内置模型：`gpt-image-2.6`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`
+- 后台设置页提供「刷新模型目录」：调用 `POST /api/image-models/refresh`，
+  内部请求 `GET chatgpt.com/backend-api/models` 拉取上游真实模型列表并缓存到 `config.json`
+- **内置模型永远保留**，上游拉取只做追加 —— 上游目录同步慢或服务器上存着旧缓存时，
+  代码里声明支持的模型（如 `gpt-image-2.6`）依然可选，不会被旧缓存覆盖
+- `gpt-image-2.5-flare` 直接透传官方 slug，不做 `auto` 映射；只有 `gpt-image-2` 会映射到 `gpt-5-5-thinking`
+
 ### 在线画图功能
 
 - 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
+- 模型下拉框与后端模型目录联动，刷新后可选到最新模型
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互
 - 本地保存图片会话历史，支持回看、删除和清空
@@ -137,9 +166,38 @@ environment:
 - 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
 
+### 账号导入与代理绑定
+
+Access Token 导入支持**一行一个 + 可选携带该号专属代理**：
+
+```text
+eyJhbGciOi...----http://1.2.3.4:8080
+eyJhbGciOi...----socks5://user:pass@5.6.7.8:1080
+eyJhbGciOi...                                    # 不带代理
+```
+
+- 分隔符取**第一个** `----`，其后整段作为该账号的专属代理（代理地址里不会再有 `----`）
+- 带代理的账号走**账号级代理**路径，优先级高于全局代理与稳定代理运行时
+- 典型用法：与注册机配合——注册时用什么 IP，就用什么 IP 跑后续请求，避免账号在多个 IP 间跳变触发风控
+
 ### 实验性 / 规划中
 
 - 详细状态说明见：[功能清单](./docs/feature-status.en.md)
+
+## 与 gpt-outlook-register 配合
+
+配套项目：[Regert888/gpt-outlook-register](https://github.com/Regert888/gpt-outlook-register)（批量注册 ChatGPT 账号的纯协议注册机）。
+
+典型工作流：
+
+1. 在注册机 WebUI 的「代理池」里配置代理（支持静态/动态类型、单代理注册配额上限、CF 拦截计数、IPv6 检测）
+2. 批量注册账号，导出格式选 **「access_token----代理」**
+3. 在本项目「号池管理 → 导入账号 → Access Token」里粘贴这批内容
+
+这样每个账号在**注册和使用阶段走同一个 IP**，避免账号在多个出口之间跳变触发风控。
+
+注册机还支持导出**「原始 session JSON」**（`/api/auth/session` 的完整响应，含 token 与 expires），
+适合需要自行接管鉴权流程的场景。
 
 ## 效果展示
 
@@ -172,7 +230,7 @@ Authorization: Bearer <auth-key>
 返回当前暴露的图片模型列表。
 
 ```bash
-curl http://localhost:8000/v1/models \
+curl http://localhost:3000/v1/models \
   -H "Authorization: Bearer <auth-key>"
 ```
 
@@ -182,7 +240,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` |
+| 返回模型 | 内置 `gpt-image-2.6`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`，以及上游目录自动拉取到的其他模型；实际以接口返回为准 |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>
@@ -196,7 +254,7 @@ curl http://localhost:8000/v1/models \
 OpenAI 兼容图片生成接口，用于文生图。
 
 ```bash
-curl http://localhost:8000/v1/images/generations \
+curl http://localhost:3000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
@@ -229,7 +287,7 @@ curl http://localhost:8000/v1/images/generations \
 OpenAI 兼容图片编辑接口，可上传图片文件，也可按官方 JSON 格式传入图片链接并生成编辑结果。
 
 ```bash
-curl http://localhost:8000/v1/images/edits \
+curl http://localhost:3000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -F "model=gpt-image-2" \
   -F "prompt=把这张图改成赛博朋克夜景风格" \
@@ -240,7 +298,7 @@ curl http://localhost:8000/v1/images/edits \
 也可以直接传图片 URL：
 
 ```bash
-curl http://localhost:8000/v1/images/edits \
+curl http://localhost:3000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -276,7 +334,7 @@ curl http://localhost:8000/v1/images/edits \
 面向文本、网页搜索与图片场景的 Chat Completions 兼容接口，不是完整通用聊天代理。
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
@@ -315,7 +373,7 @@ curl http://localhost:8000/v1/chat/completions \
 面向文本、网页搜索和图片生成工具调用的 Responses API 兼容接口，不是完整通用 Responses API 代理。
 
 ```bash
-curl http://localhost:8000/v1/responses \
+curl http://localhost:3000/v1/responses \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
@@ -348,14 +406,13 @@ curl http://localhost:8000/v1/responses \
 
 学 AI , 上 L 站：[LinuxDO](https://linux.do)
 
-## Contributors
+## 上游与致谢
 
-感谢所有为本项目做出贡献的开发者：
+本仓库基于 [basketikun/chatgpt2api](https://github.com/basketikun/chatgpt2api) 二次开发，
+上游 v1.9.4 的改动已完整合并。致谢原作者及所有贡献者：
 
 <a href="https://github.com/basketikun/chatgpt2api/graphs/contributors">
   <img alt="Contributors" src="https://contrib.rocks/image?repo=basketikun/chatgpt2api" />
 </a>
-
-## Star History
 
 [![Star History Chart](https://api.star-history.com/chart?repos=basketikun/chatgpt2api&type=date&legend=top-left)](https://www.star-history.com/?repos=basketikun%2Fchatgpt2api&type=date&legend=top-left)

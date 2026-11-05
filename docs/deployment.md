@@ -33,8 +33,12 @@ git --version
 适合不需要 WARP / FlareSolverr 清障的场景。
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/qll-yin/chatgpt2api.git
 cd chatgpt2api
+
+# 仓库里只提交脱敏的 config.example.json，先复制一份真实配置
+cp config.example.json config.json
+vi config.json          # 至少改掉 auth-key
 ```
 
 设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
@@ -47,7 +51,7 @@ environment:
 启动：
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 访问：
@@ -136,8 +140,9 @@ docker compose -f docker-compose.warp.yml down
 后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
+git clone https://github.com/qll-yin/chatgpt2api.git
 cd chatgpt2api
+cp config.example.json config.json
 uv sync
 uv run main.py
 ```
@@ -221,8 +226,7 @@ tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 
 ```bash
 git pull
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 ```
 
 查看状态：
@@ -291,7 +295,7 @@ git checkout <旧版本commit>
 普通 Docker 部署：
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 WARP / FlareSolverr 部署：
