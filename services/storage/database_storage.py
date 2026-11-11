@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from sqlalchemy import Column, String, Text, create_engine, Integer, text
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -93,27 +94,105 @@ class DatabaseStorageBackend(StorageBackend):
         source_key: str,
         target_key: str | None = None,
     ) -> None:
+        """整表覆盖写入。
+
+        历史实现是「DELETE 全表 → 逐条 INSERT」：号池几千个账号时，
+        每改一个号的 quota 就要删掉全部再全部插回去 —— 写放大 O(N)，
+        且期间表是空的（并发读会看到空号池）。
+
+        现在改为 **UPSERT（upsert）+ 差集删除**：
+        - 已存在的行 → ON CONFLICT DO UPDATE，只更新该行
+        - 新增的行 → INSERT
+        - 不在本次集合里的旧行 → 单独 DELETE
+        写入量与实际改动量成正比，不再随号池规模线性放大。
+        """
         session = self.Session()
         try:
-            session.query(model).delete()
+            key_col = target_key or source_key
+            incoming: dict[str, dict[str, Any]] = {}
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 key_value = str(item.get(source_key) or "").strip()
                 if not key_value:
                     continue
-                session.add(
-                    model(
-                        **{target_key or source_key: key_value},
-                        data=json.dumps(item, ensure_ascii=False),
-                    )
+                incoming[key_value] = item
+
+            if incoming:
+                payload = [
+                    {
+                        key_col: key_value,
+                        "data": json.dumps(item, ensure_ascii=False),
+                    }
+                    for key_value, item in incoming.items()
+                ]
+                if self._supports_upsert():
+                    self._upsert_many(session, model, payload, key_col)
+                else:
+                    # 不支持 UPSERT 的方言：退化为「先插已存在的，再补新的」
+                    existing = {
+                        str(getattr(row, key_col))
+                        for row in session.query(model).all()
+                    }
+                    for row in payload:
+                        if row[key_col] in existing:
+                            session.execute(
+                                sa_update(model)
+                                .where(getattr(model, key_col) == row[key_col])
+                                .values(data=row["data"])
+                            )
+                        else:
+                            session.add(model(**row))
+
+            # 删除本次集合之外的旧行（数量差集）
+            if incoming:
+                keep = list(incoming.keys())
+                session.query(model).filter(~getattr(model, key_col).in_(keep)).delete(
+                    synchronize_session=False
                 )
+            else:
+                session.query(model).delete()
+
             session.commit()
         except Exception as e:
             session.rollback()
             raise e
         finally:
             session.close()
+
+    def _supports_upsert(self) -> bool:
+        """当前方言是否支持 ON CONFLICT / ON DUPLICATE KEY。"""
+        return self.engine.dialect.name in {"postgresql", "sqlite", "mysql", "mariadb"}
+
+    def _upsert_many(
+        self,
+        session,
+        model: type[AccountModel] | type[AuthKeyModel],
+        payload: list[dict[str, Any]],
+        key_col: str,
+    ) -> None:
+        """批量 UPSERT（一条语句搞定整批，避免 N 次往返）。"""
+        dialect = self.engine.dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        elif dialect in {"mysql", "mariadb"}:
+            from sqlalchemy.dialects.mysql import insert as dialect_insert
+        else:
+            for row in payload:
+                session.add(model(**row))
+            return
+
+        stmt = dialect_insert(model).values(payload)
+        update_cols = {
+            "data": stmt.excluded["data"],
+        }
+        if dialect in {"mysql", "mariadb"}:
+            stmt = stmt.on_duplicate_key_update(**update_cols)
+        else:
+            stmt = stmt.on_conflict_do_update(index_elements=[key_col], set_=update_cols)
+        session.execute(stmt)
 
     def health_check(self) -> dict[str, Any]:
         """健康检查"""

@@ -7,7 +7,13 @@ from unittest import mock
 
 from PIL import Image
 
-from services.image_storage_service import ImageStorageService
+# ⚠️ 必须早于 services.* 的导入：把数据库指向临时库，
+# 否则图片索引会写进真实的 data/chatgpt2api.db 并跨测试污染。
+from test.db_fixture import reset_database_state, use_temp_database
+
+use_temp_database("chatgpt2api-test-storage-")
+
+from services.image_storage_service import ImageStorageService  # noqa: E402
 
 
 def png_bytes() -> bytes:
@@ -45,6 +51,8 @@ class ImageStorageServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # 每个用例从干净的表开始
+        reset_database_state()
         self.data_dir = Path(self.tmp.name)
         self.images_dir = self.data_dir / "images"
         self.settings = {

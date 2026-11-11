@@ -6,7 +6,13 @@ import time
 import unittest
 from pathlib import Path
 
-from services.image_task_service import ImageTaskService
+# ⚠️ 必须早于 services.* 的导入：把数据库指向临时库，
+# 否则测试会写进真实的 data/chatgpt2api.db 并互相污染。
+from test.db_fixture import reset_database_state, use_temp_database
+
+use_temp_database("chatgpt2api-test-tasks-")
+
+from services.image_task_service import ImageTaskService  # noqa: E402
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -26,6 +32,10 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def setUp(self):
+        # 每个用例从干净的表开始，避免相互污染
+        reset_database_state()
+
     def make_service(self, path: Path, handler=None) -> ImageTaskService:
         return ImageTaskService(
             path,
@@ -108,37 +118,31 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
 
     def test_startup_marks_unfinished_tasks_as_error(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "image_tasks.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "tasks": [
-                            {
-                                "id": "queued-task",
-                                "owner_id": "owner-1",
-                                "status": "queued",
-                                "mode": "generate",
-                                "model": "gpt-image-2",
-                                "created_at": "2099-01-01 00:00:00",
-                                "updated_at": "2099-01-01 00:00:00",
-                            },
-                            {
-                                "id": "running-task",
-                                "owner_id": "owner-1",
-                                "status": "running",
-                                "mode": "generate",
-                                "model": "gpt-image-2",
-                                "created_at": "2099-01-01 00:00:00",
-                                "updated_at": "2099-01-01 00:00:00",
-                            },
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
+        # 存储已从 JSON 文件迁到数据库：直接写入「未完成」的任务，
+        # 再构造一个服务实例，验证启动时把未完成任务标记为中断。
+        from services.storage import runtime_store as store
 
-            service = self.make_service(path)
+        store.upsert_image_task({
+            "owner_id": "owner-1",
+            "task_id": "queued-task",
+            "status": "queued",
+            "mode": "generate",
+            "model": "gpt-image-2",
+            "created_at": "2099-01-01 00:00:00",
+            "updated_at": "2099-01-01 00:00:00",
+        })
+        store.upsert_image_task({
+            "owner_id": "owner-1",
+            "task_id": "running-task",
+            "status": "running",
+            "mode": "generate",
+            "model": "gpt-image-2",
+            "created_at": "2099-01-01 00:00:00",
+            "updated_at": "2099-01-01 00:00:00",
+        })
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
             result = service.list_tasks(OWNER, ["queued-task", "running-task"])
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])

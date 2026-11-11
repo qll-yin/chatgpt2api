@@ -1,76 +1,48 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from services.storage import runtime_store as store
 
-from services.config import DATA_DIR
-
-TAGS_FILE = DATA_DIR / "image_tags.json"
-
-
-def _ensure_file() -> None:
-    TAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not TAGS_FILE.exists():
-        TAGS_FILE.write_text("{}", encoding="utf-8")
+# 标签存储：数据库（services/storage/runtime_store.py）。
+#
+# 旧实现用单个 JSON 文件存 {rel_path: [tag, ...]}：
+#   - 每次读写都是「读全文件 → 改 → 写全文件」，标签越多越慢
+#   - 按标签反查图片只能全量扫
+#
+# 现在用 (rel_path, tag) 复合主键的表：
+#   - 改某张图的标签 = 删该 rel 的行 + 插新行（同事务）
+#   - 按标签反查走 ix_image_tags_tag 索引
+#   - 标签总数几万个也只是索引扫描
 
 
 def load_tags() -> dict[str, list[str]]:
-    _ensure_file()
-    try:
-        data = json.loads(TAGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    """返回 {rel_path: [tag, ...]} 全量映射。
 
-
-def save_tags(data: dict[str, list[str]]) -> None:
-    _ensure_file()
-    TAGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    注意：这个接口是给「批量展示所有标签」用的，返回体天然是全量。
+    真正的按需查询应该用 `get_tags` / `list_tagged_images`。
+    """
+    result: dict[str, list[str]] = {}
+    for tag in store.list_all_tags():
+        for rel in store.list_tagged_images(tag):
+            result.setdefault(rel, []).append(tag)
+    return result
 
 
 def get_tags(image_rel: str) -> list[str]:
-    return load_tags().get(image_rel, [])
+    return store.get_image_tags(image_rel)
 
 
 def set_tags(image_rel: str, tags: list[str]) -> list[str]:
-    data = load_tags()
-    cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
-    if cleaned:
-        data[image_rel] = cleaned
-    else:
-        data.pop(image_rel, None)
-    save_tags(data)
-    return cleaned
+    return store.replace_image_tags(image_rel, tags)
 
 
 def remove_tags(image_rel: str) -> None:
-    data = load_tags()
-    if data.pop(image_rel, None) is not None:
-        save_tags(data)
+    store.delete_image_tags(image_rel)
 
 
 def delete_tag(tag: str) -> int:
     """从所有图片中删除指定标签，返回受影响的图片数。"""
-    data = load_tags()
-    count = 0
-    for rel in list(data):
-        if tag in data[rel]:
-            data[rel] = [t for t in data[rel] if t != tag]
-            if not data[rel]:
-                del data[rel]
-            count += 1
-    if count > 0:
-        save_tags(data)
-    return count
+    return store.delete_tag_everywhere(tag)
 
 
 def get_all_tags() -> list[str]:
-    data = load_tags()
-    seen: set[str] = set()
-    result: list[str] = []
-    for tags in data.values():
-        for t in tags:
-            if t not in seen:
-                seen.add(t)
-                result.append(t)
-    return result
+    return store.list_all_tags()

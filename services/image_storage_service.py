@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
@@ -15,9 +13,9 @@ from fastapi import HTTPException
 from PIL import Image
 
 from services.config import DATA_DIR, config
+from services.storage import runtime_store as store
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
-IMAGE_INDEX_LOCK = Lock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -76,23 +74,6 @@ def _local_image_path(relative_path: str) -> Path:
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="image not found") from exc
     return path
-
-
-def _read_json_object(path: Path) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _write_json_object(path: Path, data: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
 
 
 class WebDAVClient:
@@ -165,29 +146,27 @@ class WebDAVClient:
 
 
 class ImageStorageService:
+    """图片存储服务。
+
+    索引存储：**数据库**（services/storage/runtime_store.py）。
+
+    历史实现用 JSON 文件做索引，每次保存图片都要「读全文件 → 加一条 → 写全文件」，
+    并且在保存前调用 `cleanup_old_images()`（rglob 遍历整个图片目录树 + 逐文件 stat）。
+    2 万张图时，每保存一张图要多付 2 万次系统调用。
+
+    现在：索引走数据库 UPSERT（单行写）；过期图片清理由
+    `services/image_service.py` 的定时器（每 30 分钟）统一负责，
+    保存路径不再做目录遍历。
+    """
+
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
-        self._index_lock = IMAGE_INDEX_LOCK
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
 
     def mode(self) -> str:
         return _clean(self.settings().get("mode")) or "local"
-
-    def _load_index(self) -> dict[str, dict[str, object]]:
-        raw = _read_json_object(self.index_file)
-        items = raw.get("items")
-        if not isinstance(items, dict):
-            return {}
-        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
-
-    def _load_clean_index(self) -> dict[str, dict[str, object]]:
-        items = self._load_index()
-        return {rel: item for rel, item in items.items() if _is_image_rel(rel)}
-
-    def _save_index(self, items: dict[str, dict[str, object]]) -> None:
-        _write_json_object(self.index_file, {"items": items})
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         settings = self.settings()
@@ -203,7 +182,9 @@ class ImageStorageService:
         return f"{relative_dir.as_posix()}/{filename}"
 
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+        # ⚠️ 这里原本调用 config.cleanup_old_images()——每次保存图片都遍历
+        # 整个图片目录树做 stat，是"一天几万张"下的主要 CPU/IO 开销之一。
+        # 过期清理已由 image_service 的 30 分钟定时器统一负责，此处不再重复。
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:
@@ -224,12 +205,12 @@ class ImageStorageService:
 
         dimensions = _image_dimensions(image_data)
         item = {
-            "rel": rel,
-            "path": rel,
+            "rel_path": rel,
             "name": Path(rel).name,
             "date": "-".join(rel.split("/")[:3]),
             "size": len(image_data),
             "created_at": _now_iso(),
+            "created_ts": time.time(),
             "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
             "local": stored_local,
             "webdav": stored_webdav,
@@ -237,10 +218,7 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
-        with self._index_lock:
-            items = self._load_clean_index()
-            items[rel] = item
-            self._save_index(items)
+        store.upsert_image_record(item)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -250,7 +228,7 @@ class ImageStorageService:
         path = _local_image_path(safe_rel)
         if path.is_file():
             return path.read_bytes()
-        item = self._load_clean_index().get(safe_rel, {})
+        item = store.get_image_record(safe_rel) or {}
         if item.get("webdav"):
             return WebDAVClient(self.settings()).get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
@@ -261,7 +239,7 @@ class ImageStorageService:
             return False
         if _local_image_path(safe_rel).is_file():
             return True
-        item = self._load_clean_index().get(safe_rel, {})
+        item = store.get_image_record(safe_rel) or {}
         return bool(item.get("webdav"))
 
     def has_local(self, rel: str) -> bool:
@@ -269,69 +247,56 @@ class ImageStorageService:
         return _is_image_rel(safe_rel) and _local_image_path(safe_rel).is_file()
 
     def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
-        with self._index_lock:
-            indexed = self._load_clean_index()
-            root = config.images_dir
-            changed = False
-            for path in root.rglob("*"):
-                if not path.is_file() or not _is_image_rel(path.name):
-                    continue
-                rel = path.relative_to(root).as_posix()
-                if rel in indexed:
-                    continue
+        # 1) 扫描磁盘，把索引里没有的文件补录进来（首次运行/手工放入的图片）
+        root = config.images_dir
+        pending: list[dict[str, object]] = []
+        for path in root.rglob("*"):
+            if not path.is_file() or not _is_image_rel(path.name):
+                continue
+            rel = path.relative_to(root).as_posix()
+            if store.get_image_record(rel) is not None:
+                continue
+            try:
+                stat = path.stat()
+                dimensions = _image_dimensions(path.read_bytes())
+            except Exception:
                 dimensions = None
-                try:
-                    dimensions = _image_dimensions(path.read_bytes())
-                except Exception:
-                    dimensions = None
-                indexed[rel] = {
-                    "rel": rel,
-                    "path": rel,
-                    "name": path.name,
-                    "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
-                    "size": path.stat().st_size,
-                    "created_at": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                    "storage": "local",
-                    "local": True,
-                    "webdav": False,
-                    **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
-                }
-                changed = True
+                stat = path.stat()
+            pending.append({
+                "rel_path": rel,
+                "name": path.name,
+                "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+                "size": stat.st_size,
+                "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "created_ts": stat.st_mtime,
+                "storage": "local",
+                "local": True,
+                "webdav": False,
+                **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
+            })
+        store.bulk_upsert_image_records(pending)
 
-            items: list[dict[str, object]] = []
-            for rel, item in list(indexed.items()):
-                if not _is_image_rel(rel):
-                    indexed.pop(rel, None)
-                    changed = True
-                    continue
-                local = _local_image_path(rel).is_file()
-                webdav = bool(item.get("webdav"))
-                if not local and not webdav:
-                    indexed.pop(rel, None)
-                    changed = True
-                    continue
-                storage = "both" if local and webdav else ("webdav" if webdav else "local")
-                if item.get("local") != local or item.get("storage") != storage:
-                    item = {
-                        **item,
-                        "local": local,
-                        "storage": storage,
-                    }
-                    indexed[rel] = item
-                    changed = True
-                day = str(item.get("date") or "")
-                if start_date and day < start_date:
-                    continue
-                if end_date and day > end_date:
-                    continue
-                items.append({
-                    **item,
-                    "rel": rel,
-                    "path": rel,
-                    "url": self._public_url(rel, base_url),
-                })
-            if changed:
-                self._save_index(indexed)
+        # 2) 从数据库读回全部记录，按日期过滤
+        items: list[dict[str, object]] = []
+        stale: list[str] = []
+        for item in store.list_image_records(start_date, end_date):
+            rel = str(item.get("rel") or "")
+            if not rel or not _is_image_rel(rel):
+                continue
+            local = _local_image_path(rel).is_file()
+            webdav = bool(item.get("webdav"))
+            if not local and not webdav:
+                # 文件已被外部删除（手工清理 / 磁盘故障）→ 索引记录失效，顺手清掉
+                stale.append(rel)
+                continue
+            items.append({
+                **item,
+                "rel": rel,
+                "path": rel,
+                "url": self._public_url(rel, base_url),
+            })
+        for rel in stale:
+            store.delete_image_record(rel)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
 
@@ -342,18 +307,14 @@ class ImageStorageService:
         if path.is_file():
             path.unlink()
             removed = True
-        with self._index_lock:
-            items = self._load_clean_index()
-            item = items.get(safe_rel, {})
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
-                self._save_index(items)
+        item = store.get_image_record(safe_rel) or {}
+        if item.get("webdav"):
+            try:
+                removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
+            except ImageStorageError:
+                if not removed:
+                    raise
+        store.delete_image_record(safe_rel)
         return removed
 
     def sync_all(self) -> dict[str, int]:
@@ -363,39 +324,37 @@ class ImageStorageService:
         uploaded = 0
         skipped = 0
         failed = 0
-        with self._index_lock:
-            items = self._load_clean_index()
-            client = WebDAVClient(settings)
-            for path in sorted(config.images_dir.rglob("*")):
-                if not path.is_file() or not _is_image_rel(path.name):
-                    continue
-                rel = path.relative_to(config.images_dir).as_posix()
-                item = items.get(rel, {})
-                if item.get("webdav"):
-                    skipped += 1
-                    continue
-                try:
-                    payload = path.read_bytes()
-                    remote_url = client.put(rel, payload)
-                    dimensions = _image_dimensions(payload)
-                    items[rel] = {
-                        **item,
-                        "rel": rel,
-                        "path": rel,
-                        "name": path.name,
-                        "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
-                        "size": len(payload),
-                        "created_at": str(item.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
-                        "storage": "both",
-                        "local": True,
-                        "webdav": True,
-                        "remote_url": remote_url,
-                        **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
-                    }
-                    uploaded += 1
-                except Exception:
-                    failed += 1
-            self._save_index(items)
+        client = WebDAVClient(settings)
+        for path in sorted(config.images_dir.rglob("*")):
+            if not path.is_file() or not _is_image_rel(path.name):
+                continue
+            rel = path.relative_to(config.images_dir).as_posix()
+            item = store.get_image_record(rel) or {}
+            if item.get("webdav"):
+                skipped += 1
+                continue
+            try:
+                payload = path.read_bytes()
+                remote_url = client.put(rel, payload)
+                dimensions = _image_dimensions(payload)
+                stat = path.stat()
+                store.upsert_image_record({
+                    **item,
+                    "rel_path": rel,
+                    "name": path.name,
+                    "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+                    "size": len(payload),
+                    "created_at": str(item.get("created_at") or datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
+                    "created_ts": float(item.get("created_ts") or stat.st_mtime),
+                    "storage": "both",
+                    "local": True,
+                    "webdav": True,
+                    "remote_url": remote_url,
+                    **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
+                })
+                uploaded += 1
+            except Exception:
+                failed += 1
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
     def test_webdav(self) -> dict[str, object]:

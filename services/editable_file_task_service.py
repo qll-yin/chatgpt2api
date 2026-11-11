@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import threading
 import time
 from datetime import datetime
@@ -13,13 +12,13 @@ from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
+from services.storage import runtime_store as store
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
-UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 EDITABLE_FILE_PLAN_TYPES = ("Plus", "Team", "Pro", "Enterprise")
 EDITABLE_FILE_ROOT = DATA_DIR / "files"
 EDITABLE_FILE_TASKS_PATH = DATA_DIR / "editable_file_tasks.json"
@@ -35,10 +34,6 @@ def _clean(value: object, default: str = "") -> str:
 
 def _owner_id(identity: dict[str, object]) -> str:
     return _clean(identity.get("id")) or "anonymous"
-
-
-def _task_key(owner_id: str, task_id: str) -> str:
-    return f"{owner_id}:{task_id}"
 
 
 def _elapsed_seconds(task: dict[str, Any]) -> int:
@@ -84,15 +79,19 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 class EditableFileTaskService:
+    """可编辑文件（PPT/PSD）任务服务。
+
+    存储：**数据库**（services/storage/runtime_store.py）。
+    旧实现是「内存 dict + 全量 JSON 重写」，每次状态更新都重写整个文件。
+    """
+
     def __init__(self, path: Path = EDITABLE_FILE_TASKS_PATH) -> None:
         self.path = path
         self._lock = threading.RLock()
-        self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 服务重启：未完成的任务标记为中断
         with self._lock:
-            self._tasks = self._load_locked()
-            if self._recover_unfinished_locked():
-                self._save_locked()
+            self._recover_unfinished()
 
     def submit_ppt(self, identity: dict[str, object], *, client_task_id: str = "", prompt: str = "", base64_images: list[str] | None = None, base_url: str = "") -> dict[str, Any]:
         return self._submit(identity, client_task_id=client_task_id, kind="ppt", prompt=prompt, base64_images=base64_images or [], base_url=base_url)
@@ -103,34 +102,44 @@ class EditableFileTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested = [_clean(item) for item in task_ids if _clean(item)]
-        with self._lock:
-            if requested:
-                items = [task for task_id in requested if (task := self._tasks.get(_task_key(owner, task_id)))]
-                return {"items": [_public_task(item) for item in items], "missing_ids": [task_id for task_id in requested if _task_key(owner, task_id) not in self._tasks]}
-            items = [task for task in self._tasks.values() if task.get("owner_id") == owner]
+        rows = store.list_editable_file_tasks(owner)
+        by_id = {str(row.get("id")): row for row in rows}
+        if requested:
+            items = [by_id[task_id] for task_id in requested if task_id in by_id]
+            return {"items": [_public_task(item) for item in items], "missing_ids": [task_id for task_id in requested if task_id not in by_id]}
+        items = list(rows)
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return {"items": [_public_task(item) for item in items], "missing_ids": []}
 
     def _submit(self, identity: dict[str, object], *, client_task_id: str, kind: str, prompt: str, base64_images: list[str], base_url: str) -> dict[str, Any]:
         task_id = _clean(client_task_id) or new_uuid()
         owner = _owner_id(identity)
-        key = _task_key(owner, task_id)
         now = _now_iso()
         with self._lock:
-            if key in self._tasks:
-                return _public_task(self._tasks[key])
+            existing = store.get_editable_file_task(owner, task_id)
+            if existing is not None:
+                return _public_task(existing)
             ts = time.time()
-            self._tasks[key] = {"id": task_id, "owner_id": owner, "status": TASK_STATUS_QUEUED, "kind": kind, "model": EDITABLE_FILE_MODEL, "created_at": now, "updated_at": now, "created_ts": ts, "updated_ts": ts}
-            task = dict(self._tasks[key])
-            self._save_locked()
-        threading.Thread(target=self._run_task, args=(key, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
+            task = {
+                "id": task_id,
+                "owner_id": owner,
+                "status": TASK_STATUS_QUEUED,
+                "kind": kind,
+                "model": EDITABLE_FILE_MODEL,
+                "created_at": now,
+                "updated_at": now,
+                "created_ts": ts,
+                "updated_ts": ts,
+            }
+            store.upsert_editable_file_task(task)
+        threading.Thread(target=self._run_task, args=(owner, task_id, kind, prompt, base64_images, dict(identity), base_url), name=f"{kind}-file-task-{task_id[:16]}", daemon=True).start()
         return _public_task(task)
 
-    def _run_task(self, key: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
+    def _run_task(self, owner: str, task_id: str, kind: str, prompt: str, base64_images: list[str], identity: dict[str, object], base_url: str) -> None:
         started = time.time()
         token = ""
         account_email = ""
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
+        self._update_task(owner, task_id, status=TASK_STATUS_RUNNING, error="", started_ts=started)
         backend = None
         try:
             if kind == "psd" and not base64_images:
@@ -139,15 +148,15 @@ class EditableFileTaskService:
             account = account_service.get_account(token) or {}
             account_email = _clean(account.get("email"))
             backend = OpenAIBackendAPI(token)
-            output_dir = EDITABLE_FILE_ROOT / kind / key.rsplit(":", 1)[-1]
+            output_dir = EDITABLE_FILE_ROOT / kind / task_id
             result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
             account_service.mark_text_used(token)
             data = {"conversation_id": result.conversation_id, "primary_url": _file_url(result.primary_path, base_url), "zip_url": _file_url(result.zip_path, base_url)}
-            self._update_task(key, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
+            self._update_task(owner, task_id, status=TASK_STATUS_SUCCESS, result=data, account_email=account_email, error="", ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), account_email=account_email, result=data)
         except Exception as exc:
             error = str(exc) or "editable file task failed"
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
+            self._update_task(owner, task_id, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error, account_email=account_email)
         finally:
             if backend is not None:
@@ -161,64 +170,26 @@ class EditableFileTaskService:
             raise FileNotFoundError(raw)
         return path
 
-    def _update_task(self, key: str, **updates: Any) -> None:
-        with self._lock:
-            task = self._tasks.get(key)
-            if task is None:
-                return
-            task.update(updates)
-            task["updated_at"] = _now_iso()
-            task["updated_ts"] = time.time()
-            self._save_locked()
-
-    def _load_locked(self) -> dict[str, dict[str, Any]]:
-        if not self.path.exists():
-            return {}
+    def _update_task(self, owner: str, task_id: str, **updates: Any) -> None:
+        """局部更新 —— 只 UPDATE 受影响的一行。"""
+        updates = dict(updates)
+        updates["updated_at"] = _now_iso()
+        updates["updated_ts"] = time.time()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            store.update_editable_file_task(owner, task_id, updates)
         except Exception:
-            return {}
-        tasks: dict[str, dict[str, Any]] = {}
-        for item in (raw.get("tasks") if isinstance(raw, dict) else raw) or []:
-            if not isinstance(item, dict):
-                continue
-            task_id = _clean(item.get("id"))
-            owner = _clean(item.get("owner_id"))
-            if not task_id or not owner:
-                continue
-            task = {
-                "id": task_id,
-                "owner_id": owner,
-                "status": _clean(item.get("status"), TASK_STATUS_ERROR),
-                "kind": "psd" if item.get("kind") == "psd" else "ppt",
-                "created_at": _clean(item.get("created_at"), _now_iso()),
-                "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
-                "created_ts": float(item.get("created_ts") or 0),
-                "updated_ts": float(item.get("updated_ts") or 0),
-            }
-            for field in ("result", "error", "started_ts", "ended_ts"):
-                if item.get(field):
-                    task[field] = item[field]
-            tasks[_task_key(owner, task_id)] = task
-        return tasks
+            import logging
 
-    def _save_locked(self) -> None:
-        items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
+            logging.getLogger(__name__).exception(
+                "更新可编辑文件任务状态失败 owner=%s task=%s", owner, task_id
+            )
 
-    def _recover_unfinished_locked(self) -> bool:
-        changed = False
-        for task in self._tasks.values():
-            if task.get("status") in UNFINISHED_STATUSES:
-                task["status"] = TASK_STATUS_ERROR
-                task["error"] = "服务已重启，未完成的任务已中断"
-                task["ended_ts"] = time.time()
-                task["updated_at"] = _now_iso()
-                task["updated_ts"] = time.time()
-                changed = True
-        return changed
+    def _recover_unfinished(self) -> None:
+        """服务重启时把未完成的任务标记为中断。"""
+        try:
+            store.recover_unfinished_editable_file_tasks()
+        except Exception:
+            pass
 
     def _log_call(
             self,
