@@ -48,6 +48,18 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
+# 号池自动补充守护（见 services/auto_register_guardian.py）
+DEFAULT_AUTO_REGISTER = {
+    "enabled": False,
+    "threshold": 10,            # 可用账号数低于此值触发注册
+    "target_batch": 20,         # 每次注册的目标成功数
+    "check_interval_minute": 30,  # 检查间隔（分钟）
+    "register_url": "http://register:8765",  # 注册机地址
+    "register_auth_key": "",     # 注册机 auth-key（留空则不带鉴权头）
+    "register_options": {},      # 传给注册机的额外参数
+    "cooldown_minute": 30,       # 触发后的冷却期（分钟）
+}
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -215,6 +227,35 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+    }
+
+
+def _normalize_auto_register_settings(value: object) -> dict[str, object]:
+    """归一化「号池自动补充」配置。
+
+    数值字段做上下界钳制，非法值退回默认，避免写错配置导致
+    「每秒触发一次注册」这类失控行为。
+    """
+    source = value if isinstance(value, dict) else {}
+    default = DEFAULT_AUTO_REGISTER
+
+    def _int(key: str, low: int, high: int) -> int:
+        try:
+            raw = int(source.get(key, default[key]))
+        except (TypeError, ValueError):
+            raw = int(default[key])
+        return max(low, min(high, raw))
+
+    options = source.get("register_options")
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), default["enabled"]),
+        "threshold": _int("threshold", 0, 100000),
+        "target_batch": _int("target_batch", 1, 10000),
+        "check_interval_minute": _int("check_interval_minute", 1, 10080),
+        "register_url": str(source.get("register_url") or default["register_url"]).strip().rstrip("/"),
+        "register_auth_key": str(source.get("register_auth_key") or "").strip(),
+        "register_options": options if isinstance(options, dict) else {},
+        "cooldown_minute": _int("cooldown_minute", 0, 10080),
     }
 
 
@@ -746,6 +787,10 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
+        if "auto_register" in next_data:
+            next_data["auto_register"] = _normalize_auto_register_settings(
+                next_data.get("auto_register")
+            )
         if "third_party_apps" in next_data:
             next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
         if "proxy_runtime" in next_data:
@@ -770,6 +815,10 @@ class ConfigStore:
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
+
+    def get_auto_register_settings(self) -> dict[str, object]:
+        """号池自动补充守护的配置。"""
+        return _normalize_auto_register_settings(self.data.get("auto_register"))
 
     def get_storage_backend(self) -> StorageBackend:
         """获取存储后端实例（单例）"""

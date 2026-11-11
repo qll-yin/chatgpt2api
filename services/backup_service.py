@@ -16,8 +16,45 @@ from urllib.parse import quote, urlencode
 from curl_cffi import requests
 
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
-from services.image_storage_service import IMAGE_INDEX_FILE
-from services.image_tags_service import TAGS_FILE
+
+
+# ──────────────────────── 运行态数据导出（供备份用） ────────────────────────
+#
+# 图片任务 / 图片索引 / 图片标签已从 JSON 文件迁到数据库，
+# 备份时从数据库导出成与原文件同构的 JSON，归档路径保持不变，
+# 恢复端（按原路径读文件）无需任何改动。
+
+
+def _export_image_tasks() -> dict:
+    """导出图片任务，结构与旧 data/image_tasks.json 一致。"""
+    from services.storage import runtime_store as store
+
+    try:
+        rows = store.list_all_image_tasks()
+    except Exception:
+        rows = []
+    return {"tasks": rows}
+
+
+def _export_image_index() -> dict:
+    """导出图片索引，结构与旧 data/image_index.json 一致。"""
+    from services.storage import runtime_store as store
+
+    try:
+        rows = store.list_all_image_records()
+    except Exception:
+        rows = []
+    return {"items": {row.get("rel", ""): row for row in rows if row.get("rel")}}
+
+
+def _export_image_tags() -> dict:
+    """导出图片标签，结构与旧 data/image_tags.json 一致。"""
+    from services.image_tags_service import load_tags
+
+    try:
+        return load_tags()
+    except Exception:
+        return {}
 
 
 def _utc_now() -> datetime:
@@ -629,8 +666,18 @@ class BackupService:
             if include.get("logs"):
                 self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
             if include.get("image_tasks"):
-                self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
-                self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
+                # 图片任务与图片索引已从 JSON 文件迁到数据库，
+                # 备份时从数据库导出，归档里的路径与格式保持不变（恢复端无需改动）。
+                self._add_bytes_to_archive(
+                    archive,
+                    "data/image_tasks.json",
+                    _json_bytes(_export_image_tasks()),
+                )
+                self._add_bytes_to_archive(
+                    archive,
+                    "data/image_index.json",
+                    _json_bytes(_export_image_index()),
+                )
             if include.get("accounts_snapshot"):
                 self._add_bytes_to_archive(
                     archive,
@@ -644,7 +691,11 @@ class BackupService:
                     _json_bytes(config.get_storage_backend().load_auth_keys()),
                 )
             if include.get("images"):
-                self._add_file_to_archive(archive, TAGS_FILE, "data/image_tags.json")
+                self._add_bytes_to_archive(
+                    archive,
+                    "data/image_tags.json",
+                    _json_bytes(_export_image_tags()),
+                )
                 self._add_directory_to_archive(archive, config.images_dir, "data/images")
         return buffer.getvalue()
 
