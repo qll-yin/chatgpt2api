@@ -81,6 +81,73 @@ def get_settings(prefix: str = "") -> dict[str, str]:
         return {row.key: (row.value or "") for row in session.execute(stmt).scalars()}
 
 
+def _is_true(value: object) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_mail_settings() -> dict:
+    """内部用：给 create_mail_provider 的 settings（含明文密钥）。
+
+    绝不能直接返回给前端 —— 里面有各邮箱平台的 API Key。
+    按 provider 自己声明的 config_fields 逐项取，加一种邮箱不用改这里。
+    """
+    from services.register.mail_providers import list_providers
+
+    out: dict[str, Any] = {"mail_source": get_setting("mail_source", "outlook")}
+    for provider in list_providers():
+        for field in provider.get("config_fields") or []:
+            key = field.get("key")
+            if not key:
+                continue
+            out[key] = get_setting(key, "")
+    return out
+
+
+def get_sms_internal_config() -> dict:
+    """内部用：拿明文 sms_api_key，供 sms_provider 实例化使用。"""
+    return {
+        "sms_enabled":            _is_true(get_setting("sms_enabled", "0")),
+        "sms_provider":           get_setting("sms_provider", "smsbower"),
+        "sms_api_key":            get_setting("sms_api_key", ""),
+        "sms_country":            get_setting("sms_country", "52"),
+        "sms_service":            get_setting("sms_service", "dr"),
+        "sms_max_price":          get_setting("sms_max_price", ""),
+        "sms_fixed_price":        get_setting("sms_fixed_price", ""),
+        "sms_reuse_phone":        _is_true(get_setting("sms_reuse_phone", "0")),
+        "sms_phone_success_max":  get_setting("sms_phone_success_max", "3"),
+        "sms_auto_country":       _is_true(get_setting("sms_auto_country", "0")),
+        "sms_strict_whitelist":   _is_true(get_setting("sms_strict_whitelist", "0")),
+        "sms_allowed_countries":  get_setting("sms_allowed_countries", ""),
+        "sms_auto_min_stock":     get_setting("sms_auto_min_stock", "20"),
+        "sms_auto_max_price":     get_setting("sms_auto_max_price", ""),
+        "sms_max_phone_attempts": get_setting("sms_max_phone_attempts", ""),
+        "sms_per_phone_timeout":  get_setting("sms_per_phone_timeout", "80"),
+    }
+
+
+def get_export_internal_config() -> dict:
+    """内部用：拿明文密钥 + 解析后的 enabled 布尔。
+
+    ⚠️ CPA / SUB2API 导出在本项目**默认不启用**（那两个平台要求 Codex
+    风格的 access_token，与本项目号池消费的 NextAuth 风格 token 不是一回事）。
+    这里保留读取能力是为了兼容既有配置，enabled 默认为关，不会有任何行为。
+    """
+    cpa = {
+        "enabled":      _is_true(get_setting("export_cpa_enabled", "0")),
+        "cpa_url":      get_setting("export_cpa_url", ""),
+        "cpa_mgmt_key": get_setting("export_cpa_mgmt_key", ""),
+        "cpa_timeout":  get_setting("export_cpa_timeout", "30"),
+    }
+    sub2api = {
+        "enabled":           _is_true(get_setting("export_sub2api_enabled", "0")),
+        "sub2api_url":       get_setting("export_sub2api_url", ""),
+        "sub2api_api_key":   get_setting("export_sub2api_api_key", ""),
+        "sub2api_group_ids": get_setting("export_sub2api_group_ids", "2"),
+        "sub2api_timeout":   get_setting("export_sub2api_timeout", "30"),
+    }
+    return {"cpa": cpa, "sub2api": sub2api}
+
+
 # ──────────────────────── 邮箱池 ────────────────────────
 
 
@@ -296,7 +363,7 @@ def reset_account(email: str) -> bool:
 
 
 def save_registered(
-    email: str,
+    email: str | dict = "",
     access_token: str = "",
     session_token: str = "",
     refresh_token: str = "",
@@ -311,7 +378,32 @@ def save_registered(
     proxy: str = "",
     extra: dict | None = None,
 ) -> None:
-    """保存注册成功的账号（覆盖写）。"""
+    """保存注册成功的账号（覆盖写）。
+
+    支持两种调用方式：
+      1. 关键字参数：save_registered(email="a@x.com", access_token="...")
+      2. 整字典：save_registered({...})  —— registrar 用这种
+    """
+    # 方式 2：第一个参数是 dict
+    if isinstance(email, dict):
+        payload_in = dict(email)
+        email = str(payload_in.pop("email", "") or "")
+        access_token = str(payload_in.pop("access_token", "") or access_token)
+        session_token = str(payload_in.pop("session_token", "") or session_token)
+        refresh_token = str(payload_in.pop("refresh_token", "") or refresh_token)
+        id_token = str(payload_in.pop("id_token", "") or id_token)
+        password = str(payload_in.pop("password", "") or password)
+        device_id = str(payload_in.pop("device_id", "") or device_id)
+        csrf_token = str(payload_in.pop("csrf_token", "") or csrf_token)
+        cookie_header = str(payload_in.pop("cookie_header", "") or cookie_header)
+        totp_secret = str(payload_in.pop("totp_secret", "") or totp_secret)
+        totp_factor_id = str(payload_in.pop("totp_factor_id", "") or totp_factor_id)
+        session_json = str(payload_in.pop("session_json", "") or session_json)
+        proxy = str(payload_in.pop("proxy", "") or proxy)
+        # 其余字段归入 extra
+        if payload_in:
+            extra = {**(extra or {}), **payload_in}
+
     email = str(email or "").strip().lower()
     if not email:
         return
@@ -399,6 +491,7 @@ def get_registered(email: str) -> Optional[dict[str, Any]]:
                 item["extra"] = json.loads(item["extra_json"])
             except (TypeError, ValueError):
                 item["extra"] = {}
+        item.pop("extra_json", None)
         return item
 
 
@@ -492,6 +585,17 @@ def finish_run(
         )
 
 
+def get_run(run_id: str) -> Optional[dict[str, Any]]:
+    """取单个运行记录（status / error_category 等）。"""
+    with register_session_scope() as session:
+        row = session.execute(
+            select(RunModel).where(RunModel.run_id == str(run_id or ""))
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
 def list_runs(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     with register_session_scope() as session:
         count = int(session.execute(select(func.count()).select_from(RunModel)).scalar_one())
@@ -512,12 +616,31 @@ def list_runs(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], i
 
 
 def _proxy_to_dict(row) -> dict[str, Any]:
-    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+    """ORM 行 → dict，并派生 status 字段。
+
+    status 三态（与原注册机一致，前端按这个展示「可用 N / 停用 M / 已满 K」）：
+      available —— 启用中且未超配额
+      disabled  —— 被手动停用，或连续被 CF 拦截自动停用
+      exhausted —— 启用中但成功数已达上限
+    """
+    item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+    enabled = bool(item.get("enabled"))
+    max_uses = int(item.get("max_uses") or 0)
+    used = int(item.get("used_count") or 0)
+    if not enabled:
+        item["status"] = "disabled"
+    elif max_uses and used >= max_uses:
+        item["status"] = "exhausted"
+    else:
+        item["status"] = "available"
+    return item
 
 
 def list_proxies() -> list[dict[str, Any]]:
     with register_session_scope() as session:
-        stmt = select(ProxyPoolModel).order_by(ProxyPoolModel.rowid)
+        # ⚠️ 不能用 rowid 排序 —— 那是 SQLite 特有的，PG/MySQL 没有。
+        # 用 created_at + proxy 做稳定排序。
+        stmt = select(ProxyPoolModel).order_by(ProxyPoolModel.created_at, ProxyPoolModel.proxy)
         return [_proxy_to_dict(row) for row in session.execute(stmt).scalars()]
 
 
@@ -532,53 +655,48 @@ def find_proxy(proxy: str) -> Optional[dict[str, Any]]:
         return _proxy_to_dict(row) if row is not None else None
 
 
-def replace_proxies(text: str, mode: str = "replace") -> dict[str, Any]:
+def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
     """批量导入代理。
 
-    mode=replace → 覆盖（池里没有的删掉）
-    mode=append → 追加（已存在的保留原状态）
+    mode="replace"：清空后写入（保留已有代理的 enabled/上限/用量？
+                  不保留 —— 「覆盖保存」的语义就是重来，但用量清零会让
+                  已经注册成功的号对应的代理计数丢失。
+                  这里改为：replace 只清掉**不在新列表里**的代理，
+                  新列表里已存在的代理保留其状态和用量。）
+    mode="append"：只追加新代理，已存在的保持不变。
     """
-    proxies = []
-    for line in str(text or "").splitlines():
-        value = line.strip()
-        if value and not value.startswith("#"):
-            proxies.append(value)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for p in proxies or []:
+        s = str(p or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+
     now = time.time()
     with register_session_scope() as session:
         if mode == "replace":
-            if proxies:
-                # 池里没有的删掉
+            # 删掉不在新列表里的
+            if cleaned:
                 session.execute(
-                    sa_delete(ProxyPoolModel).where(ProxyPoolModel.proxy.notin_(proxies))
-                )
-                # 覆盖模式下，保留的代理要**重置计数**——
-                # 否则重新导入一份代理列表后，旧的 used_count / failed_count
-                # 还在，新代理立刻就"用满了"或"被停用了"。
-                session.execute(
-                    sa_update(ProxyPoolModel)
-                    .where(ProxyPoolModel.proxy.in_(proxies))
-                    .values(
-                        used_count=0,
-                        failed_count=0,
-                        cf_blocked=0,
-                        enabled=True,
-                        ipv6_status="untested",
-                    )
+                    sa_delete(ProxyPoolModel).where(ProxyPoolModel.proxy.notin_(cleaned))
                 )
             else:
                 session.execute(sa_delete(ProxyPoolModel))
+        # 新增（已存在的跳过，保留状态和用量）
         existing = {
             row.proxy
             for row in session.execute(
-                select(ProxyPoolModel).where(ProxyPoolModel.proxy.in_(proxies))
+                select(ProxyPoolModel).where(ProxyPoolModel.proxy.in_(cleaned))
             ).scalars()
-        } if proxies else set()
-        for proxy in proxies:
-            if proxy in existing:
+        } if cleaned else set()
+        for s in cleaned:
+            if s in existing:
                 continue
             session.add(
                 ProxyPoolModel(
-                    proxy=proxy,
+                    proxy=s,
                     enabled=True,
                     max_uses=50,
                     used_count=0,
@@ -589,15 +707,34 @@ def replace_proxies(text: str, mode: str = "replace") -> dict[str, Any]:
                     created_at=now,
                 )
             )
-    return {"total": len(proxies), "mode": mode}
+    items = list_proxies()
+    return {"total": len(cleaned), "items": items}
 
 
-def update_proxy(proxy: str, updates: dict[str, Any]) -> bool:
+def update_proxy(
+    proxy: str,
+    *,
+    enabled: Optional[bool] = None,
+    max_uses: Optional[int] = None,
+    note: Optional[str] = None,
+    proxy_type: Optional[str] = None,
+    ipv6_status: Optional[str] = None,
+) -> bool:
+    """改单个代理的启用状态 / 上限 / 备注 / 类型。返回是否命中。"""
     proxy = str(proxy or "").strip()
-    if not proxy or not updates:
+    if not proxy:
         return False
-    allowed = {"enabled", "max_uses", "proxy_type", "note", "ipv6_status", "ipv6_checked_at"}
-    payload = {k: v for k, v in updates.items() if k in allowed}
+    payload: dict[str, Any] = {}
+    if enabled is not None:
+        payload["enabled"] = bool(enabled)
+    if max_uses is not None:
+        payload["max_uses"] = max(0, int(max_uses))
+    if note is not None:
+        payload["note"] = str(note)
+    if proxy_type is not None:
+        payload["proxy_type"] = str(proxy_type)
+    if ipv6_status is not None:
+        payload["ipv6_status"] = str(ipv6_status)
     if not payload:
         return False
     with register_session_scope() as session:
@@ -737,33 +874,17 @@ def mark_proxy_cf_blocked(proxy: str, max_blocked: int = 2) -> dict[str, Any]:
 
 
 def proxy_pool_stats() -> dict[str, Any]:
-    with register_session_scope() as session:
-        total = int(
-            session.execute(select(func.count()).select_from(ProxyPoolModel)).scalar_one()
-        )
-        enabled = int(
-            session.execute(
-                select(func.count())
-                .select_from(ProxyPoolModel)
-                .where(ProxyPoolModel.enabled.is_(True))
-            ).scalar_one()
-        )
-        used = int(
-            session.execute(
-                select(func.coalesce(func.sum(ProxyPoolModel.used_count), 0))
-            ).scalar_one()
-        )
-        failed = int(
-            session.execute(
-                select(func.coalesce(func.sum(ProxyPoolModel.failed_count), 0))
-            ).scalar_one()
-        )
-        return {
-            "total": total,
-            "enabled": enabled,
-            "used": int(used),
-            "failed": int(failed),
-        }
+    """代理池概览，供前端展示「可用 N / 停用 M / 已满 K」。"""
+    items = list_proxies()
+    return {
+        "total": len(items),
+        "available": sum(1 for i in items if i.get("status") == "available"),
+        "disabled": sum(1 for i in items if i.get("status") == "disabled"),
+        "exhausted": sum(1 for i in items if i.get("status") == "exhausted"),
+        "used": sum(int(i.get("used_count") or 0) for i in items),
+        "failed": sum(int(i.get("failed_count") or 0) for i in items),
+        "enabled": sum(1 for i in items if i.get("enabled")),
+    }
 
 
 # ──────────────────────── Remail 订单 ────────────────────────
@@ -860,29 +981,38 @@ def mark_remail_order_attempt(order_no: str) -> None:
 
 
 def stats() -> dict[str, Any]:
-    """注册业务统计。"""
+    """邮箱池按状态统计（available / in_use / done / failed / total）。"""
     with register_session_scope() as session:
-        pool_total = int(
-            session.execute(select(func.count()).select_from(OutlookAccountModel)).scalar_one()
-        )
-        pool_available = int(
-            session.execute(
-                select(func.count())
-                .select_from(OutlookAccountModel)
-                .where(OutlookAccountModel.status == "available")
-            ).scalar_one()
-        )
-        registered_total = int(
-            session.execute(select(func.count()).select_from(RegisteredModel)).scalar_one()
-        )
-        runs_total = int(session.execute(select(func.count()).select_from(RunModel)).scalar_one())
-        return {
-            "pool_total": pool_total,
-            "pool_available": pool_available,
-            "registered_total": registered_total,
-            "runs_total": runs_total,
-            "proxy_pool": proxy_pool_stats(),
-        }
+        rows = session.execute(
+            select(OutlookAccountModel.status, func.count())
+            .group_by(OutlookAccountModel.status)
+        ).all()
+        out: dict[str, Any] = {"available": 0, "in_use": 0, "done": 0, "failed": 0, "total": 0}
+        for status, count in rows:
+            out[str(status) or "available"] = int(count)
+            out["total"] += int(count)
+        return out
+
+
+def stats_by_kind() -> dict:
+    """按邮箱类型分组统计，给前端展示「每种邮箱各有多少号」。"""
+    with register_session_scope() as session:
+        rows = session.execute(
+            select(
+                OutlookAccountModel.kind,
+                OutlookAccountModel.status,
+                func.count(),
+            ).group_by(OutlookAccountModel.kind, OutlookAccountModel.status)
+        ).all()
+        out: dict[str, dict[str, int]] = {}
+        for kind, status, count in rows:
+            k = kind or "outlook"
+            slot = out.setdefault(
+                k, {"available": 0, "in_use": 0, "done": 0, "failed": 0, "total": 0}
+            )
+            slot[str(status)] = int(count)
+            slot["total"] += int(count)
+        return out
 
 
 # ──────────────────────── 导入解析 ────────────────────────

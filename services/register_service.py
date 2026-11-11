@@ -257,136 +257,128 @@ def _set_run(run_id: str, **updates: Any) -> None:
 
 
 def _emit(run_id: str, message: str, level: str = "info") -> None:
-    sink = _log_sinks.get(run_id)
-    if sink is not None:
+    """推一条日志到该 run 的日志队列（前端 SSE 会读到）。"""
+    from services import register_registrar as registrar
+
+    q = registrar.get_run_queue(run_id)
+    if q is not None:
         try:
-            sink(message, level)
+            q.put_nowait(f"[{level}] {message}")
         except Exception:
             pass
 
 
+def _publish(run_id: str, kind: str, payload: dict | None = None) -> None:
+    """推一个结构化事件（进度、状态）。"""
+    import json as _json
+
+    from services import register_registrar as registrar
+
+    q = registrar.get_run_queue(run_id)
+    if q is None:
+        return
+    body = payload if isinstance(payload, dict) else {"message": str(payload)}
+    body["kind"] = kind
+    try:
+        q.put_nowait("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def register_one(options: dict[str, Any]) -> dict[str, Any]:
-    """执行一次注册（同步）。
+    """执行一次注册（同步等待完成）。
+
+    实现复用迁移过来的 registrar（services/register_registrar.py），
+    那里是原注册机的完整注册逻辑 —— 不重复实现。
 
     返回 {"ok", "run_id", "email", "access_token", "error", "error_category", "imported"}
     """
-    from services.register.auth_flow import AuthFlow
-    from services.register.mail_providers import (
-        create_mail_provider,
-        get_provider_class,
-    )
+    from services import register_registrar as registrar
+    from services.register.mail_providers import get_provider_class
     from services.storage import register_store as store
 
-    run_id = str(options.get("run_id") or uuid.uuid4().hex)
     started = time.time()
 
-    with _runs_lock:
-        _runs[run_id] = {
-            "run_id": run_id,
-            "status": "running",
-            "started_at": started,
-            "updated_at": started,
-            "email": "",
-            "error": "",
-            "error_category": "",
-        }
-
-    store.create_run(run_id, email="", log_path="")
-
-    proxy = str(options.get("proxy") or "").strip()
-    want_refresh = bool(options.get("want_refresh_token", False))
-    auto_import = bool(options.get("auto_import", False))
-    with_proxy = bool(options.get("with_proxy", True))
-
-    mail_provider = None
-    try:
-        # 邮箱来源：优先从号池 claim 一个号（pooled 类 provider），
-        # 否则用 provider 自己造号（Remail 下单 / CF 临时邮箱）
-        mail_source = str(options.get("mail_source") or _reg_setting("mail_source", "outlook"))
-        settings = dict(options.get("mail_options") or _load_mail_settings(mail_source))
-        account = None
+    # ── 准备邮箱 ──
+    mail_source = str(options.get("mail_source") or _reg_setting("mail_source", "outlook"))
+    settings = dict(options.get("mail_options") or _load_mail_settings(mail_source))
+    # account 已由调用方（如批量 worker）认领时直接复用，避免二次 claim
+    account = options.get("account")
+    if account is None:
         try:
             provider_class = get_provider_class(mail_source)
         except Exception:
             provider_class = None
         if provider_class is not None and getattr(provider_class, "pooled", False):
-            # 池化来源：从号池原子 claim 一个号
             account = store.claim_next(mail_source)
             if account is None:
                 raise RuntimeError(f"号池里没有可用的 {mail_source} 邮箱")
-        mail_provider = create_mail_provider(mail_source, settings, account)
-
-        cfg = _build_config(options)
-        env_overrides = _build_env_overrides(options)
-
-        flow = AuthFlow(
-            cfg,
-            env_overrides=env_overrides,
-            on_password=lambda email, password: store.save_password_early(email, password),
-        )
-        result = flow.run_register(mail_provider)
-
-        email = str(result.email or "").strip().lower()
-        access_token = str(result.access_token or "").strip()
-        _set_run(run_id, email=email, status="done")
-
-        store.save_registered(
-            email=email,
-            access_token=access_token,
-            session_token=str(result.session_token or ""),
-            refresh_token=str(result.refresh_token or ""),
-            id_token=str(result.id_token or ""),
-            password=str(result.password or ""),
-            device_id=str(result.device_id or ""),
-            csrf_token=str(result.csrf_token or ""),
-            cookie_header=str(result.cookie_header or ""),
-            totp_secret=str(result.totp_secret or ""),
-            session_json=str(result.session_json or ""),
-            proxy=proxy,
-        )
-        store.finish_run(run_id, ok=True, email=email)
-
-        imported = False
-        if auto_import and access_token:
-            # 自动入池：成功即刻写入 chatgpt2api 号池
-            payload = build_pool_payload(email, access_token, proxy)
-            from services.account_service import account_service
-
-            account_service.add_account_items([payload])
-            imported = True
-            _emit(run_id, f"✅ 已自动导入号池：{email}", "ok")
-
-        return {
-            "ok": True,
-            "run_id": run_id,
-            "email": email,
-            "access_token": access_token,
-            "proxy": proxy,
-            "imported": imported,
-            "duration": time.time() - started,
-        }
-    except Exception as exc:
-        error_text = str(exc) or exc.__class__.__name__
-        category = classify_error(error_text)
-        _set_run(run_id, status="failed", error=error_text, error_category=category)
-        store.finish_run(run_id, ok=False, error=error_text, error_category=category)
-        logger.warning("[register] 注册失败 (%s): %s", category, error_text)
-        return {
-            "ok": False,
-            "run_id": run_id,
+    if account is None:
+        # 非池化来源（Remail / CF 临时邮箱）由 provider 自己造号
+        account = {
             "email": "",
-            "error": error_text,
-            "error_category": category,
-            "duration": time.time() - started,
+            "password": "",
+            "client_id": "",
+            "refresh_token": "",
+            "relay_url": "",
+            "kind": mail_source,
         }
-    finally:
-        if mail_provider is not None:
-            close = getattr(mail_provider, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+
+    run_options = dict(options)
+    run_options["mail_source"] = mail_source
+    run_options["mail_options"] = settings
+
+    # 启动注册（异步线程），返回 run_id
+    run_id = registrar.start_registration(account, run_options)
+
+    # 等它跑完
+    ok, category = _wait_run(run_id, timeout=int(options.get("timeout") or 1800))
+
+    record = store.get_registered(account.get("email") or "") or {}
+    access_token = str(record.get("access_token") or "").strip()
+    email = str(record.get("email") or account.get("email") or "").strip().lower()
+
+    imported = False
+    if ok and access_token and bool(options.get("auto_import", False)):
+        payload = build_pool_payload(email, access_token, str(options.get("proxy") or ""))
+        from services.account_service import account_service
+
+        account_service.add_account_items([payload])
+        imported = True
+
+    return {
+        "ok": ok,
+        "run_id": run_id,
+        "email": email,
+        "access_token": access_token,
+        "proxy": str(options.get("proxy") or ""),
+        "imported": imported,
+        "error": "" if ok else _last_run_error(run_id),
+        "error_category": category,
+        "duration": time.time() - started,
+    }
+
+
+def _wait_run(run_id: str, timeout: int = 1800) -> tuple[bool, str]:
+    """等一个 run 跑完，返回 (ok, error_category)。"""
+    deadline = time.time() + max(10, timeout)
+    while time.time() < deadline:
+        row = store.get_run(run_id)
+        if row:
+            status = row.get("status")
+            if status == "done":
+                return True, ""
+            if status == "failed":
+                return False, str(row.get("error_category") or "")
+        time.sleep(0.5)
+    return False, ""
+
+
+def _last_run_error(run_id: str) -> str:
+    from services.storage import register_store as store
+
+    row = store.get_run(run_id) or {}
+    return str(row.get("error") or "")
 
 
 def classify_error(err: str, mail_source: str = "") -> str:

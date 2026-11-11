@@ -127,7 +127,10 @@ class RegisterPoolManagementTests(unittest.TestCase):
     """代理池与邮箱池的核心语义。"""
 
     def setUp(self):
-        store.replace_proxies("http://px1:1\nhttp://px2:2", mode="replace")
+        # replace 模式**保留**已有代理的用量（原注册机语义），
+        # 所以先清空池子，保证每个用例从零开始。
+        store.replace_proxies([], mode="replace")
+        store.replace_proxies(["http://px1:1", "http://px2:2"], mode="replace")
 
     def test_pick_proxy_reserves_quota(self):
         p1 = store.pick_proxy()
@@ -162,7 +165,7 @@ class RegisterPoolManagementTests(unittest.TestCase):
 
     def test_static_proxy_disabled_after_repeated_cf_block(self):
         p = store.pick_proxy()
-        store.update_proxy(p, {"proxy_type": "static"})
+        store.update_proxy(p, proxy_type="static")
         store.mark_proxy_cf_blocked(p)
         self.assertTrue(store.find_proxy(p)["enabled"])
         store.mark_proxy_cf_blocked(p)
@@ -170,7 +173,7 @@ class RegisterPoolManagementTests(unittest.TestCase):
 
     def test_dynamic_proxy_not_disabled(self):
         p = store.pick_proxy()
-        store.update_proxy(p, {"proxy_type": "dynamic"})
+        store.update_proxy(p, proxy_type="dynamic")
         store.mark_proxy_cf_blocked(p)
         store.mark_proxy_cf_blocked(p)
         # 动态代理换 IP 可能就通了 → 不停用
