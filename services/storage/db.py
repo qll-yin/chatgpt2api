@@ -204,6 +204,16 @@ def runtime_session_scope() -> Iterator[Session]:
         yield session
 
 
+@contextmanager
+def register_session_scope() -> Iterator[Session]:
+    """注册业务数据专用事务上下文（首次使用时自动建注册相关表）。"""
+    from services.storage.register_store import ensure_register_tables
+
+    ensure_register_tables()
+    with session_scope() as session:
+        yield session
+
+
 def database_dialect() -> str:
     """返回当前方言名（postgresql / sqlite / mysql），用于方言相关 SQL 分支。"""
     return get_engine().dialect.name

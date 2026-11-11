@@ -244,6 +244,16 @@ def list_image_tasks(owner_id: str, task_ids: Iterable[str] | None = None) -> li
         return [_task_from_row(row) for row in session.execute(stmt).scalars()]
 
 
+def list_all_image_tasks() -> list[dict[str, Any]]:
+    """列出全部图片任务（备份用）。
+
+    不分 owner，按 updated_at 倒序。备份要的是完整快照。
+    """
+    with runtime_session_scope() as session:
+        stmt = select(ImageTaskModel).order_by(ImageTaskModel.updated_at.desc())
+        return [_task_from_row(row) for row in session.execute(stmt).scalars()]
+
+
 def delete_expired_image_tasks(cutoff_ts: float) -> int:
     """删除更新时间早于 cutoff_ts 的**终态**任务，返回删除条数。
 
