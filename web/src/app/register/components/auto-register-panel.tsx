@@ -1,0 +1,245 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { LoaderCircle, Play, Save, Zap } from "lucide-react";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  checkAutoRegisterNow,
+  fetchAutoRegisterSettings,
+  saveAutoRegisterSettings,
+  triggerAutoRegisterNow,
+  type AutoRegisterSettings,
+  type AutoRegisterState,
+} from "@/lib/register-api";
+
+const DEFAULTS: AutoRegisterSettings = {
+  enabled: false,
+  threshold: 10,
+  target_batch: 20,
+  check_interval_minute: 30,
+  register_url: "",
+  register_auth_key: "",
+  register_options: {},
+  cooldown_minute: 30,
+};
+
+export function AutoRegisterPanel() {
+  const [settings, setSettings] = useState<AutoRegisterSettings>(DEFAULTS);
+  const [state, setState] = useState<AutoRegisterState | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await fetchAutoRegisterSettings();
+      setSettings({ ...DEFAULTS, ...data.settings });
+      setState(data.state);
+    } catch (error) {
+      toast.error(`加载失败：${(error as Error).message ?? error}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = setInterval(load, 10000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  const update = <K extends keyof AutoRegisterSettings>(
+    key: K,
+    value: AutoRegisterSettings[K],
+  ) => {
+    setSettings((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const data = await saveAutoRegisterSettings(settings);
+      setSettings({ ...DEFAULTS, ...data.settings });
+      toast.success("已保存，守护进程会立即重新检查");
+    } catch (error) {
+      toast.error(`保存失败：${(error as Error).message ?? error}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCheck = async () => {
+    setChecking(true);
+    try {
+      const result = await checkAutoRegisterNow();
+      toast.success(
+        result.skipped
+          ? `未触发：${result.reason ?? ""}`
+          : result.triggered
+            ? "已触发注册"
+            : "触发失败",
+      );
+      await load();
+    } catch (error) {
+      toast.error(`检查失败：${(error as Error).message ?? error}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleTrigger = async () => {
+    setChecking(true);
+    try {
+      const result = await triggerAutoRegisterNow();
+      if (result.ok) toast.success("已触发注册");
+      else toast.error(result.error || "触发失败");
+      await load();
+    } catch (error) {
+      toast.error(`触发失败：${(error as Error).message ?? error}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <div className="grid gap-4 lg:grid-cols-[1fr_minmax(280px,360px)]">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">号池自动补充</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            定时检查号池里的可用账号数，低于阈值时自动触发注册，让号池维持在目标水位。
+          </p>
+
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              checked={settings.enabled}
+              onCheckedChange={(v) => update("enabled", Boolean(v))}
+            />
+            启用自动补充
+          </label>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-threshold">可用账号低于此值触发</Label>
+              <Input
+                id="auto-threshold"
+                type="number"
+                min={0}
+                value={settings.threshold}
+                onChange={(e) => update("threshold", Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-batch">每次注册成功数</Label>
+              <Input
+                id="auto-batch"
+                type="number"
+                min={1}
+                value={settings.target_batch}
+                onChange={(e) => update("target_batch", Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-interval">检测间隔（分钟）</Label>
+              <Input
+                id="auto-interval"
+                type="number"
+                min={1}
+                value={settings.check_interval_minute}
+                onChange={(e) => update("check_interval_minute", Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-cooldown">触发后冷却（分钟）</Label>
+              <Input
+                id="auto-cooldown"
+                type="number"
+                min={0}
+                value={settings.cooldown_minute}
+                onChange={(e) => update("cooldown_minute", Number(e.target.value))}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="auto-url">注册机地址</Label>
+            <Input
+              id="auto-url"
+              placeholder="http://register:8765"
+              value={settings.register_url}
+              onChange={(e) => update("register_url", e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              注册机独立部署时填它的地址；注册机已合并进本项目时留空即可。
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="auto-key">注册机 auth-key</Label>
+            <Input
+              id="auto-key"
+              type="password"
+              value={settings.register_auth_key}
+              onChange={(e) => update("register_auth_key", e.target.value)}
+            />
+          </div>
+
+          <div className="flex flex-wrap justify-end gap-2 border-t pt-3">
+            <Button variant="secondary" onClick={handleCheck} disabled={checking}>
+              {checking ? <LoaderCircle className="size-4 animate-spin" /> : <Zap className="size-4" />}
+              立即检查
+            </Button>
+            <Button variant="secondary" onClick={handleTrigger} disabled={checking}>
+              <Play className="size-4" />
+              强制触发
+            </Button>
+            <Button onClick={handleSave} disabled={saving}>
+              {saving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+              保存
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">守护状态</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Badge variant={settings.enabled ? "secondary" : "outline"}>
+              {settings.enabled ? "已启用" : "未启用"}
+            </Badge>
+            {state?.last_error ? (
+              <span className="text-xs text-destructive">{state.last_error}</span>
+            ) : null}
+          </div>
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
+            <dt className="text-muted-foreground">上次检查</dt>
+            <dd className="text-right tabular-nums">
+              {state?.last_check_at ? new Date(state.last_check_at * 1000).toLocaleTimeString() : "—"}
+            </dd>
+            <dt className="text-muted-foreground">检查时可用数</dt>
+            <dd className="text-right tabular-nums">{state?.last_check_active ?? "—"}</dd>
+            <dt className="text-muted-foreground">上次触发</dt>
+            <dd className="text-right tabular-nums">
+              {state?.last_trigger_at ? new Date(state.last_trigger_at * 1000).toLocaleTimeString() : "—"}
+            </dd>
+            <dt className="text-muted-foreground">触发次数</dt>
+            <dd className="text-right tabular-nums">{state?.trigger_count ?? 0}</dd>
+            <dt className="text-muted-foreground">上次结果</dt>
+            <dd className="text-right text-xs text-muted-foreground">
+              {state?.last_trigger_result || "—"}
+            </dd>
+          </dl>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
