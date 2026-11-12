@@ -855,21 +855,30 @@ def finish_run(
     ⚠️ 参数名是 category（不是 error_category）—— 调用方传的也是 category，
        名字必须对齐，否则 TypeError 会让 run 永远停在 "running"，
        worker 死等 1800 秒，前端永远显示「运行中」。
+
+    ⚠️ email 传空 = **不改这一列**（不是清空）。
+       非池化来源（Remail / CF 临时邮箱）一开始登记的是占位邮箱
+       （xxx_placeholder_N@placeholder.local），失败时我们往往拿不到真实邮箱；
+       这时候把列清空会让「运行记录」里连占位信息都没了。
+       真实邮箱只在**注册成功**时回写 —— 那时 flow.result.email 才是准的。
     """
     st = str(status or "failed").strip().lower()
     if st not in ("done", "failed"):
         st = "failed"
+    values: dict[str, Any] = {
+        "status": st,
+        "finished_at": time.time(),
+        "error": (error or None),
+        "error_category": (category or None),
+    }
+    email_value = str(email or "").strip()
+    if email_value:
+        values["email"] = email_value
     with register_session_scope() as session:
         session.execute(
             sa_update(RunModel)
             .where(RunModel.run_id == run_id)
-            .values(
-                status=st,
-                finished_at=time.time(),
-                error=(error or None),
-                error_category=(category or None),
-                email=(email or None),
-            )
+            .values(**values)
         )
 
 

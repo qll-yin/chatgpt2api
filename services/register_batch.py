@@ -649,7 +649,7 @@ class AutoLoopController:
             #    旧注册机不管号池，所以「注册成功自动导入号池」这个开关
             #    形同虚设 —— 号注册出来了，但号池里一个都没有。
             if ok:
-                self._import_to_pool(account, proxy)
+                self._import_to_pool(account, proxy, run_id)
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)
@@ -818,19 +818,34 @@ class AutoLoopController:
 
         threading.Thread(target=_run, daemon=True, name="auto-loop-quota-refresh").start()
 
-    def _import_to_pool(self, account: dict, proxy: str) -> bool:
-        """注册成功后把这个号写入号池。
+    def _import_to_pool(
+        self,
+        account: dict,
+        proxy: str,
+        run_id: str = "",
+    ) -> bool:
+        """注册成功后把这个号写入号池（chatgpt2api 的「号池管理」）。
 
         走 chatgpt2api 原生的号池写入（和手动导入号池同一套），
         格式与注册机导出的 `access_token----proxy` 完全一致。
 
         ⚠️ 这里**不刷新额度** —— 批量过程中逐个刷新会拖慢 worker，
         而且额度刷新要走 OpenAI 网络请求。批量结束后由前端统一刷一次。
+
+        ⚠️ 邮箱必须用**注册成功后的真实邮箱**，不能用 worker 手里的那个：
+           · 池化来源（outlook / icloud）：两者一致
+           · 非池化来源（Remail / CF 临时邮箱）：worker 手里只有占位地址
+             （remail_placeholder_xxx@placeholder.local），
+             用它去查注册结果永远查不到 → 号注册出来了却**入不了池**。
+             真实邮箱由 registrar 写进运行记录（run.email），这里从那里取。
         """
         if not self._options.get("auto_import", True):
             return False
-        email = str(account.get("email") or "").strip().lower()
+        email = self._resolve_registered_email(account, run_id)
         if not email:
+            logger.warning(
+                "[auto-loop] 注册成功但拿不到真实邮箱，跳过入池（run=%s）", run_id
+            )
             return False
         try:
             from services import register_service
@@ -847,16 +862,67 @@ class AutoLoopController:
 
             result = register_service.import_to_pool_with_refresh([payload], refresh=False)
             imported = int(result.get("imported") or 0)
-            if imported:
+            skipped = int(result.get("skipped") or 0)
+            # ⚠️ imported=0 但 skipped>0 = 这个号**已经在池子里**（重跑同一个号）。
+            #    这时也要算成功 —— 号池里那条记录的代理已经被更新成这次的代理了
+            #    （add_account_items 是合并覆盖），不算成功的话用户会以为没入池。
+            if imported or skipped:
                 with self._lock:
                     self._imported_tokens.append(access_token)
-                logger.info("[auto-loop] 已导入号池: %s", email)
-                self._broadcast("imported", {"email": email, "imported": imported})
-            return bool(imported)
+                if imported:
+                    logger.info(
+                        "[auto-loop] 已导入号池: %s（代理=%s）",
+                        email,
+                        payload.get("proxy") or "直连",
+                    )
+                else:
+                    logger.info(
+                        "[auto-loop] 号已在池中，已更新代理: %s（代理=%s）",
+                        email,
+                        payload.get("proxy") or "直连",
+                    )
+                self._broadcast(
+                    "imported",
+                    {"email": email, "imported": imported or skipped},
+                )
+                return True
+            logger.warning(
+                "[auto-loop] 入池未新增（可能已存在）: %s skipped=%s",
+                email,
+                skipped,
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
             # 入池失败不能拖垮整个批次 —— 号已经注册成功了
             logger.warning("[auto-loop] 导入号池失败 %s: %s", email, exc)
             return False
+
+    @staticmethod
+    def _resolve_registered_email(account: dict, run_id: str = "") -> str:
+        """找出这次注册**真实**用掉的邮箱。
+
+        顺序：
+          1. 运行记录里的邮箱（registrar 成功后回写的是真实邮箱，最准）
+          2. worker 手里的 account 邮箱（池化来源就是这个）
+          3. 都拿不到 → 空串（调用方跳过入池）
+        """
+        candidates: list[str] = []
+        if run_id:
+            try:
+                row = db.get_run(run_id) or {}
+                candidates.append(str(row.get("email") or ""))
+            except Exception:  # noqa: BLE001
+                pass
+        candidates.append(str((account or {}).get("email") or ""))
+        for raw in candidates:
+            email = raw.strip().lower()
+            # 占位邮箱（remail_placeholder_xxx@placeholder.local）不能用来查凭证
+            if not email or "@" not in email:
+                continue
+            if "placeholder" in email:
+                continue
+            return email
+        return ""
 
     def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
         """轮询 runs 表，等 run 跑完。"""

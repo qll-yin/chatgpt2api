@@ -143,6 +143,80 @@ class ImportIntegrityTests(unittest.TestCase):
         )
 
 
+class UndefinedGlobalTests(unittest.TestCase):
+    """函数里用到的名字必须在模块级可见 —— 否则运行时 NameError。
+
+    ⚠️ 为什么需要
+    ----------
+    这个项目大量使用「函数内延迟 import」（为了避免循环依赖 / 减少启动开销）。
+    于是很容易出现这种情况：
+
+        from services.storage import register_store as store   # 只在 A 函数里导入了
+
+        def B():
+            return store.get_run(...)      # ← B 里没导入，模块级也没有 store
+                                          #    一跑到就是 NameError
+
+    实测踩过：`register_service._wait_run` 就是这样 —— 单次注册接口直接 500，
+    而且报错发生在等 run 结束的时候，离根因十万八千里。
+
+    用 `symtable`（Python 自带的符号表分析器）静态扫一遍：
+    函数作用域里「按全局查找」的名字，必须在模块级存在或是内置名。
+    """
+
+    # 只扫注册相关模块 —— 其他模块的历史遗留问题不在本轮范围内，
+    # 一次扫全库会引入一堆与本次改动无关的噪声。
+    TARGETS = [
+        "services/register_service.py",
+        "services/register_batch.py",
+        "services/register_registrar.py",
+        "services/register_two_factor.py",
+        "services/auto_register_guardian.py",
+        "services/register_exporter.py",
+    ]
+
+    def test_no_undefined_global_names(self):
+        import builtins
+        import symtable
+
+        problems: list[str] = []
+        checked = 0
+
+        for rel in self.TARGETS:
+            path = ROOT / rel
+            if not path.is_file():
+                continue
+            checked += 1
+            source = path.read_text(encoding="utf-8")
+            top = symtable.symtable(source, rel, "exec")
+            module_names = {sym.get_name() for sym in top.get_symbols()}
+
+            def walk(table) -> None:
+                for sym in table.get_symbols():
+                    name = sym.get_name()
+                    if not (sym.is_global() and not sym.is_assigned()):
+                        continue
+                    if name in module_names or hasattr(builtins, name):
+                        continue
+                    problems.append(
+                        f"{rel}:{table.get_lineno()}  函数 {table.get_name()} "
+                        f"引用了未定义的全局名 {name}"
+                    )
+
+                for child in table.get_children():
+                    walk(child)
+
+            walk(top)
+
+        self.assertGreater(checked, 3, "扫描目标太少，检查脚本可能失效")
+        self.assertEqual(
+            problems,
+            [],
+            "以下函数引用了模块级不存在的名字（运行时会 NameError）：\n"
+            + "\n".join(problems),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 

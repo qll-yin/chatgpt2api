@@ -356,14 +356,14 @@ export function BatchRegisterPanel() {
                   checked={autoImport}
                   onCheckedChange={(v) => setAutoImport(Boolean(v))}
                 />
-                注册成功后自动导入号池
+                注册成功后自动导入号池管理
               </label>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
                   checked={withProxy}
                   onCheckedChange={(v) => setWithProxy(Boolean(v))}
                 />
-                入池时携带代理
+                入池时携带注册所用代理
               </label>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
@@ -376,6 +376,10 @@ export function BatchRegisterPanel() {
                 <Checkbox checked={want2fa} onCheckedChange={(v) => setWant2fa(Boolean(v))} />
                 绑定 2FA
               </label>
+              <p className="text-xs text-muted-foreground">
+                自动导入写入的是左侧导航「号池管理」里的账号池（chatgpt2api 账号池），
+                不是本页的「注册结果」；批量结束后会自动刷一次额度。
+              </p>
             </div>
 
             <div className="flex flex-wrap gap-2 border-t pt-3">

@@ -33,9 +33,29 @@
 
 SQLite 特殊处理
 ---------------
-SQLite 不支持 `pool_size` 之外的多数队列参数，且默认禁止跨线程共享连接。
-这里用 `StaticPool` + `check_same_thread=False`，让多线程共用同一连接；
+SQLite 默认禁止跨线程共享连接，这里用 `check_same_thread=False` 放开，
 同时开启 WAL 模式提升读写并发（生产推荐 PG，此处仅为兼容旧部署）。
+
+⚠️ 文件库用**真正的连接池**（QueuePool），不是 StaticPool
+--------------------------------------------------------
+早先这里用的是 `StaticPool` —— 全进程**共用同一条连接**。
+SQLite 的连接对象是带状态的：游标、事务、预处理语句都挂在连接上。
+多线程同时用同一条连接时，一个线程的 `commit()` 会把另一个线程正在
+遍历的结果集作废，于是对方拿到**空行**：
+
+    IndexError: tuple index out of range        ← 取行时行是空的
+    TypeError: int() argument ... not 'NoneType' ← 计数列读成 None
+
+本项目的批量注册正是多 worker 线程 + FastAPI 请求线程一起读写，
+所以这个坑会表现为「注册跑着跑着状态乱掉 / 统计接口 500」，
+而且是**随机**出现，极难定位。
+
+改成 QueuePool 后：连接池保证一条连接同一时刻只被一个线程持有，
+每个线程各拿各的连接，配合 WAL（读不阻塞写）+ busy_timeout
+（写锁排队而不是直接报错），并发就正常了。
+
+内存库（`sqlite:///:memory:`）例外：每条连接都是一个独立的空库，
+只能继续用 StaticPool（本项目没有用到，保留兜底）。
 """
 
 from __future__ import annotations
@@ -69,6 +89,15 @@ _engine_lock = threading.Lock()
 
 def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
+
+
+def _is_sqlite_memory(url: str) -> bool:
+    """内存库（每条连接都是独立空库）—— 只能用 StaticPool。"""
+    if ":memory:" in url:
+        return True
+    # sqlite:// 或 sqlite+pysqlite:// —— 无路径 = 内存库
+    tail = url.split("://", 1)[-1]
+    return tail in ("", "/")
 
 
 def resolve_database_url() -> str:
@@ -118,11 +147,21 @@ def get_engine() -> Engine:
         if _is_sqlite(url):
             from sqlalchemy.pool import StaticPool
 
-            # SQLite：单连接 + 跨线程共享 + WAL
-            kwargs.update(
-                poolclass=StaticPool,
-                connect_args={"check_same_thread": False, "timeout": POOL_TIMEOUT},
-            )
+            connect_args = {"check_same_thread": False, "timeout": POOL_TIMEOUT}
+            if _is_sqlite_memory(url):
+                # 内存库：每条连接都是独立空库，只能共用一条
+                kwargs.update(poolclass=StaticPool, connect_args=connect_args)
+            else:
+                # 文件库：走真正的连接池 —— 一条连接同一时刻只归一个线程，
+                # 避免多线程共用一条连接时互相作废对方的结果集
+                # （见模块 docstring 的「SQLite 特殊处理」）。
+                kwargs.update(
+                    pool_size=POOL_SIZE,
+                    max_overflow=MAX_OVERFLOW,
+                    pool_timeout=POOL_TIMEOUT,
+                    pool_recycle=POOL_RECYCLE,
+                    connect_args=connect_args,
+                )
         else:
             kwargs.update(
                 pool_size=POOL_SIZE,
@@ -153,9 +192,12 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
     def _set_pragmas(dbapi_connection, _record):  # pragma: no cover - 驱动回调
         cursor = dbapi_connection.cursor()
         try:
+            # ⚠️ 顺序要紧：busy_timeout 必须**先**设。
+            #    切 WAL 模式要拿文件锁，别的连接正持有事务时会报
+            #    "database is locked" —— 先设好等待时间才不会在并发建连时炸。
+            cursor.execute(f"PRAGMA busy_timeout={POOL_TIMEOUT * 1000}")
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute(f"PRAGMA busy_timeout={POOL_TIMEOUT * 1000}")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()

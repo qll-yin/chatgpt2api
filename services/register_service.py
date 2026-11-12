@@ -387,13 +387,27 @@ def register_one(options: dict[str, Any]) -> dict[str, Any]:
     # 等它跑完
     ok, category = _wait_run(run_id, timeout=int(options.get("timeout") or 1800))
 
-    record = store.get_registered(account.get("email") or "") or {}
+    # ⚠️ 邮箱要用**注册成功后的真实邮箱**，不能直接用 account 里的：
+    #    非池化来源（Remail / CF 临时邮箱）的 account["email"] 是占位地址
+    #    （remail_placeholder_xxx@placeholder.local），真实邮箱只写在
+    #    运行记录（registrar 成功后回写）里。用占位邮箱查凭证 → 查不到 →
+    #    号注册出来了却没入池（用户实测：注册结果里有，号池里没有）。
+    run_row = store.get_run(run_id) or {}
+    real_email = str(
+        run_row.get("email") or account.get("email") or ""
+    ).strip().lower()
+    if "placeholder" in real_email:
+        real_email = ""
+    record = store.get_registered(real_email) or {}
     access_token = str(record.get("access_token") or "").strip()
-    email = str(record.get("email") or account.get("email") or "").strip().lower()
+    email = str(record.get("email") or real_email or account.get("email") or "").strip().lower()
 
     imported = False
     if ok and access_token and bool(options.get("auto_import", False)):
         payload = build_pool_payload(email, access_token, str(options.get("proxy") or ""))
+        # 「入池时携带代理」关掉时，即使注册记录里存了代理也不带进号池
+        if not options.get("with_proxy", True):
+            payload.pop("proxy", None)
         # 单次注册只有一个号，直接带刷新（用户想立刻看到额度）
         result = import_to_pool_with_refresh([payload])
         imported = bool(result.get("imported"))
@@ -413,6 +427,11 @@ def register_one(options: dict[str, Any]) -> dict[str, Any]:
 
 def _wait_run(run_id: str, timeout: int = 1800) -> tuple[bool, str]:
     """等一个 run 跑完，返回 (ok, error_category)。"""
+    # ⚠️ 这里必须自己 import —— 本模块的 store 是**函数内局部导入**的，
+    #    模块级没有这个名字。漏了这行会 NameError：
+    #    单次注册接口直接 500（实测就是这个坑）。
+    from services.storage import register_store as store
+
     deadline = time.time() + max(10, timeout)
     while time.time() < deadline:
         row = store.get_run(run_id)

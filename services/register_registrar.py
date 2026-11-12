@@ -213,6 +213,30 @@ def classify_error(err: str, mail_source: str = "") -> str:
     return "unknown"
 
 
+def _flow_result_email(flow, fallback: str = "") -> str:
+    """取注册流程里的**真实**邮箱。
+
+    ⚠️ 为什么需要它
+    --------------
+    非池化来源（Remail / CF 临时邮箱）在号池里没有真实邮箱，
+    worker 造的是一个占位地址：
+        `remail_placeholder_1712345678_0@placeholder.local`
+    注册成功之后真实邮箱只存在于 `flow.result.email` 里。
+    而「注册成功后自动导入号池」要靠邮箱去查凭证 ——
+    拿占位邮箱去查，永远查不到 → 号注册出来了却入不了池。
+
+    所以这里把 flow.result.email 挖出来，作为运行记录 / 入池的真实标识。
+    拿不到就回退到外层 email（池化来源两者本来就一致）。
+    """
+    try:
+        real = str(getattr(getattr(flow, "result", None), "email", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        real = ""
+    if not real:
+        real = str(fallback or "").strip()
+    return real
+
+
 def _do_register(
     run_id: str,
     account: dict,
@@ -243,7 +267,18 @@ def _do_register(
 
     email = account["email"]
     # 提前读取，避免在 try 块前异常时 except 引用未定义
-    mail_source = db.get_setting("mail_source", "outlook")
+    #
+    # ⚠️ 优先用**本次批量指定的**邮箱来源（用户在「批量注册」页选的）。
+    #    旧注册机只有一个全局 mail_source，所以原来直接读配置没问题；
+    #    迁移过来后多了一次「本次选哪个来源」的选择，
+    #    这里如果还只读全局配置，就会出现：
+    #      worker 按 remail 去 claim（甚至造占位邮箱）
+    #      registrar 却按配置的 outlook 去取邮箱
+    #    → 来源对不上，注册必然失败（这是批量最容易踩的坑）。
+    #    没有指定时才回退到全局配置 —— 与旧注册机行为完全一致。
+    mail_source = str(
+        options.get("mail_source") or db.get_setting("mail_source", "outlook")
+    ).strip() or "outlook"
     # 要不要操作号池（mark_done / mark_failed / release）由 provider 声明的
     # pooled 决定。未知 kind 时保守当池化处理 —— 号池里真有这行的话
     # 至少不会漏掉状态回写，把号永远卡在 in_use。
@@ -251,6 +286,10 @@ def _do_register(
         is_pooled = get_provider_class(mail_source).pooled
     except MailProviderError:
         is_pooled = True
+
+    # flow 在 try 里创建，异常时可能还没建出来 ——
+    # 先置空，except 分支才能安全引用（否则 NameError 会盖掉真正的报错）。
+    flow = None  # type: ignore[assignment]
 
     try:
         # 本次注册专属的配置覆盖。
@@ -577,7 +616,7 @@ def _do_register(
             f"st={result_summary['session_token_len']} "
             f"rt={result_summary['refresh_token_len']}"
         )
-        db.finish_run(run_id, "done")
+        db.finish_run(run_id, "done", email=_flow_result_email(flow, d.get("email") or email))
 
     except Exception as e:
         err = str(e)
@@ -640,7 +679,16 @@ def _do_register(
                     f"[register] 记 Remail 订单失败原因出错: {e}"
                 )
 
-        db.finish_run(run_id, "failed", err, category=category)
+        db.finish_run(
+            run_id,
+            "failed",
+            err,
+            category=category,
+            # ⚠️ 失败时也尽量回写真实邮箱（能拿到的话）——
+            #    非池化来源登记的是占位邮箱，真实邮箱只有 flow.result 里有。
+            #    拿不到就留空：finish_run 空值不会清空原列。
+            email=_flow_result_email(flow, email),
+        )
         _emit_status(run_id, "error", {"message": err, "category": category})
 
     finally:
