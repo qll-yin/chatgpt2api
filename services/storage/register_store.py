@@ -564,6 +564,85 @@ def list_registered(limit: int = 0, offset: int = 0) -> tuple[list[dict[str, Any
         return items, count
 
 
+def release_proxy_for_emails(emails: list[str]) -> int:
+    """把这些号占用的代理配额还回去。返回释放了几个。
+
+    只对**真正占用过配额**的号释放 —— 用 extra_json.proxy_released 标记位
+    防重复释放（同一个号先标异常再删除，不能减两次）。
+    """
+    cleaned = [str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()]
+    if not cleaned:
+        return 0
+    released = 0
+    with register_session_scope() as session:
+        rows = session.execute(
+            select(RegisteredModel).where(RegisteredModel.email.in_(cleaned))
+        ).scalars()
+        for row in rows:
+            extra: dict[str, Any] = {}
+            if row.extra_json:
+                try:
+                    extra = json.loads(row.extra_json) or {}
+                except (TypeError, ValueError):
+                    extra = {}
+            if extra.get("proxy_released"):
+                continue
+            # 代理地址：优先看 extra（历史数据），再看独立列
+            proxy = str(extra.get("proxy") or row.proxy or "").strip()
+            if not proxy:
+                continue
+            # 只释放真正占过配额的代理 —— 用量已经是 0 的说明没占过
+            proxy_row = session.execute(
+                select(ProxyPoolModel).where(ProxyPoolModel.proxy == proxy)
+            ).scalar_one_or_none()
+            if proxy_row is not None and int(proxy_row.used_count or 0) > 0:
+                proxy_row.used_count = int(proxy_row.used_count) - 1
+            extra["proxy_released"] = True
+            row.extra_json = json.dumps(extra, ensure_ascii=False)
+            released += 1
+    return released
+
+
+def mark_registered_abnormal(email: str, abnormal: bool = True) -> bool:
+    """标注账号异常（被封 / 额度耗尽 / 不可用）。
+
+    标注为异常时**自动释放该号占用的代理配额** —— 号已经废了，
+    它的 IP 名额应该还回池子里给别的号用。
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return False
+    if abnormal:
+        release_proxy_for_emails([email])
+    with register_session_scope() as session:
+        row = session.execute(
+            select(RegisteredModel).where(RegisteredModel.email == email)
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        extra: dict[str, Any] = {}
+        if row.extra_json:
+            try:
+                extra = json.loads(row.extra_json) or {}
+            except (TypeError, ValueError):
+                extra = {}
+        extra["abnormal"] = bool(abnormal)
+        row.extra_json = json.dumps(extra, ensure_ascii=False)
+        return True
+
+
+def mark_registered_abnormal_by_emails(emails: list[str], abnormal: bool = True) -> int:
+    """批量标注账号异常。返回实际标注了几个。"""
+    cleaned = [str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()]
+    if not cleaned:
+        return 0
+    count = 0
+    for email in cleaned:
+        if mark_registered_abnormal(email, abnormal):
+            count += 1
+    return count
+
+
 def delete_registered(emails: list[str]) -> int:
     if not emails:
         return 0
@@ -1001,97 +1080,6 @@ def proxy_pool_stats() -> dict[str, Any]:
     }
 
 
-# ──────────────────────── Remail 订单 ────────────────────────
-
-
-def save_remail_order(order: dict[str, Any]) -> None:
-    order_no = str(order.get("order_no") or "").strip()
-    if not order_no:
-        return
-    with register_session_scope() as session:
-        existing = session.execute(
-            select(RemailOrderModel).where(RemailOrderModel.order_no == order_no)
-        ).scalar_one_or_none()
-        payload = {
-            "email": order.get("email"),
-            "suffix": order.get("suffix"),
-            "service_mode": order.get("service_mode"),
-            "supply_policy": order.get("supply_policy"),
-            "project_id": order.get("project_id"),
-            "order_status": order.get("order_status"),
-            "service_token": order.get("service_token"),
-            "pay_amount": order.get("pay_amount"),
-            "received_at": order.get("received_at"),
-            "receive_started_at": order.get("receive_started_at"),
-            "after_sale_until": order.get("after_sale_until"),
-            "used_email": order.get("used_email"),
-        }
-        payload = {k: v for k, v in payload.items() if v is not None}
-        if existing is None:
-            session.add(
-                RemailOrderModel(order_no=order_no, created_at=time.time(), **payload)
-            )
-        else:
-            for key, value in payload.items():
-                setattr(existing, key, value)
-
-
-def get_remail_order(order_no: str) -> Optional[dict[str, Any]]:
-    with register_session_scope() as session:
-        row = session.execute(
-            select(RemailOrderModel).where(RemailOrderModel.order_no == order_no)
-        ).scalar_one_or_none()
-        return {c.name: getattr(row, c.name) for c in row.__table__.columns} if row else None
-
-
-def list_remail_orders(limit: int = 100) -> list[dict[str, Any]]:
-    with register_session_scope() as session:
-        stmt = select(RemailOrderModel).order_by(RemailOrderModel.created_at.desc()).limit(limit)
-        return [
-            {c.name: getattr(row, c.name) for c in row.__table__.columns}
-            for row in session.execute(stmt).scalars()
-        ]
-
-
-def update_remail_order(order_no: str, updates: dict[str, Any]) -> bool:
-    allowed = {
-        "order_status", "used_email", "attempts", "received_at",
-        "receive_started_at", "after_sale_until", "service_token",
-    }
-    payload = {k: v for k, v in (updates or {}).items() if k in allowed}
-    if not payload:
-        return False
-    with register_session_scope() as session:
-        result = session.execute(
-            sa_update(RemailOrderModel)
-            .where(RemailOrderModel.order_no == order_no)
-            .values(**payload)
-        )
-        return bool(result.rowcount)
-
-
-def link_remail_order(email: str, order_no: str = "") -> bool:
-    """把 Remail 订单关联到注册成功的账号。"""
-    order_no = str(order_no or "").strip()
-    email = str(email or "").strip().lower()
-    if not order_no:
-        return False
-    with register_session_scope() as session:
-        result = session.execute(
-            sa_update(RemailOrderModel)
-            .where(RemailOrderModel.order_no == order_no)
-            .values(used_email=email)
-        )
-        return bool(result.rowcount)
-
-
-def mark_remail_order_attempt(order_no: str) -> None:
-    with register_session_scope() as session:
-        session.execute(
-            sa_update(RemailOrderModel)
-            .where(RemailOrderModel.order_no == order_no)
-            .values(attempts=RemailOrderModel.attempts + 1)
-        )
 
 
 def stats() -> dict[str, Any]:
@@ -1161,3 +1149,326 @@ def parse_lines(text: str, kind: str = "") -> list[dict[str, Any]]:
 def parse_import_text(text: str, kind: str = "") -> list[dict[str, Any]]:
     """parse_lines 的别名（与原 db.py 命名保持一致）。"""
     return parse_lines(text, kind)
+
+
+# ──────────────────────── Remail 订单 ────────────────────────
+#
+# Remail 只交付「邮箱地址 + serviceToken」这一对取件凭证，不交付账号密码，
+# 所以本地必须自己记一份 —— 后续取件、重复收件、看邮箱类型都读这里，
+# 不再回查 Remail 的 projects / orders 接口。
+#
+# ⚠️ 这套函数被 services/register/mail_providers/remail.py 直接调用
+#    （下单落库、复用挑选、尝试计数），也 registrar 调用（成功后关联账号）。
+
+# 一个长效订单最多被拿去注册几次。超过就不再复用它 ——
+# 否则会死循环卡在一个坏邮箱上（每次都失败又每次都复用它）。
+REMAIL_MAX_ATTEMPTS = 10
+
+
+def _remail_order_to_dict(row) -> dict[str, Any]:
+    item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+    # service_token 是取件凭证，列表页不返回明文（详情/取件时才用）。
+    item["has_token"] = bool(item.get("service_token"))
+    item.pop("service_token", None)
+    item["attempt_count"] = int(item.get("attempt_count") or 0)
+    item["disabled"] = bool(item.get("disabled"))
+    # 最大复用次数，前端显示「已用 N / 上限 M」用，别在前端硬编码。
+    item["max_attempts"] = REMAIL_MAX_ATTEMPTS
+    # 可复用 = 长效 + 没关联账号 + 状态有效 + 有 token + 未禁用 + 尝试次数没超限。
+    # 前端据此显示「可复用」标签，并提示下一个注册任务会直接用它（不再扣费）。
+    item["reusable"] = bool(
+        str(item.get("service_mode") or "").lower() == "purchase"
+        and not (item.get("used_email") or "").strip()
+        and item.get("has_token")
+        and str(item.get("order_status") or "") in ("paid", "active", "completed")
+        and not item["disabled"]
+        and item["attempt_count"] < REMAIL_MAX_ATTEMPTS
+    )
+    return item
+
+
+def save_remail_order(d: dict[str, Any]) -> None:
+    """记录一笔 Remail 订单（覆盖写）。"""
+    order_no = str(d.get("order_no") or "").strip()
+    if not order_no:
+        return
+    with register_session_scope() as session:
+        # ⚠️ used_email / disabled / attempt_count 不能被覆盖成默认值：
+        #    这张表的写操作是整行替换，不显式带上就会冲掉 ——
+        #    used_email 被冲空 → 那个邮箱会被重复注册；
+        #    disabled 被冲掉 → 手动禁用的订单又会被复用。
+        #    所以先读旧值，没传就沿用。
+        prev = session.execute(
+            select(RemailOrderModel).where(RemailOrderModel.order_no == order_no)
+        ).scalar_one_or_none()
+        prev_used = (prev.used_email or "").strip() if prev is not None else ""
+        prev_attempt = int(prev.attempt_count or 0) if prev is not None else 0
+        prev_disabled = bool(prev.disabled) if prev is not None else False
+
+        attempt = d.get("attempt_count")
+        disabled = d.get("disabled")
+        values = {
+            "email": str(d.get("email") or "").strip(),
+            "suffix": str(d.get("suffix") or "").strip(),
+            "service_mode": str(d.get("service_mode") or "").strip(),
+            "supply_policy": str(d.get("supply_policy") or "").strip(),
+            "project_id": d.get("project_id"),
+            "order_status": str(d.get("order_status") or "").strip(),
+            "service_token": str(d.get("service_token") or "").strip(),
+            "pay_amount": str(d.get("pay_amount") or "").strip(),
+            "received_at": d.get("received_at") or time.time(),
+            "receive_started_at": str(d.get("receive_started_at") or "").strip(),
+            "after_sale_until": str(d.get("after_sale_until") or "").strip(),
+            "used_email": str(d.get("used_email") or "").strip() or prev_used,
+            "attempt_count": int(attempt) if attempt is not None else prev_attempt,
+            "last_error": d.get("last_error"),
+            "disabled": bool(disabled) if disabled is not None else prev_disabled,
+            "created_at": d.get("created_at") or time.time(),
+        }
+        if prev is None:
+            session.add(RemailOrderModel(order_no=order_no, **values))
+        else:
+            for key, value in values.items():
+                setattr(prev, key, value)
+
+
+def list_remail_orders(limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
+    with register_session_scope() as session:
+        stmt = (
+            select(RemailOrderModel)
+            .order_by(RemailOrderModel.received_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return [_remail_order_to_dict(row) for row in session.execute(stmt).scalars()]
+
+
+def count_remail_orders() -> int:
+    with register_session_scope() as session:
+        return int(
+            session.execute(select(func.count()).select_from(RemailOrderModel)).scalar_one()
+        )
+
+
+def get_remail_order(order_no: str, *, with_token: bool = False) -> Optional[dict[str, Any]]:
+    with register_session_scope() as session:
+        row = session.execute(
+            select(RemailOrderModel).where(
+                RemailOrderModel.order_no == str(order_no or "").strip()
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+        if not with_token:
+            item["has_token"] = bool(item.get("service_token"))
+            item.pop("service_token", None)
+        return item
+
+
+def link_remail_order(order_no: str, email: str) -> bool:
+    """把订单关联到本地注册成功的账号。
+
+    顺带：短效（code）订单关联成功后即视为「已消耗」——
+    它的取件凭证是一次性的，用完就该标 consumed，而不是继续挂在 active。
+    长效（purchase）订单保持 active（还能重复收件）。
+    """
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(RemailOrderModel)
+            .where(RemailOrderModel.order_no == order_no)
+            .values(used_email=str(email or "").strip().lower())
+        )
+        ok = bool(result.rowcount)
+    if ok:
+        _consume_short_lived_order(order_no)
+    return ok
+
+
+def update_remail_order_status(order_no: str, status: str) -> bool:
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(RemailOrderModel)
+            .where(RemailOrderModel.order_no == order_no)
+            .values(order_status=str(status or "").strip())
+        )
+        return bool(result.rowcount)
+
+
+def set_remail_order_disabled(order_no: str, disabled: bool = True) -> bool:
+    """本地禁用 / 启用一笔 Remail 订单。
+
+    ⚠️ 用**独立的 disabled 字段**，不改 order_status ——
+    order_status 是 Remail 服务端返回的状态（paid/active/completed…），
+    不该把「我不想再用这个」混进去，否则分不清
+    「服务端说这单废了」和「我手动不用了」。
+
+    禁用的订单不会被复用（claim_reusable_remail_order 会跳过），
+    但仍可手动取件 —— 邮箱还在，钱已经花了。
+    """
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(RemailOrderModel)
+            .where(RemailOrderModel.order_no == order_no)
+            .values(disabled=bool(disabled))
+        )
+        return bool(result.rowcount)
+
+
+def delete_remail_order(order_no: str) -> bool:
+    """从本地删除一笔 Remail 订单记录。
+
+    ⚠️ 只删**本地记录**，不会去 Remail 退单/退款 —— 那个要走服务端的售后流程
+    （Order.afterSaleUntil）。这里只是让主人不再看到它、不再复用它。
+    """
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_delete(RemailOrderModel).where(RemailOrderModel.order_no == order_no)
+        )
+        return bool(result.rowcount)
+
+
+def delete_remail_orders(order_nos: list[str]) -> int:
+    """批量删除本地 Remail 订单记录。"""
+    cleaned = [str(o or "").strip() for o in (order_nos or []) if str(o or "").strip()]
+    if not cleaned:
+        return 0
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_delete(RemailOrderModel).where(RemailOrderModel.order_no.in_(cleaned))
+        )
+        return int(result.rowcount or 0)
+
+
+def find_remail_order_by_email(email: str) -> Optional[dict[str, Any]]:
+    with register_session_scope() as session:
+        row = session.execute(
+            select(RemailOrderModel)
+            .where(RemailOrderModel.email == str(email or "").strip().lower())
+            .order_by(RemailOrderModel.received_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+        item["has_token"] = bool(item.get("service_token"))
+        item.pop("service_token", None)
+        return item
+
+
+def claim_reusable_remail_order(
+    *,
+    service_mode: str = "purchase",
+    suffix: str = "",
+    project_id: Any = None,
+    max_attempts: int = REMAIL_MAX_ATTEMPTS,
+) -> Optional[dict[str, Any]]:
+    """找一笔可以复用的 Remail 订单，返回**含 service_token** 的完整记录。
+
+    复用条件（全部满足）：
+      1. service_mode = purchase（**长效**订单才可重复收件；code 短效是一次性的）
+      2. 没有关联账号（used_email 为空）—— 已注册成功的号不能再拿来注册
+      3. 订单还有 service_token（没它就取不到件）
+      4. 订单状态是有效的（paid / active / completed 都算；
+         refunded / failed / closed 的不能再用）
+      5. suffix / project_id 匹配（不同后缀的邮箱不能混用）
+      6. 尝试次数没超限（attempt_count < max_attempts）
+
+    为什么要复用：长效订单是**已经付过钱**的邮箱，注册失败（OTP 超时、
+    409、风控）之后那个邮箱本身还是好的 —— 换个号重新注册完全可行，
+    不该再花一次钱买新的。
+
+    挑哪一笔：最早下的一笔（received_at 升序）—— 优先把已经付过钱的用掉，
+    避免囤着一堆闲置订单还继续买新的。
+    """
+    mode = str(service_mode or "purchase").strip().lower()
+    if mode != "purchase":
+        # 短效订单一次性，用完就没了，不存在「复用」
+        return None
+    sf = str(suffix or "").strip()
+
+    with register_session_scope() as session:
+        stmt = select(RemailOrderModel).where(
+            RemailOrderModel.service_mode == "purchase",
+            (RemailOrderModel.used_email.is_(None)) | (RemailOrderModel.used_email == ""),
+            RemailOrderModel.service_token.is_not(None),
+            RemailOrderModel.service_token != "",
+            RemailOrderModel.order_status.in_(["paid", "active", "completed"]),
+            RemailOrderModel.disabled.is_(False),
+            RemailOrderModel.attempt_count < max(1, int(max_attempts)),
+        )
+        if sf:
+            stmt = stmt.where(RemailOrderModel.suffix == sf)
+        if project_id is not None:
+            stmt = stmt.where(RemailOrderModel.project_id == int(project_id))
+        stmt = stmt.order_by(RemailOrderModel.received_at.asc()).limit(1)
+        row = session.execute(stmt).scalar_one_or_none()
+        if row is None:
+            return None
+        return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def mark_remail_order_attempt(order_no: str, ok: bool, error: str = "") -> bool:
+    """记录一次注册尝试的结果。
+
+    失败 → attempt_count +1（超过上限就不再被复用，避免死循环用一个坏邮箱）
+    成功 → 由 registrar 走 link_remail_order 关联账号，不再计数
+    """
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(RemailOrderModel)
+            .where(RemailOrderModel.order_no == order_no)
+            .values(
+                attempt_count=RemailOrderModel.attempt_count + 1,
+                last_error=None if ok else str(error or "")[:200],
+            )
+        )
+        ok_row = bool(result.rowcount)
+
+    # 短效订单进入终态 → 状态置为「已消耗」
+    # ⚠️ 只在短效（code）订单上做。长效（purchase）能重复收件，
+    #    它的 active 是**真实状态**，不能改成 consumed。
+    if ok_row:
+        _consume_short_lived_order(order_no)
+    return ok_row
+
+
+def _consume_short_lived_order(order_no: str) -> bool:
+    """短效（code）订单用尽后，把状态置为 consumed（已消耗）。
+
+    背景：短效订单的 serviceToken 是**一次性凭证**，实测取件返回
+    `401 Credential is invalid or expired` —— 凭证早已失效，
+    但订单状态还写着 'active'，是**假状态**。
+    """
+    order_no = str(order_no or "").strip()
+    if not order_no:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(RemailOrderModel)
+            .where(
+                RemailOrderModel.order_no == order_no,
+                RemailOrderModel.service_mode == "code",
+                (
+                    RemailOrderModel.order_status.is_(None)
+                    | (RemailOrderModel.order_status.notin_(["consumed", "refunded"]))
+                ),
+            )
+            .values(order_status="consumed")
+        )
+        return bool(result.rowcount)

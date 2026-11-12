@@ -88,6 +88,34 @@ class MailConfigRequest(BaseModel):
     mail_source: str | None = None
 
 
+class RemailOrderRequest(BaseModel):
+    """手动下一单（测试用 / 补单）。留空则用「邮箱配置」里的默认值。"""
+
+    suffix: str | None = None
+    project_id: int | None = None
+    service_mode: str | None = None
+    supply_policy: str | None = None
+
+
+class LinkOrderRequest(BaseModel):
+    email: str
+
+
+class OrderDisabledRequest(BaseModel):
+    disabled: bool = True
+
+
+class BulkDeleteOrdersRequest(BaseModel):
+    order_nos: list[str]
+
+
+class MarkAbnormalRequest(BaseModel):
+    """标注账号异常（被封 / 额度耗尽 / 不可用）。"""
+
+    emails: list[str]
+    abnormal: bool = True
+
+
 class BatchStartRequest(BaseModel):
     """批量注册参数。字段与原注册机的 auto-loop 一致。"""
 
@@ -153,6 +181,8 @@ def create_router() -> APIRouter:
                 "has_refresh_token": bool(item.get("refresh_token")),
                 "proxy": item.get("proxy") or "",
                 "created_at": item.get("created_at"),
+                # 标注异常的号（被封 / 额度耗尽 / 不可用）
+                "abnormal": bool((item.get("extra") or {}).get("abnormal")),
             }
             for item in items
         ]
@@ -384,6 +414,202 @@ def create_router() -> APIRouter:
         for key, value in body.values.items():
             store.set_setting(str(key), value)
         return {"values": store.get_settings()}
+
+    # ──────────────────────── Remail 订单 ────────────────────────
+    #
+    # Remail 只交付「邮箱地址 + serviceToken」这一对取件凭证，不交付账号密码，
+    # 所以本地必须自己记一份 —— 后续取件、重复收件、看邮箱类型都读本地表，
+    # 不回查 Remail 的 projects / orders 接口。
+
+    @router.get("/api/register/mail/orders")
+    async def mail_orders(
+        limit: int = 50,
+        offset: int = 0,
+        authorization: str | None = Header(default=None),
+    ):
+        """本机记录的 Remail 订单列表。"""
+        require_admin(authorization)
+        items = store.list_remail_orders(limit=max(1, min(limit, 500)), offset=max(0, offset))
+        return {"items": items, "total": store.count_remail_orders()}
+
+    @router.post("/api/register/mail/orders")
+    async def create_mail_order(
+        body: RemailOrderRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """手动下一单（测试用 / 补单）。
+
+        走的是和注册流程完全一样的 provider.create_mailbox()，
+        所以订单会落在同一张表里，行为一致。
+        """
+        require_admin(authorization)
+        from services.register.mail_providers import create_mail_provider
+
+        try:
+            provider = create_mail_provider("remail", store.get_mail_settings())
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail={"error": f"构造 Remail provider 失败: {exc}"}
+            )
+
+        # 允许这一单覆盖配置里的后缀 / 项目 / 模式
+        for attr, value in (
+            ("email_suffix", body.suffix),
+            ("project_id", body.project_id),
+            ("service_mode", body.service_mode),
+            ("supply_policy", body.supply_policy),
+        ):
+            if value not in (None, ""):
+                setattr(provider, attr, value)
+
+        try:
+            email = provider.create_mailbox()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail={"error": f"下单失败: {exc}"})
+        return {"ok": True, "email": email, "items": store.list_remail_orders()}
+
+    @router.get("/api/register/mail/orders/{order_no}/mails")
+    async def mail_order_mails(
+        order_no: str,
+        authorization: str | None = Header(default=None),
+    ):
+        """对某个订单取件 —— 这就是「长效订单可以重复收件」的入口。
+
+        订单里的 serviceToken 是取件凭证，这里从本地表读，不回查服务端。
+        """
+        require_admin(authorization)
+        from services.register.mail_providers import create_mail_provider
+
+        order = store.get_remail_order(order_no, with_token=True)
+        if not order:
+            raise HTTPException(status_code=404, detail={"error": "订单不存在"})
+        token = order.get("service_token") or ""
+        if not token:
+            raise HTTPException(status_code=400, detail={"error": "该订单没有 serviceToken，无法取件"})
+
+        try:
+            provider = create_mail_provider("remail", store.get_mail_settings())
+            mails = provider.fetch_mails(order.get("email") or "", token)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"取件失败: {exc}"})
+
+        # 只回必要字段。邮件正文可能很长，前端只展示摘要 + 验证码。
+        items = [
+            {
+                "id": mail.get("id"),
+                "sender": mail.get("sender") or "",
+                "subject": mail.get("subject") or "",
+                "receivedAt": mail.get("receivedAt") or "",
+                "verificationCode": mail.get("verificationCode") or "",
+                "bodyPreview": (mail.get("bodyPreview") or "")[:300],
+            }
+            for mail in mails
+        ]
+        return {"ok": True, "email": order.get("email") or "", "items": items}
+
+    @router.post("/api/register/mail/orders/{order_no}/link")
+    async def link_mail_order(
+        order_no: str,
+        body: LinkOrderRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """把订单关联到本地注册成功的账号。"""
+        require_admin(authorization)
+        if not store.link_remail_order(order_no, body.email):
+            raise HTTPException(status_code=404, detail={"error": "订单不存在"})
+        return {"ok": True, "items": store.list_remail_orders()}
+
+    @router.post("/api/register/mail/orders/{order_no}/disabled")
+    async def mail_order_disabled(
+        order_no: str,
+        body: OrderDisabledRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """本地禁用 / 启用一笔订单。
+
+        禁用的订单不会再被自动复用（但仍可手动取件 —— 邮箱还在，钱已经花了）。
+        只改本地标记，不动 Remail 服务端的状态。
+        """
+        require_admin(authorization)
+        if not store.set_remail_order_disabled(order_no, body.disabled):
+            raise HTTPException(status_code=404, detail={"error": "订单不存在"})
+        return {"ok": True, "items": store.list_remail_orders()}
+
+    @router.delete("/api/register/mail/orders/{order_no}")
+    async def delete_mail_order(
+        order_no: str,
+        authorization: str | None = Header(default=None),
+    ):
+        """删除本地订单记录。
+
+        ⚠️ 只删本地记录，不会去 Remail 退单 —— 退款要走服务端的售后流程。
+        """
+        require_admin(authorization)
+        if not store.delete_remail_order(order_no):
+            raise HTTPException(status_code=404, detail={"error": "订单不存在"})
+        return {"ok": True, "items": store.list_remail_orders()}
+
+    @router.post("/api/register/mail/orders/bulk_delete")
+    async def bulk_delete_mail_orders(
+        body: BulkDeleteOrdersRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """批量删除本地订单记录。"""
+        require_admin(authorization)
+        deleted = store.delete_remail_orders(body.order_nos)
+        return {"ok": True, "deleted": deleted, "items": store.list_remail_orders()}
+
+    @router.get("/api/register/mail/wallet")
+    async def mail_wallet(authorization: str | None = Header(default=None)):
+        """查 Remail 余额（透传 apikey/profile）。"""
+        require_admin(authorization)
+        from services.register.mail_providers import create_mail_provider
+
+        try:
+            provider = create_mail_provider("remail", store.get_mail_settings())
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail={"error": f"构造 Remail provider 失败: {exc}"}
+            )
+        try:
+            resp = provider._request("GET", "/v1/open/apikey/profile", timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"查询余额失败: {exc}"})
+        status = getattr(resp, "status_code", 0)
+        if status != 200:
+            raise HTTPException(
+                status_code=500, detail={"error": f"查询余额失败: status={status}"}
+            )
+        data = provider._parse_json(resp)
+        key = data.get("apiKey") if isinstance(data.get("apiKey"), dict) else data
+        return {
+            "ok": True,
+            "balance": str(key.get("balance") or "0"),
+            "enabled": key.get("enabled"),
+        }
+
+    # ──────────────────────── 标注账号异常 ────────────────────────
+
+    @router.post("/api/register/registered/mark-abnormal")
+    async def mark_abnormal(
+        body: MarkAbnormalRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """标注账号异常（被封 / 额度耗尽 / 不可用）。
+
+        标注异常时会**自动释放该号占用的代理配额** —— 号已经废了，
+        它的 IP 名额应该还回池子里给别的号用。
+        """
+        require_admin(authorization)
+        updated = store.mark_registered_abnormal_by_emails(body.emails, body.abnormal)
+        items, total = store.list_registered(limit=200)
+        return {
+            "ok": True,
+            "updated": updated,
+            "items": items,
+            "total": total,
+            "proxy_stats": store.proxy_pool_stats(),
+        }
 
     # ──────────────────────── 批量注册 ────────────────────────
 

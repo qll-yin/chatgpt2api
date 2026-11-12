@@ -289,7 +289,7 @@ class RemailMailProvider(MailProvider):
         返回复用的邮箱地址；没有可复用的返回 None（走正常下单）。
         """
         try:
-            from webui import db
+            from services.storage import register_store as db
             order = db.claim_reusable_remail_order(
                 service_mode=self.service_mode,
                 suffix=self.email_suffix,
@@ -314,7 +314,7 @@ class RemailMailProvider(MailProvider):
         # 这次尝试先记上：万一这单又失败了，attempt_count 涨上去，
         # 超过上限就不再复用它（否则会死循环卡在一个坏邮箱上）。
         try:
-            from webui import db
+            from services.storage import register_store as db
             db.mark_remail_order_attempt(self._order_no, ok=True)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[remail] 记尝试次数失败（不影响复用）: {e}")
@@ -375,7 +375,7 @@ class RemailMailProvider(MailProvider):
 
         # 记到本地订单表 —— 后续取件 / 重复收件 / 看邮箱类型都读这里
         try:
-            from webui import db
+            from services.storage import register_store as db
             db.save_remail_order({
                 "order_no": order_no,
                 "email": email,

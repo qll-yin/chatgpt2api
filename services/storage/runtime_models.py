@@ -149,8 +149,17 @@ class EditableFileTaskModel(RuntimeBase):
 
 
 def create_runtime_tables(engine) -> None:
-    """建表 + 建索引。幂等，可重复调用。"""
+    """建表 + 建索引 + 补列。幂等，可重复调用。
+
+    ⚠️ create_all 只建缺失的表，不给已存在的表加新列 ——
+    模型加字段后，跑过的库必须补一次，否则查询直接报
+    ``no such column``。详见 services/storage/migrations.py。
+    """
+    from services.storage.migrations import ensure_columns
+
     runtime_metadata.create_all(engine)
+    for table in runtime_metadata.tables.values():
+        ensure_columns(engine, table.name, list(table.columns))
 
 
 def row_to_dict(row: Any) -> dict[str, Any]:

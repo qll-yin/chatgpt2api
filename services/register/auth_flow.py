@@ -2009,7 +2009,7 @@ class AuthFlow:
 
     def get_sentinel_token(self, device_id: str) -> str:
         logger.info("[4/10] 获取 Sentinel Token (PoW)...")
-        from sentinel import get_sentinel_token
+        from .sentinel import get_sentinel_token
         result = get_sentinel_token(
             self.session,
             device_id=device_id,
@@ -2151,7 +2151,7 @@ class AuthFlow:
         so_token_for_request = getattr(self, "_last_sentinel_so_token", "")
         if self.result.device_id:
             try:
-                from sentinel import get_sentinel_token as _get_st
+                from .sentinel import get_sentinel_token as _get_st
                 token, so_token = _get_st(self.session, device_id=self.result.device_id,
                                 flow="username_password_create",
                                 **self._sentinel_fp_kwargs())
@@ -2460,7 +2460,7 @@ class AuthFlow:
         # 创建账户前刷新 sentinel token，flow 为 create_account
         if self.result.device_id:
             try:
-                from sentinel import get_sentinel_token as _get_st
+                from .sentinel import get_sentinel_token as _get_st
                 token, so_token = _get_st(self.session, device_id=self.result.device_id,
                                 flow="oauth_create_account",
                                 **self._sentinel_fp_kwargs())

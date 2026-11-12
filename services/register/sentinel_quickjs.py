@@ -330,7 +330,7 @@ def get_sentinel_token_via_quickjs(
         #    （curl:(35)，全局 5.4% 偶发）—— 排查方向被带偏了一整轮。
         #    网络类异常现在原样抛出去，让 registrar 的 classify_error 判成 network，
         #    也让 http_client 的 TLS 重试有机会先兜住；真正的 JS/PoW 问题才 return None。
-        from http_client import _is_tls_handshake_error
+        from .http_client import _is_tls_handshake_error
 
         if _is_tls_handshake_error(e):
             log(f"Sentinel 网络异常（非 PoW 问题，原样上抛）: {e}")

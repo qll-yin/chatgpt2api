@@ -17,6 +17,8 @@ services/register_service.py 的 `_import_to_pool`。
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import (
     Boolean,
     Column,
@@ -31,6 +33,8 @@ from sqlalchemy.orm import declarative_base
 
 register_metadata = MetaData()
 RegisterBase = declarative_base(metadata=register_metadata)
+
+logger = logging.getLogger(__name__)
 
 
 class OutlookAccountModel(RegisterBase):
@@ -173,7 +177,16 @@ class RemailOrderModel(RegisterBase):
     after_sale_until = Column(Text, nullable=True)
     # 关联到本地注册成功的账号
     used_email = Column(String(320), nullable=True)
-    attempts = Column(Integer, nullable=False, default=0)
+    # 这个邮箱被拿去注册过几次。用来防止死循环复用同一个坏邮箱
+    # （每次都失败又每次都复用它）。
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # 最近一次失败原因，便于人工判断
+    last_error = Column(Text, nullable=True)
+    # 本地手动禁用（True = 禁用，不再被自动复用）
+    # ⚠️ 用独立字段，不混进 order_status ——
+    #    order_status 是 Remail 服务端返回的状态，得分清
+    #    「服务端说这单废了」和「我手动不用了」。
+    disabled = Column(Boolean, nullable=False, default=False, server_default="0")
     created_at = Column(Float, nullable=True)
 
     __table_args__ = (
@@ -182,5 +195,67 @@ class RemailOrderModel(RegisterBase):
 
 
 def create_register_tables(engine) -> None:
-    """建表 + 建索引。幂等。"""
+    """建表 + 建索引 + 补列。幂等。
+
+    ⚠️ create_all 只建缺失的表，**不会给已存在的表加新列** ——
+    模型加了字段之后，跑过的库必须补一次，否则查询直接
+    ``OperationalError: no such column``。所以这里额外做一次列比对。
+    """
+    from services.storage.migrations import ensure_columns
+
     register_metadata.create_all(engine)
+    for table in register_metadata.tables.values():
+        ensure_columns(engine, table.name, list(table.columns))
+    _migrate_legacy_columns(engine)
+    _drop_legacy_columns(engine)
+
+
+# 模型里已经废弃、但老库里还留着的列。
+#
+# ⚠️ 这些列往往是 ``NOT NULL`` 且**没有 SQL 级 DEFAULT**
+#    （SQLAlchemy 的 ``default=0`` 是应用层默认值，不写进 DDL），
+#    新 INSERT 不带这一列就 IntegrityError。
+#    所以必须真的从表里删掉，而不是留着。
+LEGACY_COLUMNS_TO_DROP = {
+    # 早期叫 attempts，后来与原注册机对齐改名成 attempt_count
+    "reg_remail_orders": ["attempts"],
+}
+
+
+def _drop_legacy_columns(engine) -> None:
+    """删除模型里已废弃的老列（数据已在迁移函数里搬走）。"""
+    from services.storage.migrations import drop_columns
+
+    for table_name, columns in LEGACY_COLUMNS_TO_DROP.items():
+        drop_columns(engine, table_name, columns)
+
+
+def _migrate_legacy_columns(engine) -> None:
+    """历史数据的列迁移。
+
+    早期版本的 RemailOrderModel 用的是 ``attempts`` 列，后来改名为
+    ``attempt_count``（与原注册机对齐）。改名后老库的尝试次数会「归零」——
+    那些订单会被当成从没试过，可能被无限复用。
+    所以把老列的值搬过来。
+    """
+    from sqlalchemy import inspect, text
+
+    dialect = engine.dialect.name
+    if dialect != "sqlite":
+        return  # 只在本地 SQLite 上做这个一次性搬运
+    try:
+        inspector = inspect(engine)
+        if "reg_remail_orders" not in inspector.get_table_names():
+            return
+        cols = {c["name"] for c in inspector.get_columns("reg_remail_orders")}
+        if "attempts" not in cols or "attempt_count" not in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE reg_remail_orders SET attempt_count = attempts "
+                    "WHERE COALESCE(attempt_count, 0) = 0 AND COALESCE(attempts, 0) > 0"
+                )
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("[migrate] 订单尝试次数搬运失败", exc_info=True)
