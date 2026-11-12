@@ -49,6 +49,9 @@ const stateLabel: Record<string, string> = {
   running: "运行中",
   paused: "已暂停",
   stopped: "已停止",
+  // 等资源（号池空 / 代理用尽）—— 此时没有任何注册在跑，
+  // 跟「运行中」区分开，避免用户以为还在注册。
+  waiting: "等待资源",
 };
 
 export function BatchRegisterPanel() {
@@ -164,8 +167,38 @@ export function BatchRegisterPanel() {
           pushLog("run", `已刷新 ${String(data.refreshed ?? 0)} 个号的额度`, "ok");
           return;
         }
+        if (kind === "proxy_disabled") {
+          pushLog(
+            "run",
+            `代理已自动停用（${String(data.reason ?? "连续失效")}）：${String(data.proxy ?? "")}`,
+            "error",
+          );
+          return;
+        }
+        if (kind === "circuit_break") {
+          pushLog("run", `批次已暂停：${String(data.reason ?? "")}`, "error");
+          return;
+        }
+        if (kind === "run_event") {
+          // registrar 内部的结构化事件（error / progress / warning…）
+          const inner = String(data.kind ?? "");
+          const msg = String(data.message ?? "");
+          if (inner === "error") {
+            pushLog("run", `注册出错：${msg}`, "error");
+          } else if (msg) {
+            pushLog("run", msg, inner === "warning" ? "warn" : undefined);
+          }
+          return;
+        }
         if (kind === "ping" || kind === "ended") return;
-        pushLog("log", String(payload.message ?? data.message ?? ""));
+        // 详细日志行：registrar 写的是 "16:13:02 [ERROR] services.register.auth_flow: ..."
+        // 解析出级别，好让错误行能标红。
+        const raw = String(data.message ?? payload.message ?? "");
+        const levelMatch = raw.match(/\[(ERROR|WARNING|INFO|DEBUG|CRITICAL)\]/i);
+        const level = levelMatch ? levelMatch[1].toLowerCase() : undefined;
+        // 多 worker 并发时，每行都带上是哪个号 —— 不然分不清是谁的
+        const who = data.email ? `[${String(data.email).slice(0, 18)}] ` : "";
+        pushLog("log", who + raw.replace(/\d{2}:\d{2}:\d{2}\s+/, ""), level);
       },
       (error) => {
         pushLog("log", `日志连接断开：${(error as Error).message ?? error}`, "error");
@@ -387,6 +420,11 @@ export function BatchRegisterPanel() {
               <Badge variant={isRunning ? "default" : "secondary"}>
                 {stateLabel[state] ?? state}
               </Badge>
+              {state === "waiting" ? (
+                <span className="text-xs text-amber-700 dark:text-amber-300">
+                  没有可用邮箱/代理，暂未在注册 —— 补上资源后会自动继续
+                </span>
+              ) : null}
               <span className="text-xs text-muted-foreground">
                 {status?.last_message || "—"}
               </span>

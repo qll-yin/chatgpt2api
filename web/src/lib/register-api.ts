@@ -17,6 +17,8 @@ export type RegisterProxy = {
   failed_count: number;
   proxy_type: string;
   cf_blocked: number;
+  /** 连续 409 invalid_state 的次数（达阈值静态代理自动停用） */
+  invalid_state: number;
   ipv6_status: string;
   note?: string | null;
   status: "available" | "disabled" | "exhausted";
@@ -107,7 +109,8 @@ export type MailProvider = {
 };
 
 export type BatchStatus = {
-  state: "stopped" | "running" | "paused";
+  /** waiting = 等资源（号池空 / 代理用尽），此时没有任何注册在跑 */
+  state: "stopped" | "running" | "paused" | "waiting";
   started_at: number;
   elapsed: number;
   registered_ok: number;
@@ -394,6 +397,16 @@ export type ProxyTestResult = {
   ipv6_addr?: string;
   error?: string;
 };
+
+export async function resetRegisterProxyInvalidState(proxy: string): Promise<{
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{ items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    "/api/register/proxies/invalid-reset",
+    { method: "POST", body: { proxy } },
+  );
+}
 
 export async function testRegisterProxies(
   proxies: string[],

@@ -46,6 +46,7 @@ import {
   fetchRegisterProxies,
   importRegisterProxies,
   resetRegisterProxyCf,
+  resetRegisterProxyInvalidState,
   resetRegisterProxyUsage,
   testRegisterProxies,
   testRegisterProxiesIpv6,
@@ -258,6 +259,17 @@ export function ProxyPoolPanel() {
     }
   };
 
+  const resetInvalid = async (row: RegisterProxy) => {
+    try {
+      const data = await resetRegisterProxyInvalidState(row.proxy);
+      setItems(data.items || []);
+      setStats(data.stats ?? null);
+      toast.success(`${row.proxy} 的会话失效计数已清零`);
+    } catch (error) {
+      toast.error(`重置失败：${(error as Error).message ?? error}`);
+    }
+  };
+
   const removeOne = async (row: RegisterProxy) => {
     try {
       const data = await deleteRegisterProxy(row.proxy);
@@ -377,6 +389,7 @@ export function ProxyPoolPanel() {
                 <TableHead className="w-24">协议</TableHead>
                 <TableHead className="w-28">类型</TableHead>
                 <TableHead className="w-24">CF拦截</TableHead>
+                <TableHead className="w-28 whitespace-nowrap">会话失效</TableHead>
                 <TableHead className="w-20">IPv6</TableHead>
                 <TableHead className="w-16">启用</TableHead>
                 <TableHead className="w-28">已用/上限</TableHead>
@@ -388,7 +401,7 @@ export function ProxyPoolPanel() {
             <TableBody>
               {items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={11} className="py-8 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={12} className="py-8 text-center text-sm text-muted-foreground">
                     {loading ? "加载中…" : "代理池是空的，先在上面导入"}
                   </TableCell>
                 </TableRow>
@@ -424,6 +437,15 @@ export function ProxyPoolPanel() {
                       <TableCell className="text-xs tabular-nums">
                         {p.cf_blocked > 0 ? (
                           <span className="text-red-600 dark:text-red-400">{p.cf_blocked} 次</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                        {p.invalid_state > 0 ? (
+                          <span className="text-amber-600 dark:text-amber-400">
+                            {p.invalid_state} 次
+                          </span>
                         ) : (
                           <span className="text-muted-foreground">—</span>
                         )}
@@ -500,6 +522,16 @@ export function ProxyPoolPanel() {
                             onClick={() => void resetCf(p)}
                           >
                             清CF
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 whitespace-nowrap px-1.5 text-xs"
+                            disabled={!p.invalid_state}
+                            title="清零 409 invalid_state 计数（换 IP 后手动清一下）"
+                            onClick={() => void resetInvalid(p)}
+                          >
+                            清失效
                           </Button>
                           <Button
                             variant="ghost"
