@@ -54,7 +54,6 @@ import {
 
 import { Pagination } from "./pagination";
 
-const PAGE_SIZE = 20;
 
 /** Remail 服务端返回的订单状态。 */
 const STATUS_META: Record<
@@ -112,6 +111,7 @@ export function MailOrdersPanel() {
   const [items, setItems] = useState<MailOrder[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [wallet, setWallet] = useState<{ balance: string; enabled?: boolean } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -134,7 +134,7 @@ export function MailOrdersPanel() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchMailOrders(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+      const data = await fetchMailOrders(pageSize, (page - 1) * pageSize);
       setItems(data.items || []);
       setTotal(data.total || 0);
     } catch (error) {
@@ -142,7 +142,7 @@ export function MailOrdersPanel() {
     } finally {
       setLoading(false);
     }
-  }, [page]);
+  }, [page, pageSize]);
 
   const loadWallet = useCallback(async () => {
     try {
@@ -486,9 +486,13 @@ export function MailOrdersPanel() {
 
             <Pagination
               page={page}
-              pageSize={PAGE_SIZE}
+              pageSize={pageSize}
               total={total}
               onPageChange={setPage}
+              onPageSizeChange={(size) => {
+                setPageSize(size);
+                setPage(1);
+              }}
             />
           </CardContent>
         </Card>

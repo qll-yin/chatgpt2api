@@ -11,12 +11,21 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   checkAutoRegisterNow,
   fetchAutoRegisterSettings,
+  fetchMailProviders,
   saveAutoRegisterSettings,
   triggerAutoRegisterNow,
   type AutoRegisterSettings,
   type AutoRegisterState,
+  type MailProvider,
 } from "@/lib/register-api";
 
 const DEFAULTS: AutoRegisterSettings = {
@@ -25,12 +34,14 @@ const DEFAULTS: AutoRegisterSettings = {
   target_batch: 20,
   check_interval_minute: 30,
   concurrency: 3,
+  mail_source: "",
   register_options: {},
   cooldown_minute: 30,
 };
 
 export function AutoRegisterPanel() {
   const [settings, setSettings] = useState<AutoRegisterSettings>(DEFAULTS);
+  const [providers, setProviders] = useState<MailProvider[]>([]);
   const [state, setState] = useState<AutoRegisterState | null>(null);
   const [saving, setSaving] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -50,6 +61,18 @@ export function AutoRegisterPanel() {
     const timer = setInterval(load, 10000);
     return () => clearInterval(timer);
   }, [load]);
+
+  // 邮箱来源清单 —— 守护触发注册时也要知道用哪个来源
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { providers: list } = await fetchMailProviders();
+        setProviders([...list].sort((a, b) => Number(b.ready) - Number(a.ready)));
+      } catch {
+        /* 忽略 */
+      }
+    })();
+  }, []);
 
   const update = <K extends keyof AutoRegisterSettings>(
     key: K,
@@ -155,6 +178,31 @@ export function AutoRegisterPanel() {
                 value={settings.concurrency}
                 onChange={(e) => update("concurrency", Number(e.target.value))}
               />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-source">注册用的邮箱来源</Label>
+              <Select
+                value={settings.mail_source || "__default__"}
+                onValueChange={(v) =>
+                  update("mail_source", v === "__default__" ? "" : v)
+                }
+              >
+                <SelectTrigger id="auto-source">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__default__">跟随「邮箱配置」</SelectItem>
+                  {providers.map((p) => (
+                    <SelectItem key={p.kind} value={p.kind} disabled={!p.ready}>
+                      {p.display_name}
+                      {p.ready ? "" : "（未就绪）"}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                守护触发批量注册时用哪个邮箱来源。留空则用「邮箱配置」里选的那个。
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="auto-interval">检测间隔（分钟）</Label>

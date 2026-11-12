@@ -42,13 +42,30 @@ export type RegisterStatus = {
 
 export type RegisterRun = {
   run_id: string;
+  batch_id?: string | null;
   email?: string | null;
   status?: string | null;
   started_at?: number | null;
   finished_at?: number | null;
+  log_path?: string | null;
   error?: string | null;
   error_category?: string | null;
   duration?: number | null;
+};
+
+/** 一次批量注册 = 一个批次，下面挂多个 run */
+export type RegisterRunBatch = {
+  batch_id: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  duration?: number | null;
+  total: number;
+  ok: number;
+  fail: number;
+  running: number;
+  /** 成功注册的邮箱 */
+  emails: string[];
+  runs: RegisterRun[];
 };
 
 export type RegisteredItem = {
@@ -79,6 +96,14 @@ export type MailProvider = {
   pooled: boolean;
   ephemeral: boolean;
   config_fields: MailProviderField[];
+  /** 必填配置项是否都填了 */
+  configured: boolean;
+  /** 缺哪些必填项 */
+  missing: string[];
+  /** 是否真的能用（配置齐 + 池化来源还有可用邮箱） */
+  ready: boolean;
+  /** 池化来源的邮箱池可用数 */
+  pool_available: number | null;
 };
 
 export type BatchStatus = {
@@ -119,6 +144,47 @@ export type ImportToPoolResult = {
   missing: string[];
 };
 
+export type MailPoolItem = {
+  email: string;
+  password?: string | null;
+  client_id?: string | null;
+  refresh_token?: string | null;
+  relay_url?: string | null;
+  kind: string;
+  status: string;
+  imported_at?: number | null;
+  claimed_at?: number | null;
+  finished_at?: number | null;
+  fail_reason?: string | null;
+};
+
+export type SmsConfig = {
+  sms_enabled: string;
+  sms_provider: string;
+  sms_api_key: string;
+  sms_country: string;
+  sms_service: string;
+  sms_max_price: string;
+  sms_fixed_price: string;
+  sms_reuse_phone: string;
+  sms_phone_success_max: string;
+  sms_auto_country: string;
+  sms_strict_whitelist: string;
+  sms_allowed_countries: string;
+  sms_auto_min_stock: string;
+  sms_auto_max_price: string;
+  sms_max_phone_attempts: string;
+  sms_per_phone_timeout: string;
+};
+
+export type SmsCountry = {
+  id: string;
+  name_cn: string;
+  openai_sms_safe?: boolean;
+  price?: number | null;
+  count?: number | null;
+};
+
 export type MailOrder = {
   order_no: string;
   email: string;
@@ -153,6 +219,8 @@ export type AutoRegisterSettings = {
   target_batch: number;
   check_interval_minute: number;
   concurrency: number;
+  /** 触发的批量注册用哪个邮箱来源（留空 = 用「邮箱配置」里选的） */
+  mail_source: string;
   register_options: Record<string, unknown>;
   cooldown_minute: number;
 };
@@ -177,9 +245,19 @@ export async function fetchRegisterStatus(): Promise<RegisterStatus> {
 export async function fetchRegisterRuns(
   limit = 50,
   offset = 0,
-): Promise<{ items: RegisterRun[]; total: number }> {
-  return httpRequest<{ items: RegisterRun[]; total: number }>(
+): Promise<{ items: RegisterRunBatch[]; total: number }> {
+  return httpRequest<{ items: RegisterRunBatch[]; total: number }>(
     `/api/register/runs?limit=${limit}&offset=${offset}`,
+  );
+}
+
+export async function fetchBatchLog(batchId: string): Promise<{
+  batch_id: string;
+  emails: string[];
+  content: string;
+}> {
+  return httpRequest<{ batch_id: string; emails: string[]; content: string }>(
+    `/api/register/batches/${encodeURIComponent(batchId)}/log`,
   );
 }
 
@@ -190,6 +268,25 @@ export async function fetchRegistered(
   return httpRequest<{ items: RegisteredItem[]; total: number }>(
     `/api/register/registered?limit=${limit}&offset=${offset}`,
   );
+}
+
+export async function fetchRegisteredDetail(email: string): Promise<{
+  item: Record<string, unknown> & {
+    email: string;
+    access_token?: string | null;
+    refresh_token?: string | null;
+    id_token?: string | null;
+    session_token?: string | null;
+    password?: string | null;
+    proxy?: string | null;
+    device_id?: string | null;
+    cookie_header?: string | null;
+    totp_secret?: string | null;
+    extra?: Record<string, unknown>;
+    created_at?: number | null;
+  };
+}> {
+  return httpRequest(`/api/register/registered/${encodeURIComponent(email)}`);
 }
 
 export async function importRegisteredToPool(
@@ -323,8 +420,13 @@ export async function testRegisterProxiesIpv6(
   }>("/api/register/proxies/ipv6-test", { method: "POST", body: { proxies, timeout } });
 }
 
-export async function fetchMailProviders(): Promise<{ providers: MailProvider[] }> {
-  return httpRequest<{ providers: MailProvider[] }>("/api/register/mail-providers");
+export async function fetchMailProviders(): Promise<{
+  providers: MailProvider[];
+  current: string;
+}> {
+  return httpRequest<{ providers: MailProvider[]; current: string }>(
+    "/api/register/mail-providers",
+  );
 }
 
 export async function fetchMailConfig(): Promise<{ config: Record<string, string> }> {
@@ -446,6 +548,80 @@ export async function markRegisteredAbnormal(
     method: "POST",
     body: { emails, abnormal },
   });
+}
+
+// ──────────────────────── 邮箱池 ────────────────────────
+
+export async function fetchMailPool(
+  params: { status?: string; kind?: string; limit?: number; offset?: number } = {},
+): Promise<{ items: MailPoolItem[]; total: number; stats: RegisterStatus }> {
+  const q = new URLSearchParams();
+  if (params.status) q.set("status", params.status);
+  if (params.kind) q.set("kind", params.kind);
+  q.set("limit", String(params.limit ?? 50));
+  q.set("offset", String(params.offset ?? 0));
+  return httpRequest<{ items: MailPoolItem[]; total: number; stats: RegisterStatus }>(
+    `/api/register/mail-pool?${q.toString()}`,
+  );
+}
+
+export async function importMailPool(
+  text: string,
+  kind = "outlook",
+): Promise<{ ok: boolean; inserted?: number; updated?: number; skipped?: number }> {
+  return httpRequest<{
+    ok: boolean;
+    inserted?: number;
+    updated?: number;
+    skipped?: number;
+  }>("/api/register/mail-pool", { method: "POST", body: { text, kind } });
+}
+
+export async function deleteMailPool(emails: string[]) {
+  return httpRequest<{ removed: number }>("/api/register/mail-pool", {
+    method: "DELETE",
+    body: { emails },
+  });
+}
+
+// ──────────────────────── SMS 接码配置 ────────────────────────
+
+export async function fetchSmsConfig(): Promise<{ config: SmsConfig }> {
+  return httpRequest<{ config: SmsConfig }>("/api/register/sms");
+}
+
+export async function saveSmsConfig(values: Partial<SmsConfig>) {
+  return httpRequest<{ ok: boolean; config: SmsConfig }>("/api/register/sms", {
+    method: "POST",
+    body: values,
+  });
+}
+
+export async function testSms() {
+  return httpRequest<{ ok: boolean; provider: string; balance: number; message: string }>(
+    "/api/register/sms/test",
+    { method: "POST" },
+  );
+}
+
+export async function fetchSmsCountries(): Promise<{
+  countries: SmsCountry[];
+  openai_sms_safe: string[];
+}> {
+  return httpRequest<{ countries: SmsCountry[]; openai_sms_safe: string[] }>(
+    "/api/register/sms/countries",
+  );
+}
+
+export async function fetchSmsAllCountries(provider = ""): Promise<{
+  countries: SmsCountry[];
+  openai_sms_safe: string[];
+  source: string;
+}> {
+  const q = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+  return httpRequest<{ countries: SmsCountry[]; openai_sms_safe: string[]; source: string }>(
+    `/api/register/sms/all-countries${q}`,
+  );
 }
 
 // ──────────────────────── 批量注册 ────────────────────────

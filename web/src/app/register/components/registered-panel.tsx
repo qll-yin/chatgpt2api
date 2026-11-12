@@ -1,13 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, LoaderCircle, RefreshCw } from "lucide-react";
+import { AlertTriangle, Copy, Download, Eye, LoaderCircle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -18,15 +26,14 @@ import {
 } from "@/components/ui/table";
 import {
   fetchRegistered,
+  fetchRegisteredDetail,
   importRegisteredToPool,
-  importTokenTextToPool,
   markRegisteredAbnormal,
   type RegisteredItem,
 } from "@/lib/register-api";
 
 import { Pagination } from "./pagination";
 
-const PAGE_SIZE = 20;
 
 /**
  * 注册结果：勾选账号 → 批量导入号池。
@@ -42,14 +49,17 @@ export function RegisteredPanel() {
   const [withProxy, setWithProxy] = useState(true);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [text, setText] = useState("");
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [marking, setMarking] = useState(false);
+  const [detail, setDetail] = useState<Awaited<ReturnType<typeof fetchRegisteredDetail>>["item"] | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchRegistered(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+      const data = await fetchRegistered(pageSize, (page - 1) * pageSize);
       setItems(data.items || []);
       setTotal(data.total || 0);
     } catch (error) {
@@ -57,7 +67,7 @@ export function RegisteredPanel() {
     } finally {
       setLoading(false);
     }
-  }, [page]);
+  }, [page, pageSize]);
 
   useEffect(() => {
     void load();
@@ -129,62 +139,23 @@ export function RegisteredPanel() {
     }
   };
 
-  const handleImportText = async () => {
-    if (!text.trim()) {
-      toast.error("请先粘贴要导入的内容");
-      return;
-    }
-    setImporting(true);
+  const handleShowDetail = async (email: string) => {
+    setDetailOpen(true);
+    setDetailLoading(true);
+    setDetail(null);
     try {
-      const result = await importTokenTextToPool(text);
-      toast.success(`导入完成：新增 ${result.imported} 个，跳过 ${result.skipped} 个`);
-      setText("");
-      await load();
+      const data = await fetchRegisteredDetail(email);
+      setDetail(data.item);
     } catch (error) {
-      toast.error(`导入失败：${(error as Error).message ?? error}`);
+      toast.error(`加载详情失败：${(error as Error).message ?? error}`);
+      setDetailOpen(false);
     } finally {
-      setImporting(false);
+      setDetailLoading(false);
     }
   };
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">导入外部账号</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <p className="text-xs text-muted-foreground">
-            <strong>用途</strong>：把<strong>不是本机注册出来的</strong>账号批量灌进号池 ——
-            比如别的机器上跑的注册机导出的文件、手头攒的账号、或从别处复制来的 token。
-            本机注册成功的号走下面的「注册结果 → 勾选 → 导入号池」即可，不用走这里。
-          </p>
-          <p className="text-xs text-muted-foreground">
-            每行一个账号，格式{" "}
-            <code className="rounded bg-stone-100 px-1 dark:bg-stone-800">access_token----proxy</code>
-            ，proxy 可省略（写成 <code className="rounded bg-stone-100 px-1 dark:bg-stone-800">access_token</code>{" "}
-            即可）。
-          </p>
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            rows={4}
-            placeholder={"eyJhbGciOi...\nsocks5://user:pass@host:port"}
-            className="w-full rounded-md border border-stone-200 bg-white p-2 font-mono text-xs outline-none focus:border-stone-400 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-100"
-          />
-          <div className="flex justify-end">
-            <Button onClick={handleImportText} disabled={importing}>
-              {importing ? (
-                <LoaderCircle className="size-4 animate-spin" />
-              ) : (
-                <Download className="size-4" />
-              )}
-              导入
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
       <Card>
         <CardHeader className="flex-row items-center justify-between gap-2">
           <CardTitle className="text-base">
@@ -241,12 +212,13 @@ export function RegisteredPanel() {
                 <TableHead className="w-24">access_token</TableHead>
                 <TableHead className="w-24">refresh_token</TableHead>
                 <TableHead>代理</TableHead>
+                <TableHead className="w-20">详情</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={7} className="py-8 text-center text-sm text-muted-foreground">
                     {loading ? "加载中…" : "还没有注册成功的账号"}
                   </TableCell>
                 </TableRow>
@@ -284,6 +256,17 @@ export function RegisteredPanel() {
                     <TableCell className="max-w-[240px] truncate text-xs text-muted-foreground">
                       {item.proxy || "—"}
                     </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 whitespace-nowrap px-1.5 text-xs"
+                        onClick={() => void handleShowDetail(item.email)}
+                      >
+                        <Eye className="size-3.5" />
+                        查看
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))
               )}
@@ -291,12 +274,84 @@ export function RegisteredPanel() {
           </Table>
           <Pagination
             page={page}
-            pageSize={PAGE_SIZE}
+            pageSize={pageSize}
             total={total}
             onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
           />
         </CardContent>
       </Card>
+
+      {/* 账户详情 */}
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>账户详情</DialogTitle>
+            <DialogDescription>
+              {detail?.email || (detailLoading ? "加载中…" : "")}
+            </DialogDescription>
+          </DialogHeader>
+          {detailLoading ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">加载中…</p>
+          ) : detail ? (
+            <div className="max-h-[60vh] space-y-2 overflow-y-auto text-xs">
+              {(
+                [
+                  ["access_token", "Access Token"],
+                  ["refresh_token", "Refresh Token"],
+                  ["id_token", "ID Token"],
+                  ["session_token", "Session Token"],
+                  ["password", "密码"],
+                  ["proxy", "代理"],
+                  ["device_id", "Device ID"],
+                  ["totp_secret", "TOTP Secret"],
+                  ["cookie_header", "Cookie"],
+                ] as const
+              ).map(([key, label]) => {
+                const value = detail[key];
+                if (!value) return null;
+                const text = String(value);
+                return (
+                  <div key={key} className="rounded-md border border-stone-200 p-2 dark:border-stone-700">
+                    <div className="mb-1 font-medium text-muted-foreground">{label}</div>
+                    <div className="break-all font-mono leading-relaxed">{text}</div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="mt-1 h-6 px-1.5 text-xs"
+                      onClick={() => {
+                        void navigator.clipboard
+                          .writeText(text)
+                          .then(() => toast.success(`${label} 已复制`))
+                          .catch(() => toast.error("复制失败"));
+                      }}
+                    >
+                      <Copy className="size-3" />
+                      复制
+                    </Button>
+                  </div>
+                );
+              })}
+              {detail.extra && Object.keys(detail.extra).length > 0 ? (
+                <div className="rounded-md border border-stone-200 p-2 dark:border-stone-700">
+                  <div className="mb-1 font-medium text-muted-foreground">其他信息</div>
+                  <pre className="whitespace-pre-wrap break-all font-mono leading-relaxed">
+                    {JSON.stringify(detail.extra, null, 2)}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setDetailOpen(false)}>
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

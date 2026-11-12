@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { subscribeSSE } from "@/lib/sse";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -66,6 +68,8 @@ export function BatchRegisterPanel() {
   const logIdRef = useRef(0);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
+  const selectedProvider = providers.find((p) => p.kind === mailSource) ?? null;
+
   const pushLog = useCallback((kind: string, message: string, level?: string) => {
     logIdRef.current += 1;
     const now = new Date();
@@ -101,10 +105,17 @@ export function BatchRegisterPanel() {
     let active = true;
     void (async () => {
       try {
-        const { providers: list } = await fetchMailProviders();
+        const { providers: list, current } = await fetchMailProviders();
         if (!active) return;
-        setProviders(list);
-        if (list.length > 0) setMailSource(list[0].kind);
+        // 就绪的（配置齐了 + 池化来源还有可用邮箱）排前面 ——
+        // 用户配好了 remail 就该默认用 remail，而不是列表里第一个。
+        const sorted = [...list].sort((a, b) => Number(b.ready) - Number(a.ready));
+        setProviders(sorted);
+        const preferred =
+          sorted.find((p) => p.kind === current && p.ready) ??
+          sorted.find((p) => p.ready) ??
+          sorted[0];
+        if (preferred) setMailSource(preferred.kind);
       } catch {
         /* 忽略 */
       }
@@ -116,42 +127,51 @@ export function BatchRegisterPanel() {
 
   // SSE 实时日志
   useEffect(() => {
-    const source = new EventSource("/api/register/batch/stream");
-    source.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as {
-          kind?: string;
-          data?: Record<string, unknown>;
-          message?: string;
-        };
-        if (payload.kind === "state" || payload.kind === "run_started" || payload.kind === "run_finished") {
-          const data = payload.data ?? {};
-          if (payload.kind === "state" && data.state) {
+    // ⚠️ 用自带的 subscribeSSE 而不是 EventSource：
+    //    EventSource 不能自定义请求头 → 带不上 Authorization → 401；
+    //    而且用相对路径会打到前端自己的端口 → 404。
+    const unsubscribe = subscribeSSE(
+      "/api/register/batch/stream",
+      (payload) => {
+        const kind = String(payload.kind ?? "");
+        const data = (payload.data ?? {}) as Record<string, unknown>;
+        if (kind === "state") {
+          if (data.state) {
             setStatus((prev) => (prev ? { ...prev, ...(data as Partial<BatchStatus>) } : prev));
-          } else if (payload.kind === "run_started") {
-            pushLog("run", `开始注册 ${String(data.email ?? "")}`);
-          } else if (payload.kind === "run_finished") {
-            const ok = Boolean(data.ok);
-            pushLog(
-              "run",
-              ok
-                ? `注册成功 ${String(data.email ?? "")}`
-                : `注册失败 ${String(data.email ?? "")}${data.category ? `（${String(data.category)}）` : ""}`,
-              ok ? "ok" : "error",
-            );
           }
           return;
         }
-        if (payload.kind === "ping") return;
-        pushLog("log", payload.message ?? String(payload.data ?? ""));
-      } catch {
-        /* 忽略解析失败 */
-      }
-    };
-    source.onerror = () => {
-      // EventSource 会自动重连，这里不额外处理
-    };
-    return () => source.close();
+        if (kind === "run_started") {
+          pushLog("run", `开始注册 ${String(data.email ?? "")}`);
+          return;
+        }
+        if (kind === "run_finished") {
+          const ok = Boolean(data.ok);
+          pushLog(
+            "run",
+            ok
+              ? `注册成功 ${String(data.email ?? "")}`
+              : `注册失败 ${String(data.email ?? "")}${data.category ? `（${String(data.category)}）` : ""}`,
+            ok ? "ok" : "error",
+          );
+          return;
+        }
+        if (kind === "imported") {
+          pushLog("run", `已导入号池：${String(data.email ?? "")}`, "ok");
+          return;
+        }
+        if (kind === "quota_refreshed") {
+          pushLog("run", `已刷新 ${String(data.refreshed ?? 0)} 个号的额度`, "ok");
+          return;
+        }
+        if (kind === "ping" || kind === "ended") return;
+        pushLog("log", String(payload.message ?? data.message ?? ""));
+      },
+      (error) => {
+        pushLog("log", `日志连接断开：${(error as Error).message ?? error}`, "error");
+      },
+    );
+    return unsubscribe;
   }, [pushLog]);
 
   // 日志滚动到底
@@ -214,18 +234,39 @@ export function BatchRegisterPanel() {
           <CardContent className="space-y-4">
             <div className="space-y-1.5">
               <Label>邮箱来源</Label>
-              <Select value={mailSource} onValueChange={setMailSource}>
+              {/* ⚠️ Radix 的 Select 不接受空串 value —— 会抛错并让整棵树崩掉 */}
+              <Select
+                value={mailSource || "__none__"}
+                onValueChange={setMailSource}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="选择邮箱来源" />
                 </SelectTrigger>
                 <SelectContent>
-                  {providers.map((p) => (
-                    <SelectItem key={p.kind} value={p.kind}>
-                      {p.display_name}
-                    </SelectItem>
-                  ))}
+                  {providers.map((p) => {
+                    // 没配好的来源直接禁掉 —— 让用户去「邮箱配置」补齐，
+                    // 而不是选完了点开始才发现一个号都领不到。
+                    const reason = !p.configured
+                      ? "缺少必填配置"
+                      : p.pooled && !p.pool_available
+                        ? "邮箱池里没有可用邮箱"
+                        : "";
+                    return (
+                      <SelectItem key={p.kind} value={p.kind} disabled={!p.ready}>
+                        {p.display_name}
+                        {p.ready ? "" : `（${reason}）`}
+                      </SelectItem>
+                    );
+                  })}
                 </SelectContent>
               </Select>
+              {selectedProvider && !selectedProvider.ready ? (
+                <p className="text-xs text-amber-700 dark:text-amber-300">
+                  {selectedProvider.pooled && !selectedProvider.pool_available
+                    ? "这个来源的邮箱池是空的 —— 去「邮箱池」页导入邮箱列表后才能用。"
+                    : "这个来源还没配齐 —— 去「邮箱配置」页填完必填项后才能用。"}
+                </p>
+              ) : null}
             </div>
 
             <div className="grid grid-cols-2 gap-3">

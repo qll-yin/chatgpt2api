@@ -131,7 +131,10 @@ export function MailConfigPanel() {
         <CardContent className="space-y-4">
           <div className="space-y-1.5">
             <Label>当前来源</Label>
-            <Select value={mailSource} onValueChange={setMailSource}>
+            <Select
+              value={mailSource || providers[0]?.kind || "__none__"}
+              onValueChange={setMailSource}
+            >
               <SelectTrigger>
                 <SelectValue placeholder="选择邮箱来源" />
               </SelectTrigger>
@@ -182,18 +185,22 @@ export function MailConfigPanel() {
                       用下拉框，候选项由 provider 在 config_fields[].options 里声明 */}
                   {field.type === "select" ? (
                     <Select
-                      value={values[field.key] ?? ""}
+                      // ⚠️ Radix 的 Select 不接受空串 value —— 会抛错并让整棵树崩掉。
+                      //    没存过值时选第一个候选项。
+                      value={values[field.key] || field.options?.[0] || "__none__"}
                       onValueChange={(v) => setValue(field.key, v)}
                     >
                       <SelectTrigger id={`mail-${field.key}`}>
                         <SelectValue placeholder={field.placeholder || "请选择"} />
                       </SelectTrigger>
                       <SelectContent>
-                        {(field.options ?? []).map((opt) => (
-                          <SelectItem key={opt} value={opt}>
-                            {opt}
-                          </SelectItem>
-                        ))}
+                        {(field.options ?? [])
+                          .filter((opt) => opt !== "")
+                          .map((opt) => (
+                            <SelectItem key={opt} value={opt}>
+                              {opt}
+                            </SelectItem>
+                          ))}
                       </SelectContent>
                     </Select>
                   ) : (
