@@ -55,6 +55,7 @@ DEFAULT_AUTO_REGISTER = {
     "target_batch": 20,         # 每次注册的目标成功数
     "check_interval_minute": 30,  # 检查间隔（分钟）
     "concurrency": 3,           # 触发的批量注册并发数
+    "mail_source": "",          # 触发的批量注册用哪个邮箱来源（留空 = 用「邮箱配置」里选的）
     "register_options": {},     # 传给批量控制器的额外参数
     "cooldown_minute": 30,       # 触发后的冷却期（分钟）
 }
@@ -252,6 +253,7 @@ def _normalize_auto_register_settings(value: object) -> dict[str, object]:
         "target_batch": _int("target_batch", 1, 10000),
         "check_interval_minute": _int("check_interval_minute", 1, 10080),
         "concurrency": _int("concurrency", 1, 20),
+        "mail_source": str(source.get("mail_source") or "").strip(),
         "register_options": options if isinstance(options, dict) else {},
         "cooldown_minute": _int("cooldown_minute", 0, 10080),
     }

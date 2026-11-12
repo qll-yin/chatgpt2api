@@ -131,11 +131,63 @@ def build_pool_payload(email: str, access_token: str, proxy: str = "") -> dict[s
     return payload
 
 
+def import_to_pool_with_refresh(
+    payloads: list[dict[str, Any]],
+    *,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """写入号池，并按号池管理的同一套流程刷新额度。
+
+    ⚠️ 为什么必须刷新
+    ----------------
+    只调 `add_account_items` 的话，号是进去了，但**额度是 0** ——
+    因为额度是 refresh 时从 OpenAI 拉的。号池管理页的导入接口
+    （`POST /api/accounts`）都是「入池 + refresh_accounts」两步，
+    注册结果导入号池必须走同一套流程，否则用户还得手动点一次刷新。
+
+    refresh=False 用于批量注册过程中的高频入池 —— 那时账号量大，
+    逐个刷新会拖慢 worker；额度可以在批量结束后统一刷。
+    """
+    from services.account_service import account_service
+
+    if not payloads:
+        return {"imported": 0, "skipped": 0, "refreshed": 0, "errors": [], "items": []}
+
+    result = account_service.add_account_items(payloads)
+    out: dict[str, Any] = {
+        "imported": int(result.get("added") or 0),
+        "skipped": int(result.get("skipped") or 0),
+        "refreshed": 0,
+        "errors": [],
+        "items": result.get("items") or [],
+    }
+    if not refresh:
+        return out
+
+    tokens = [
+        str(p.get("access_token") or "").strip()
+        for p in payloads
+        if str(p.get("access_token") or "").strip()
+    ]
+    if tokens:
+        try:
+            refresh_result = account_service.refresh_accounts(tokens)
+            out["refreshed"] = int(refresh_result.get("refreshed") or 0)
+            out["errors"] = refresh_result.get("errors") or []
+            if refresh_result.get("items"):
+                out["items"] = refresh_result.get("items")
+        except Exception as exc:  # noqa: BLE001
+            # 刷新失败不影响「号已入池」这个事实
+            out["errors"] = [str(exc)]
+    return out
+
+
 def import_registered_to_pool(
     emails: list[str],
     *,
     with_proxy: bool = True,
     source_type: str = "register",
+    refresh: bool = True,
 ) -> dict[str, Any]:
     """把已注册的账号批量导入号池。
 
@@ -144,7 +196,6 @@ def import_registered_to_pool(
 
     返回 {"total", "imported", "skipped", "missing", "items"}
     """
-    from services.account_service import account_service
     from services.storage import register_store as store
 
     keys = [str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()]
@@ -188,12 +239,14 @@ def import_registered_to_pool(
             "items": [],
         }
 
-    result = account_service.add_account_items(payloads)
+    result = import_to_pool_with_refresh(payloads, refresh=refresh)
     return {
         "total": len(keys),
-        "imported": int(result.get("added") or 0),
+        "imported": int(result.get("imported") or 0),
         "skipped": int(result.get("skipped") or 0),
         "missing": missing,
+        "refreshed": int(result.get("refreshed") or 0),
+        "errors": result.get("errors") or [],
         "items": result.get("items") or [],
     }
 
@@ -208,8 +261,6 @@ def import_token_text_to_pool(
     这是 chatgpt2api 原生的导入格式（注册机导出格式也用它），
     在这里复用，保证「注册机导出 → chatgpt2api 导入」的格式永远一致。
     """
-    from services.account_service import account_service
-
     tokens: list[str] = []
     payloads: list[dict[str, Any]] = []
     for raw in str(text or "").splitlines():
@@ -235,11 +286,13 @@ def import_token_text_to_pool(
     if not payloads:
         return {"total": 0, "imported": 0, "skipped": 0, "items": []}
 
-    result = account_service.add_account_items(payloads)
+    result = import_to_pool_with_refresh(payloads)
     return {
         "total": len(tokens),
-        "imported": int(result.get("added") or 0),
+        "imported": int(result.get("imported") or 0),
         "skipped": int(result.get("skipped") or 0),
+        "refreshed": int(result.get("refreshed") or 0),
+        "errors": result.get("errors") or [],
         "items": result.get("items") or [],
     }
 
@@ -341,10 +394,9 @@ def register_one(options: dict[str, Any]) -> dict[str, Any]:
     imported = False
     if ok and access_token and bool(options.get("auto_import", False)):
         payload = build_pool_payload(email, access_token, str(options.get("proxy") or ""))
-        from services.account_service import account_service
-
-        account_service.add_account_items([payload])
-        imported = True
+        # 单次注册只有一个号，直接带刷新（用户想立刻看到额度）
+        result = import_to_pool_with_refresh([payload])
+        imported = bool(result.get("imported"))
 
     return {
         "ok": ok,

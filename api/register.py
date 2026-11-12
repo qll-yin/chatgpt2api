@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
@@ -86,6 +86,38 @@ class MailConfigRequest(BaseModel):
     model_config = {"extra": "allow"}
 
     mail_source: str | None = None
+
+
+class SmsConfigRequest(BaseModel):
+    """SMS 接码配置。字段与原注册机一致；api_key 传 '***' 或空 = 不修改。"""
+
+    sms_enabled: str | None = None
+    sms_provider: str | None = None
+    sms_api_key: str | None = None
+    sms_country: str | None = None
+    sms_service: str | None = None
+    sms_max_price: str | None = None
+    sms_fixed_price: str | None = None
+    sms_reuse_phone: str | None = None
+    sms_phone_success_max: str | None = None
+    sms_auto_country: str | None = None
+    sms_strict_whitelist: str | None = None
+    sms_allowed_countries: str | None = None
+    sms_auto_min_stock: str | None = None
+    sms_auto_max_price: str | None = None
+    sms_max_phone_attempts: str | None = None
+    sms_per_phone_timeout: str | None = None
+
+
+class MailPoolImportRequest(BaseModel):
+    """批量导入邮箱号池。"""
+
+    text: str
+    kind: str = "outlook"
+
+
+class MailPoolDeleteRequest(BaseModel):
+    emails: list[str]
 
 
 class RemailOrderRequest(BaseModel):
@@ -161,9 +193,80 @@ def create_router() -> APIRouter:
         offset: int = 0,
         authorization: str | None = Header(default=None),
     ):
+        """运行记录 —— 按批次聚合。
+
+        一次批量注册 = 一个批次（下面挂多个 run，每个 run 一次注册），
+        这样「这一轮跑了几个号、哪些邮箱、日志在哪」一眼能看到。
+        """
         require_admin(authorization)
-        items, total = store.list_runs(limit=max(1, min(limit, 500)), offset=max(0, offset))
+        items, total = store.list_run_batches(
+            limit=max(1, min(limit, 500)), offset=max(0, offset)
+        )
         return {"items": items, "total": total}
+
+    @router.get("/api/register/runs/{run_id}/log")
+    async def run_log(run_id: str, authorization: str | None = Header(default=None)):
+        """单个 run 的完整日志。
+
+        日志文件是注册时写下的（data/register_logs/<run_id>.log），
+        run 结束后照样能翻 —— 排查问题靠它。
+        """
+        require_admin(authorization)
+        from pathlib import Path
+
+        from services.storage import register_store as run_store
+
+        row = run_store.get_run(run_id)
+        if not row:
+            raise HTTPException(status_code=404, detail={"error": "运行记录不存在"})
+        log_path = str(row.get("log_path") or "").strip()
+        if not log_path:
+            return {"run_id": run_id, "email": row.get("email"), "content": ""}
+        path = Path(log_path)
+        if not path.is_file():
+            return {"run_id": run_id, "email": row.get("email"), "content": ""}
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"读取日志失败: {exc}"})
+        return {"run_id": run_id, "email": row.get("email"), "content": content}
+
+    @router.get("/api/register/batches/{batch_id}/log")
+    async def batch_log(batch_id: str, authorization: str | None = Header(default=None)):
+        """一个批次下所有 run 的日志（按时间顺序拼起来）。
+
+        「每一轮的日志都区分开」—— 按批次给，前端一次拉齐。
+        """
+        require_admin(authorization)
+        from pathlib import Path
+
+        items, _total = store.list_run_batches(limit=500, offset=0)
+        batch = next((b for b in items if b.get("batch_id") == batch_id), None)
+        if batch is None:
+            raise HTTPException(status_code=404, detail={"error": "批次不存在"})
+        chunks: list[str] = []
+        for run in batch.get("runs") or []:
+            log_path = str(run.get("log_path") or "").strip()
+            head = f"───── {run.get('email') or run.get('run_id')} [{run.get('status')}] ─────"
+            chunks.append(head)
+            if log_path:
+                path = Path(log_path)
+                if path.is_file():
+                    try:
+                        chunks.append(
+                            path.read_text(encoding="utf-8", errors="replace")
+                        )
+                    except Exception:  # noqa: BLE001
+                        chunks.append("(读取日志失败)")
+                else:
+                    chunks.append("(日志文件不存在)")
+            else:
+                chunks.append("(无日志文件)")
+        return {
+            "batch_id": batch_id,
+            "emails": batch.get("emails") or [],
+            "content": "\n".join(chunks),
+        }
 
     @router.get("/api/register/registered")
     async def registered(
@@ -187,6 +290,18 @@ def create_router() -> APIRouter:
             for item in items
         ]
         return {"items": brief, "total": total}
+
+    @router.get("/api/register/registered/{email}")
+    async def registered_detail(
+        email: str,
+        authorization: str | None = Header(default=None),
+    ):
+        """单个注册账号的完整详情（管理员可看凭证）。"""
+        require_admin(authorization)
+        record = store.get_registered(email)
+        if not record:
+            raise HTTPException(status_code=404, detail={"error": "账号不存在"})
+        return {"item": record}
 
     @router.post("/api/register/import-to-pool")
     async def import_to_pool(
@@ -329,10 +444,33 @@ def create_router() -> APIRouter:
 
     @router.get("/api/register/mail-providers")
     async def mail_providers(authorization: str | None = Header(default=None)):
+        """邮箱来源清单 + 每个来源的「是否已配置 / 是否就绪」。
+
+        前端据此排序并禁用没配好的来源 —— 否则用户会选一个根本没配的
+        来源，点开始后才发现一个号都领不到。
+        """
         require_admin(authorization)
         from services.register.mail_providers import list_providers
 
-        return {"providers": list_providers()}
+        providers = list_providers()
+        settings = store.get_mail_settings()
+        pool_stats = store.stats()
+        for item in providers:
+            missing = [
+                str(field.get("key"))
+                for field in item.get("config_fields") or []
+                if field.get("required") and not str(settings.get(field.get("key")) or "").strip()
+            ]
+            item["missing"] = missing
+            item["configured"] = not missing
+            # 池化来源（outlook / icloud_relay）还要邮箱池里有号才算就绪
+            if item.get("pooled"):
+                item["pool_available"] = int(pool_stats.get("available") or 0)
+                item["ready"] = item["configured"] and item["pool_available"] > 0
+            else:
+                item["pool_available"] = None
+                item["ready"] = item["configured"]
+        return {"providers": providers, "current": settings.get("mail_source", "outlook")}
 
     @router.get("/api/register/mail-config")
     async def get_mail_config(authorization: str | None = Header(default=None)):
@@ -414,6 +552,195 @@ def create_router() -> APIRouter:
         for key, value in body.values.items():
             store.set_setting(str(key), value)
         return {"values": store.get_settings()}
+
+    # ──────────────────────── SMS 接码配置 ────────────────────────
+    #
+    # 接码与「获取 refresh_token」强关联 —— 部分账号在 codex auth 阶段
+    # 会命中 add-phone，必须接码才能过。所以这套配置要能配。
+
+    @router.get("/api/register/sms")
+    async def get_sms_config(authorization: str | None = Header(default=None)):
+        """SMS 接码配置（api_key 脱敏成 '***'）。"""
+        require_admin(authorization)
+        return {"config": store.get_sms_config()}
+
+    @router.post("/api/register/sms")
+    async def save_sms_config(
+        body: SmsConfigRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """保存 SMS 接码配置。"""
+        require_admin(authorization)
+        store.save_sms_config(body.model_dump(exclude_none=True))
+        return {"ok": True, "config": store.get_sms_config()}
+
+    @router.post("/api/register/sms/test")
+    async def test_sms(authorization: str | None = Header(default=None)):
+        """测试接码平台连通性（查余额）。"""
+        require_admin(authorization)
+        from services.register.sms_provider import create_sms_provider
+
+        cfg = store.get_sms_internal_config()
+        if not cfg.get("sms_api_key"):
+            raise HTTPException(status_code=400, detail={"error": "未配置 sms_api_key"})
+        try:
+            provider = create_sms_provider(cfg["sms_provider"], cfg)
+            balance = provider.get_balance()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"连接失败: {exc}"})
+        return {
+            "ok": True,
+            "provider": cfg["sms_provider"],
+            "balance": balance,
+            "message": f"连接成功，余额: {balance}",
+        }
+
+    @router.get("/api/register/sms/countries")
+    async def sms_top_countries(authorization: str | None = Header(default=None)):
+        """接码平台的国家排名（价格 + 库存）。"""
+        require_admin(authorization)
+        from services.register.sms_provider import (
+            OPENAI_SMS_COUNTRIES,
+            SMS_COUNTRY_NAMES_CN,
+            create_sms_provider,
+        )
+
+        cfg = store.get_sms_internal_config()
+        if not cfg.get("sms_api_key"):
+            raise HTTPException(status_code=400, detail={"error": "未配置 sms_api_key"})
+        try:
+            provider = create_sms_provider(cfg["sms_provider"], cfg)
+            rows = provider.get_top_countries(service=cfg.get("sms_service") or "dr")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"查询失败: {exc}"})
+        for row in rows:
+            cid = str(row.get("country"))
+            row["openai_sms_safe"] = cid in OPENAI_SMS_COUNTRIES
+            row["name_cn"] = SMS_COUNTRY_NAMES_CN.get(cid, "未知")
+        return {
+            "ok": True,
+            "countries": rows[:30],
+            "openai_sms_safe": list(OPENAI_SMS_COUNTRIES),
+        }
+
+    @router.get("/api/register/sms/all-countries")
+    async def sms_all_countries(
+        provider: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        """平台实际有库存的国家（动态查询）；查询失败则回落到静态字典。"""
+        require_admin(authorization)
+        from services.register.sms_provider import (
+            OPENAI_SMS_COUNTRIES,
+            SMS_COUNTRY_NAMES_CN,
+            create_sms_provider,
+        )
+
+        cfg = store.get_sms_internal_config()
+        if provider:
+            cfg["sms_provider"] = provider
+
+        if cfg.get("sms_api_key"):
+            try:
+                p = create_sms_provider(cfg["sms_provider"], cfg)
+                rows = p.get_top_countries(service=cfg.get("sms_service") or "dr")
+                countries = [
+                    {
+                        "id": str(r.get("country") or ""),
+                        "name_cn": SMS_COUNTRY_NAMES_CN.get(
+                            str(r.get("country") or ""), f"国家{r.get('country')}"
+                        ),
+                        "openai_sms_safe": str(r.get("country") or "") in OPENAI_SMS_COUNTRIES,
+                        "price": r.get("price"),
+                        "count": r.get("count"),
+                    }
+                    for r in rows
+                ]
+                if countries:
+                    return {
+                        "ok": True,
+                        "countries": countries,
+                        "openai_sms_safe": list(OPENAI_SMS_COUNTRIES),
+                        "source": "live",
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+
+        items = sorted(
+            SMS_COUNTRY_NAMES_CN.items(),
+            key=lambda kv: int(kv[0]) if kv[0].isdigit() else 9999,
+        )
+        return {
+            "ok": True,
+            "countries": [
+                {
+                    "id": cid,
+                    "name_cn": name,
+                    "openai_sms_safe": cid in OPENAI_SMS_COUNTRIES,
+                }
+                for cid, name in items
+            ],
+            "openai_sms_safe": list(OPENAI_SMS_COUNTRIES),
+            "source": "static",
+        }
+
+    # ──────────────────────── 邮箱池 ────────────────────────
+    #
+    # 池化的邮箱来源（outlook / icloud_relay）需要先把邮箱列表导进来，
+    # 否则批量注册时一个号都领不到。
+
+    @router.get("/api/register/mail-pool")
+    async def mail_pool(
+        status: str = "",
+        kind: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        authorization: str | None = Header(default=None),
+    ):
+        """邮箱池列表。"""
+        require_admin(authorization)
+        items, total = store.list_accounts(
+            status=status, kind=kind, limit=max(1, min(limit, 500)), offset=max(0, offset)
+        )
+        return {
+            "items": items,
+            "total": total,
+            "stats": store.stats(),
+        }
+
+    @router.post("/api/register/mail-pool")
+    async def import_mail_pool(
+        body: MailPoolImportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """批量导入邮箱号池。
+
+        **有一行不合法就整批拒绝**，一个都不写库 —— 不会出现
+        「写进去一半对不上账」。错误里带行号和原因，前端直接展示。
+        """
+        require_admin(authorization)
+        from services.register.mail_providers import ImportValidationError, MailProviderError
+
+        try:
+            result = store.import_accounts(body.text, kind=body.kind)
+        except ImportValidationError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "message": str(exc), "errors": exc.errors},
+            )
+        except MailProviderError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)})
+        return {"ok": True, **result, "stats": store.stats()}
+
+    @router.delete("/api/register/mail-pool")
+    async def delete_mail_pool(
+        body: MailPoolDeleteRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """从邮箱池移除账号。"""
+        require_admin(authorization)
+        removed = store.delete_accounts(body.emails)
+        return {"removed": removed, "stats": store.stats()}
 
     # ──────────────────────── Remail 订单 ────────────────────────
     #

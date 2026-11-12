@@ -105,6 +105,9 @@ class RunModel(RegisterBase):
     __tablename__ = "reg_runs"
 
     run_id = Column(String(64), primary_key=True)
+    # 批次号 —— 一次批量注册 = 一个批次，下面挂多个 run（每个 run 一次注册）。
+    # 用来把「每一轮」的记录和日志归到一起。
+    batch_id = Column(String(64), nullable=True, index=True)
     email = Column(String(320), nullable=True)
     # running / done / failed
     status = Column(String(16), nullable=True)

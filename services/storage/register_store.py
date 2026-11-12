@@ -174,6 +174,86 @@ def get_sms_internal_config() -> dict:
     }
 
 
+# SMS 接码配置的默认值 —— 与原注册机一致。
+# ⚠️ 一定要有默认值：前端拿到空串会显示成空的下拉框/空输入框，
+#    用户以为没配，实际是有默认值的。
+SMS_CONFIG_DEFAULTS = {
+    "sms_enabled": "0",
+    "sms_provider": "smsbower",
+    "sms_country": "52",
+    "sms_service": "dr",
+    "sms_max_price": "",
+    "sms_fixed_price": "",
+    "sms_reuse_phone": "0",
+    "sms_phone_success_max": "3",
+    "sms_auto_country": "0",
+    "sms_strict_whitelist": "0",
+    "sms_allowed_countries": "",
+    "sms_auto_min_stock": "20",
+    "sms_auto_max_price": "",
+    "sms_max_phone_attempts": "",
+    "sms_per_phone_timeout": "80",
+}
+
+# SMS 接码配置的全部键（读写都用它，避免两处漏字段）
+SMS_CONFIG_KEYS = (
+    "sms_enabled",
+    "sms_provider",
+    "sms_api_key",
+    "sms_country",
+    "sms_service",
+    "sms_max_price",
+    "sms_fixed_price",
+    "sms_reuse_phone",
+    "sms_phone_success_max",
+    "sms_auto_country",
+    "sms_strict_whitelist",
+    "sms_allowed_countries",
+    "sms_auto_min_stock",
+    "sms_auto_max_price",
+    "sms_max_phone_attempts",
+    "sms_per_phone_timeout",
+)
+
+
+def get_sms_config() -> dict[str, Any]:
+    """返回 SMS 接码配置（api_key 隐藏明文）。
+
+    sms_enabled:        '0'/'1' 是否启用接码（命中 add-phone 时才会用）
+    sms_provider:       接码平台（smsbower / herosms）
+    sms_country:        国家代码或 ID（推荐 '52' = 泰国，OpenAI 走 SMS 的稳定国家）
+    sms_service:        服务代码（OpenAI = 'dr'）
+    sms_max_price:      号码最高单价（空 / -1 = 不限）
+    sms_reuse_phone:    '0'/'1' 同号复用（省钱）
+    sms_phone_success_max: 同号最多复用几次（默认 3）
+    sms_auto_country:   '0'/'1' 自动选最优国家（按价格 + 库存）
+    """
+    out = {
+        key: get_setting(key, SMS_CONFIG_DEFAULTS.get(key, ""))
+        for key in SMS_CONFIG_KEYS
+    }
+    out["sms_api_key"] = "***" if get_setting("sms_api_key") else ""
+    return out
+
+
+def save_sms_config(data: dict[str, Any]) -> None:
+    """保存 SMS 接码配置。
+
+    sms_api_key 传 '***' 或空 = **不修改**（前端回填的就是掩码，
+    直接保存会把真值覆盖掉）。
+    """
+    for key in SMS_CONFIG_KEYS:
+        if key not in data:
+            continue
+        value = data[key]
+        if key == "sms_api_key":
+            if not value or value == "***":
+                continue
+        if isinstance(value, bool):
+            value = "1" if value else "0"
+        set_setting(key, str(value).strip())
+
+
 def get_export_internal_config() -> dict:
     """内部用：拿明文密钥 + 解析后的 enabled 布尔。
 
@@ -643,6 +723,66 @@ def mark_registered_abnormal_by_emails(emails: list[str], abnormal: bool = True)
     return count
 
 
+def list_run_batches(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    """按批次聚合运行记录。
+
+    一次批量注册 = 一个批次，下面挂多个 run（每个 run 一次注册）。
+    返回每批：开始/结束时间、耗时、成功数、失败数、邮箱列表、逐个 run 的明细。
+    """
+    with register_session_scope() as session:
+        rows = session.execute(
+            select(RunModel).order_by(RunModel.started_at.desc())
+        ).scalars()
+        batches: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for row in rows:
+            item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+            if item.get("finished_at"):
+                item["duration"] = item["finished_at"] - (item.get("started_at") or 0)
+            else:
+                item["duration"] = None
+            batch_key = str(item.get("batch_id") or item.get("run_id"))
+            batch = batches.get(batch_key)
+            if batch is None:
+                batch = {
+                    "batch_id": batch_key,
+                    "started_at": item.get("started_at"),
+                    "finished_at": item.get("finished_at"),
+                    "duration": item.get("duration"),
+                    "total": 0,
+                    "ok": 0,
+                    "fail": 0,
+                    "running": 0,
+                    "emails": [],
+                    "runs": [],
+                }
+                batches[batch_key] = batch
+                order.append(batch_key)
+            batch["total"] += 1
+            if item.get("status") == "done":
+                batch["ok"] += 1
+                if item.get("email"):
+                    batch["emails"].append(item["email"])
+            elif item.get("status") == "failed":
+                batch["fail"] += 1
+            else:
+                batch["running"] += 1
+            batch["runs"].append(item)
+            # 批次的起止时间 = 子 run 的最小/最大
+            started = item.get("started_at")
+            finished = item.get("finished_at")
+            if started:
+                batch["started_at"] = min(batch["started_at"] or started, started)
+            if finished:
+                batch["finished_at"] = max(batch["finished_at"] or finished, finished)
+            if batch["started_at"] and batch["finished_at"]:
+                batch["duration"] = batch["finished_at"] - batch["started_at"]
+
+        total = len(order)
+        page = order[offset : offset + limit] if limit else order
+        return [batches[key] for key in page], total
+
+
 def delete_registered(emails: list[str]) -> int:
     if not emails:
         return 0
@@ -679,7 +819,12 @@ def update_registered_credentials(email: str, updates: dict[str, Any]) -> bool:
 # ──────────────────────── 运行记录 ────────────────────────
 
 
-def create_run(run_id: str, email: str = "", log_path: str = "") -> None:
+def create_run(
+    run_id: str,
+    email: str = "",
+    log_path: str = "",
+    batch_id: str = "",
+) -> None:
     with register_session_scope() as session:
         session.add(
             RunModel(
@@ -688,6 +833,7 @@ def create_run(run_id: str, email: str = "", log_path: str = "") -> None:
                 status="running",
                 started_at=time.time(),
                 log_path=log_path or None,
+                batch_id=batch_id or None,
             )
         )
 

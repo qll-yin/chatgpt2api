@@ -15,6 +15,7 @@ import json
 import logging
 import queue
 import threading
+import uuid
 import time
 from typing import Optional
 
@@ -62,8 +63,13 @@ class AutoLoopController:
         self._pause_event = threading.Event()  # set = 暂停
         # 进度统计
         self._started_at: float = 0.0
+        # 批次结束时间（非 0 = 已结束）。用它冻结「已用时」——
+        # 否则跑完了还显示"用了 3 小时"。
+        self._finished_at: float = 0.0
         self._registered_ok = 0
         self._registered_fail = 0
+        # 本次批量导入号池的 access_token —— 批量结束后统一刷额度用
+        self._imported_tokens: list[str] = []
         # 当前每个 worker 在跑啥（worker_id → email）
         self._worker_status: dict[int, dict] = {}
         self._last_message = ""
@@ -90,8 +96,13 @@ class AutoLoopController:
             self._stop_event.clear()
             self._pause_event.clear()
             self._options = dict(options or {})
+            # 批次号 —— 一次批量 = 一个批次，下面的每个 run 都带上它，
+            # 运行记录就能按「这一轮」归组看日志和邮箱。
+            self._options.setdefault("batch_id", uuid.uuid4().hex[:12])
             self._state = AutoLoopState.RUNNING
             self._started_at = time.time()
+            self._finished_at = 0.0
+            self._imported_tokens = []
             self._registered_ok = 0
             self._registered_fail = 0
             self._worker_status.clear()
@@ -176,6 +187,10 @@ class AutoLoopController:
     def _snapshot(self) -> dict:
         with self._lock:
             stats = db.stats()
+            # 已用时：批次结束后**冻结**，不能一直累加 ——
+            # 跑完了还显示"用了 3 小时"是错的。
+            end_at = self._finished_at or time.time()
+            elapsed = (end_at - self._started_at) if self._started_at else 0
             workers_info = [
                 {
                     "id": wid,
@@ -189,7 +204,8 @@ class AutoLoopController:
             return {
                 "state": self._state,
                 "started_at": self._started_at,
-                "elapsed": (time.time() - self._started_at) if self._started_at else 0,
+                "finished_at": self._finished_at,
+                "elapsed": elapsed,
                 "registered_ok": self._registered_ok,
                 "registered_fail": self._registered_fail,
                 "target_count": self._target_count,
@@ -320,11 +336,16 @@ class AutoLoopController:
         finally:
             with self._lock:
                 self._state = AutoLoopState.STOPPED
+                self._finished_at = time.time()
                 self._worker_status.clear()
                 self._last_message = (
                     f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
                 )
             self._broadcast("state", self._snapshot())
+            # 批量期间为了不拖慢 worker，入池时没刷额度。
+            # 这里统一刷一次 —— 后台线程跑，不阻塞管理线程。
+            if self._options.get("auto_import", True):
+                self._refresh_pool_quota_async()
 
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
@@ -378,7 +399,13 @@ class AutoLoopController:
 
             # claim 下一个号。要不要走号池由 provider 的 pooled 决定，
             # 非池化的（CF 这类自己造地址的）用虚拟占位。
-            mail_source = db.get_setting("mail_source", "outlook")
+            #
+            # ⚠️ 优先用**本次批量指定的** mail_source（用户在批量注册页选的），
+            #    没有才回退到全局配置 —— 否则用户在页面上选了 Remail，
+            #    这里还是按配置的 outlook 去 claim，结果一个号都领不到。
+            mail_source = str(
+                self._options.get("mail_source") or db.get_setting("mail_source", "outlook")
+            ).strip() or "outlook"
             try:
                 pooled = get_provider_class(mail_source).pooled
             except MailProviderError as e:
@@ -473,6 +500,13 @@ class AutoLoopController:
                             f"{cfres.get('cf_blocked')} 次）→ 换下一个代理: {proxy[:60]}"
                         )
 
+            # ── 注册成功 → 写入号池 ──
+            # ⚠️ 这一步原来完全缺失：auto_loop 是从旧注册机迁来的，
+            #    旧注册机不管号池，所以「注册成功自动导入号池」这个开关
+            #    形同虚设 —— 号注册出来了，但号池里一个都没有。
+            if ok:
+                self._import_to_pool(account, proxy)
+
             with self._lock:
                 self._worker_status.pop(worker_id, None)
             self._record_finish(ok, category)
@@ -492,6 +526,73 @@ class AutoLoopController:
                     if self._stop_event.is_set() or self._pause_event.is_set():
                         break
                     time.sleep(0.1)
+
+    def _refresh_pool_quota_async(self) -> None:
+        """批量结束后统一刷新号池额度（后台线程）。"""
+
+        def _run():
+            try:
+                from services.account_service import account_service
+
+                with self._lock:
+                    tokens = list(self._imported_tokens)
+                if not tokens:
+                    return
+                result = account_service.refresh_accounts(tokens)
+                refreshed = int(result.get("refreshed") or 0)
+                errors = result.get("errors") or []
+                if refreshed:
+                    logger.info("[auto-loop] 已刷新 %s 个号的额度", refreshed)
+                if errors:
+                    logger.warning("[auto-loop] 刷新额度有 %s 个失败", len(errors))
+                self._broadcast(
+                    "quota_refreshed",
+                    {"refreshed": refreshed, "errors": len(errors)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[auto-loop] 刷新额度失败: %s", exc)
+
+        threading.Thread(target=_run, daemon=True, name="auto-loop-quota-refresh").start()
+
+    def _import_to_pool(self, account: dict, proxy: str) -> bool:
+        """注册成功后把这个号写入号池。
+
+        走 chatgpt2api 原生的号池写入（和手动导入号池同一套），
+        格式与注册机导出的 `access_token----proxy` 完全一致。
+
+        ⚠️ 这里**不刷新额度** —— 批量过程中逐个刷新会拖慢 worker，
+        而且额度刷新要走 OpenAI 网络请求。批量结束后由前端统一刷一次。
+        """
+        if not self._options.get("auto_import", True):
+            return False
+        email = str(account.get("email") or "").strip().lower()
+        if not email:
+            return False
+        try:
+            from services import register_service
+
+            record = db.get_registered(email) or {}
+            access_token = str(record.get("access_token") or "").strip()
+            if not access_token:
+                logger.warning("[auto-loop] 注册成功但没拿到 access_token，跳过入池: %s", email)
+                return False
+
+            payload = register_service.build_pool_payload(email, access_token, proxy)
+            if not self._options.get("with_proxy", True):
+                payload.pop("proxy", None)
+
+            result = register_service.import_to_pool_with_refresh([payload], refresh=False)
+            imported = int(result.get("imported") or 0)
+            if imported:
+                with self._lock:
+                    self._imported_tokens.append(access_token)
+                logger.info("[auto-loop] 已导入号池: %s", email)
+                self._broadcast("imported", {"email": email, "imported": imported})
+            return bool(imported)
+        except Exception as exc:  # noqa: BLE001
+            # 入池失败不能拖垮整个批次 —— 号已经注册成功了
+            logger.warning("[auto-loop] 导入号池失败 %s: %s", email, exc)
+            return False
 
     def _wait_run_finish(self, run_id: str, timeout: int = 1800) -> tuple[bool, str]:
         """轮询 runs 表，等 run 跑完。"""

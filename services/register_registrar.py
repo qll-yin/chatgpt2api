@@ -810,7 +810,12 @@ def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
     run_id = uuid.uuid4().hex[:12]
     log_file = LOG_DIR / f"{run_id}.log"
-    db.create_run(run_id, account["email"], str(log_file))
+    db.create_run(
+        run_id,
+        account["email"],
+        str(log_file),
+        str(options.get("batch_id") or ""),
+    )
 
     q: queue.Queue = queue.Queue()
     with _lock:

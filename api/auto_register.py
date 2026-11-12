@@ -22,6 +22,7 @@ class AutoRegisterSettingsRequest(BaseModel):
     target_batch: int | None = None
     check_interval_minute: int | None = None
     concurrency: int | None = None
+    mail_source: str | None = None
     register_options: dict | None = None
     cooldown_minute: int | None = None
 

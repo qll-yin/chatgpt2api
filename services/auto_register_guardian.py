@@ -57,6 +57,8 @@ DEFAULT_SETTINGS = {
     "check_interval_minute": 30,
     # 触发的批量注册并发数
     "concurrency": 3,
+    # 触发的批量注册用哪个邮箱来源（留空 = 用「邮箱配置」里选的那个）
+    "mail_source": "",
     # 传给批量控制器的额外参数（代理池、邮箱来源、是否要 refresh_token 等）
     "register_options": {},
     # 触发后多久内不再重复触发（分钟），防止注册还没跑完就又触发
@@ -99,6 +101,7 @@ def get_settings() -> dict[str, Any]:
     settings["check_interval_minute"] = max(1, int(settings.get("check_interval_minute") or 1))
     settings["cooldown_minute"] = max(0, int(settings.get("cooldown_minute") or 0))
     settings["concurrency"] = max(1, min(20, int(settings.get("concurrency") or 1)))
+    settings["mail_source"] = str(settings.get("mail_source") or "").strip()
     settings["enabled"] = bool(settings.get("enabled"))
     options = settings.get("register_options")
     settings["register_options"] = options if isinstance(options, dict) else {}
@@ -147,6 +150,10 @@ def trigger_registration(settings: dict[str, Any] | None = None) -> dict[str, An
     options = dict(settings.get("register_options") or {})
     options["target_count"] = int(settings.get("target_batch") or 1)
     options["concurrency"] = int(settings.get("concurrency") or 1)
+    # 邮箱来源：优先用守护自己配的，留空则用「邮箱配置」里选的那个
+    mail_source = str(settings.get("mail_source") or "").strip()
+    if mail_source:
+        options["mail_source"] = mail_source
     # 注册成功自动入号池 —— 守护的整个目的就是补号池
     options.setdefault("auto_import", True)
 
