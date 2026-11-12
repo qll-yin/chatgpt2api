@@ -55,6 +55,39 @@ class RegisterSettingsRequest(BaseModel):
     values: dict[str, str]
 
 
+class ProxyUpdateRequest(BaseModel):
+    """改单个代理的属性（字段不传的保持原值）。"""
+
+    proxy: str
+    enabled: bool | None = None
+    max_uses: int | None = None
+    note: str | None = None
+    # static=固定出口 IP / dynamic=每次连接换 IP
+    # ⚠️ 被 Cloudflare 403 拦时两者处置不同：
+    #    static → 出口 IP 已被拉黑，连续被拦达阈值就自动停用
+    #    dynamic → 换个出口 IP 可能就通过，只记次数不停用
+    proxy_type: str | None = None
+
+
+class ProxyResetRequest(BaseModel):
+    """proxy 留空 = 作用于全部。"""
+
+    proxy: str | None = None
+
+
+class ProxyTestRequest(BaseModel):
+    proxies: list[str] = []
+    timeout: int = 8
+
+
+class MailConfigRequest(BaseModel):
+    """邮箱配置。password 类字段传空或 '***' 表示不修改。"""
+
+    model_config = {"extra": "allow"}
+
+    mail_source: str | None = None
+
+
 class BatchStartRequest(BaseModel):
     """批量注册参数。字段与原注册机的 auto-loop 一致。"""
 
@@ -95,10 +128,14 @@ def create_router() -> APIRouter:
         return register_service.register_status()
 
     @router.get("/api/register/runs")
-    async def runs(authorization: str | None = Header(default=None)):
+    async def runs(
+        limit: int = 50,
+        offset: int = 0,
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
-        items = register_service.list_runs(limit=100)
-        return {"items": items}
+        items, total = store.list_runs(limit=max(1, min(limit, 500)), offset=max(0, offset))
+        return {"items": items, "total": total}
 
     @router.get("/api/register/registered")
     async def registered(
@@ -167,12 +204,169 @@ def create_router() -> APIRouter:
         ]
         return store.replace_proxies(proxies, mode=mode)
 
+    @router.patch("/api/register/proxies")
+    async def update_proxy(
+        body: ProxyUpdateRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """改单个代理：启用开关 / 成功注册上限 / 备注 / 类型（静态 or 动态）。"""
+        require_admin(authorization)
+        ok = store.update_proxy(
+            body.proxy,
+            enabled=body.enabled,
+            max_uses=body.max_uses,
+            note=body.note,
+            proxy_type=body.proxy_type,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail={"error": "代理不存在"})
+        return {"items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.delete("/api/register/proxies")
+    async def clear_proxies(authorization: str | None = Header(default=None)):
+        """清空整个代理池（连同用量记录）。"""
+        require_admin(authorization)
+        removed = store.clear_proxies()
+        return {"removed": removed, "items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.delete("/api/register/proxies/{proxy:path}")
+    async def delete_proxy(
+        proxy: str,
+        authorization: str | None = Header(default=None),
+    ):
+        """删掉单个代理。"""
+        require_admin(authorization)
+        if not store.delete_proxy(proxy):
+            raise HTTPException(status_code=404, detail={"error": "代理不存在"})
+        return {"items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.post("/api/register/proxies/reset")
+    async def reset_proxy_usage(
+        body: ProxyResetRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """重置用量计数（不删代理）。proxy 留空 = 全部重置。"""
+        require_admin(authorization)
+        reset = store.reset_proxy_counts(body.proxy)
+        return {"reset": reset, "items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.post("/api/register/proxies/cf-reset")
+    async def reset_proxy_cf(
+        body: ProxyResetRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """清零 CF 拦截计数（代理换了 IP / 供应商修了之后手动点一下）。"""
+        require_admin(authorization)
+        target = str(body.proxy or "").strip()
+        if target:
+            store.reset_proxy_cf_blocked(target)
+            reset = 1
+        else:
+            reset = store.reset_all_proxy_cf_blocked()
+        return {"reset": reset, "items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.post("/api/register/proxies/test")
+    async def test_proxy_conn(
+        body: ProxyTestRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """并发测试代理连通性（复用注册流程的 session 工厂）。"""
+        require_admin(authorization)
+        from services import proxy_test
+
+        if not body.proxies:
+            raise HTTPException(status_code=400, detail={"error": "请先选择要测试的代理"})
+        results = proxy_test.test_proxies(body.proxies, timeout=body.timeout)
+        return {"results": results}
+
+    @router.post("/api/register/proxies/ipv6-test")
+    async def test_proxy_ipv6(
+        body: ProxyTestRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """检测哪些代理走 IPv6 出口（IPv6 被 CF 按段拉黑的概率低得多）。"""
+        require_admin(authorization)
+        from services import proxy_test
+
+        if not body.proxies:
+            raise HTTPException(status_code=400, detail={"error": "请先选择要检测的代理"})
+        results = proxy_test.test_ipv6(body.proxies, timeout=body.timeout or 10)
+        return {
+            "results": results,
+            "items": store.list_proxies(),
+            "stats": store.proxy_pool_stats(),
+        }
+
     @router.get("/api/register/mail-providers")
     async def mail_providers(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         from services.register.mail_providers import list_providers
 
         return {"providers": list_providers()}
+
+    @router.get("/api/register/mail-config")
+    async def get_mail_config(authorization: str | None = Header(default=None)):
+        """邮箱配置（密码类字段脱敏成 '***'）。"""
+        require_admin(authorization)
+        return {"config": store.get_mail_config()}
+
+    @router.post("/api/register/mail-config")
+    async def save_mail_config(
+        body: MailConfigRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """保存邮箱配置。password 类字段传空或 '***' = 不修改。"""
+        require_admin(authorization)
+        try:
+            store.save_mail_config(body.model_dump(exclude_none=True))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail={"error": f"保存失败: {exc}"})
+        return {"config": store.get_mail_config()}
+
+    @router.post("/api/register/mail-test")
+    async def test_mail(authorization: str | None = Header(default=None)):
+        """测试当前邮箱来源的连通性（具体怎么测由 provider 的 self_test 决定）。"""
+        require_admin(authorization)
+        from services.register.mail_providers import (
+            MailProviderError,
+            create_mail_provider,
+            get_provider_class,
+        )
+
+        mail_source = store.get_setting("mail_source", "outlook")
+        try:
+            provider_cls = get_provider_class(mail_source)
+        except MailProviderError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)})
+
+        # 池化 provider 的连通性绑在具体某个号上，没号可测
+        if provider_cls.pooled:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"{provider_cls.display_name} 是号池类型，不需要单独测试；"
+                    "导入时会校验格式"
+                },
+            )
+
+        try:
+            provider = create_mail_provider(mail_source, store.get_mail_settings())
+        except MailProviderError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail={"error": f"构造 {provider_cls.display_name} 失败: {exc}"}
+            )
+
+        try:
+            result = provider.self_test()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail={"error": f"连接失败: {exc}"})
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=500, detail={"error": result.get("message") or "连接失败"}
+            )
+        return {"ok": True, "message": result.get("message", "连接成功")}
 
     @router.get("/api/register/settings")
     async def get_settings(authorization: str | None = Header(default=None)):

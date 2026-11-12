@@ -138,6 +138,8 @@ class ProxyPoolModel(RegisterBase):
     cf_blocked = Column(Integer, nullable=False, default=0)
     # untested / ok / fail
     ipv6_status = Column(String(16), nullable=False, default="untested")
+    # 上次做 IPv6 检测的时间（Unix 时间戳）
+    ipv6_checked_at = Column(Float, nullable=True)
     ipv6_checked_at = Column(Float, nullable=True)
     last_used_at = Column(Float, nullable=True)
     note = Column(Text, nullable=True)

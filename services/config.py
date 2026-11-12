@@ -54,9 +54,8 @@ DEFAULT_AUTO_REGISTER = {
     "threshold": 10,            # 可用账号数低于此值触发注册
     "target_batch": 20,         # 每次注册的目标成功数
     "check_interval_minute": 30,  # 检查间隔（分钟）
-    "register_url": "http://register:8765",  # 注册机地址
-    "register_auth_key": "",     # 注册机 auth-key（留空则不带鉴权头）
-    "register_options": {},      # 传给注册机的额外参数
+    "concurrency": 3,           # 触发的批量注册并发数
+    "register_options": {},     # 传给批量控制器的额外参数
     "cooldown_minute": 30,       # 触发后的冷却期（分钟）
 }
 
@@ -252,8 +251,7 @@ def _normalize_auto_register_settings(value: object) -> dict[str, object]:
         "threshold": _int("threshold", 0, 100000),
         "target_batch": _int("target_batch", 1, 10000),
         "check_interval_minute": _int("check_interval_minute", 1, 10080),
-        "register_url": str(source.get("register_url") or default["register_url"]).strip().rstrip("/"),
-        "register_auth_key": str(source.get("register_auth_key") or "").strip(),
+        "concurrency": _int("concurrency", 1, 20),
         "register_options": options if isinstance(options, dict) else {},
         "cooldown_minute": _int("cooldown_minute", 0, 10080),
     }

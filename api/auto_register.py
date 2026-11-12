@@ -21,8 +21,7 @@ class AutoRegisterSettingsRequest(BaseModel):
     threshold: int | None = None
     target_batch: int | None = None
     check_interval_minute: int | None = None
-    register_url: str | None = None
-    register_auth_key: str | None = None
+    concurrency: int | None = None
     register_options: dict | None = None
     cooldown_minute: int | None = None
 
@@ -71,7 +70,7 @@ def create_router() -> APIRouter:
 
     @router.post("/api/auto-register/trigger")
     async def trigger_now(authorization: str | None = Header(default=None)):
-        """强制触发一轮注册，忽略阈值判断（仍受「注册机已有任务在跑」保护）。"""
+        """强制触发一轮注册，忽略阈值判断（仍受「批量注册已在跑」保护）。"""
         require_admin(authorization)
         settings = guardian.get_settings()
         result = guardian.trigger_registration(settings)

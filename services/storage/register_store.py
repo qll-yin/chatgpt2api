@@ -103,6 +103,55 @@ def get_mail_settings() -> dict:
     return out
 
 
+def get_mail_config() -> dict[str, Any]:
+    """返回邮箱来源配置（密码类字段脱敏成 '***'）。
+
+    遍历**所有** provider 声明的 config_fields —— 前端一次拿到所有邮箱的
+    配置项，切换来源时不用再请求一次。
+    """
+    from services.register.mail_providers import list_providers
+
+    out: dict[str, Any] = {"mail_source": get_setting("mail_source", "outlook")}
+    for provider in list_providers():
+        for field in provider.get("config_fields") or []:
+            key = field.get("key")
+            if not key:
+                continue
+            if field.get("type") == "password":
+                out[key] = "***" if get_setting(key) else ""
+            else:
+                out[key] = get_setting(key, "")
+    return out
+
+
+def save_mail_config(data: dict[str, Any]) -> None:
+    """保存邮箱配置。
+
+    password 类字段传空或 '***' 表示**不修改**（前端回填的就是掩码，
+    直接保存会把真值覆盖掉）。
+
+    mail_source 校验查 provider 注册表 —— 未知来源直接抛错，
+    避免出现「保存成功但选择没生效」的静默失败。
+    """
+    from services.register.mail_providers import get_provider_class, list_providers
+
+    if "mail_source" in data:
+        src = str(data["mail_source"]).strip().lower()
+        get_provider_class(src)  # 未注册的 kind 会抛错
+        set_setting("mail_source", src)
+
+    for provider in list_providers():
+        for field in provider.get("config_fields") or []:
+            key = field.get("key")
+            if not key or key not in data:
+                continue
+            val = data[key]
+            if field.get("type") == "password":
+                if not val or val == "***":
+                    continue  # 没填 / 是掩码 → 保持原值
+            set_setting(key, str(val).strip())
+
+
 def get_sms_internal_config() -> dict:
     """内部用：拿明文 sms_api_key，供 sms_provider 实例化使用。"""
     return {
@@ -751,6 +800,71 @@ def delete_proxy(proxy: str) -> bool:
     with register_session_scope() as session:
         result = session.execute(
             sa_delete(ProxyPoolModel).where(ProxyPoolModel.proxy == proxy)
+        )
+        return bool(result.rowcount)
+
+
+def clear_proxies() -> int:
+    """清空整个代理池（连同用量记录）。"""
+    with register_session_scope() as session:
+        result = session.execute(sa_delete(ProxyPoolModel))
+        return int(result.rowcount or 0)
+
+
+def reset_proxy_counts(proxy: Optional[str] = None) -> int:
+    """重置用量计数。proxy 为空则重置全部。
+
+    注意：只清 used_count / failed_count，不动 enabled / max_uses / cf_blocked。
+    """
+    with register_session_scope() as session:
+        stmt = sa_update(ProxyPoolModel).values(used_count=0, failed_count=0)
+        target = str(proxy or "").strip()
+        if target:
+            stmt = stmt.where(ProxyPoolModel.proxy == target)
+        result = session.execute(stmt)
+        return int(result.rowcount or 0)
+
+
+def reset_proxy_cf_blocked(proxy: str) -> bool:
+    """清零某个代理的 CF 拦截计数。
+
+    场景：静态代理被 CF 拉黑后自动停用了，换了 IP / 供应商修了之后手动清一下，
+    不用删了重导。
+    """
+    target = str(proxy or "").strip()
+    if not target:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(ProxyPoolModel.proxy == target)
+            .values(cf_blocked=0)
+        )
+        return bool(result.rowcount)
+
+
+def reset_all_proxy_cf_blocked() -> int:
+    """清零全部代理的 CF 拦截计数。"""
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel).where(ProxyPoolModel.cf_blocked > 0).values(cf_blocked=0)
+        )
+        return int(result.rowcount or 0)
+
+
+def set_proxy_ipv6_status(proxy: str, status: str) -> bool:
+    """记录代理的 IPv6 检测结果（ok / fail / untested）。"""
+    target = str(proxy or "").strip()
+    if not target:
+        return False
+    st = str(status or "untested").strip().lower()
+    if st not in ("ok", "fail", "untested"):
+        st = "untested"
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(ProxyPoolModel.proxy == target)
+            .values(ipv6_status=st, ipv6_checked_at=time.time())
         )
         return bool(result.rowcount)
 

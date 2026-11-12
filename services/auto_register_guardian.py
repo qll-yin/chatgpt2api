@@ -13,21 +13,23 @@
   ↓
 可用账号数（status == "正常"） < threshold ?
   ↓ 是
-检查是否已有注册任务在跑（幂等保护）→ 没有才触发
+检查是否已有批量注册在跑（幂等保护）→ 没有才触发
   ↓
-调用注册机的 /api/auto/start，target_count = target_batch
-  ↓
-注册机注册满 target_batch 个成功后自动停止
+启动本进程的批量注册控制器（services/register_batch.py），
+target_count = target_batch，注册满这么多成功后自动停
 ```
 
-为什么用「HTTP 调注册机」而不是把注册代码搬进来
---------------------------------------------------
-注册机是独立部署的服务，已经具备完整的自动循环能力
-（`/api/auto/start` 支持 `target_count` 达标自动停止）。
-通过 HTTP 调用它：
-- 不需要在本项目里复制 1.2 万行注册逻辑
-- 注册机可以独立升级、独立重启
-- 职责边界清晰：本项目管「什么时候需要补」，注册机管「怎么补」
+为什么是**进程内调用**而不是 HTTP 调注册机
+-------------------------------------------
+注册机已经合并进本项目（services/register/ + services/register_batch.py），
+它不是独立部署的服务。早期版本这里按「外部服务」设计，去打
+`http://register:8765/api/auto/start` —— 那台主机根本不存在，
+于是守护每次触发都是
+`HTTPConnectionPool(host='register', port=8765): NameResolutionError`。
+
+现在改成直接调 `register_batch.CONTROLLER.start()`：
+同一个进程、同一个数据库、同一个号池，没有网络往返，也不会因为
+「注册机没起」而静默失败。
 
 可用账号的口径
 --------------
@@ -37,13 +39,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 from typing import Any
-
-import requests
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +55,9 @@ DEFAULT_SETTINGS = {
     "target_batch": 20,
     # 检查间隔（分钟）
     "check_interval_minute": 30,
-    # 注册机地址（容器内默认用服务名）
-    "register_url": "http://register:8765",
-    # 注册机接口鉴权（注册机的 auth-key，留空则不带）
-    "register_auth_key": "",
-    # 传给注册机的额外参数（并发数、代理池、是否要 refresh_token 等）
+    # 触发的批量注册并发数
+    "concurrency": 3,
+    # 传给批量控制器的额外参数（代理池、邮箱来源、是否要 refresh_token 等）
     "register_options": {},
     # 触发后多久内不再重复触发（分钟），防止注册还没跑完就又触发
     "cooldown_minute": 30,
@@ -101,8 +98,7 @@ def get_settings() -> dict[str, Any]:
     settings["target_batch"] = max(1, int(settings.get("target_batch") or 1))
     settings["check_interval_minute"] = max(1, int(settings.get("check_interval_minute") or 1))
     settings["cooldown_minute"] = max(0, int(settings.get("cooldown_minute") or 0))
-    settings["register_url"] = str(settings.get("register_url") or "").strip().rstrip("/")
-    settings["register_auth_key"] = str(settings.get("register_auth_key") or "").strip()
+    settings["concurrency"] = max(1, min(20, int(settings.get("concurrency") or 1)))
     settings["enabled"] = bool(settings.get("enabled"))
     options = settings.get("register_options")
     settings["register_options"] = options if isinstance(options, dict) else {}
@@ -126,64 +122,44 @@ def _active_account_count() -> int:
     return int(account_service.get_stats().get("active") or 0)
 
 
-def _register_auto_running(register_url: str, auth_key: str) -> bool:
-    """问注册机：现在有没有自动循环在跑。
+def _batch_running() -> bool:
+    """批量注册控制器当前是否在跑。
 
-    用于幂等保护 —— 守护自己触发的注册还没结束时不重复触发。
-    注册机不可达时返回 False（宁可多触发一次，也不要卡死不动）。
+    用于幂等保护 —— 守护自己触发的注册还没结束时，不重复触发。
     """
     try:
-        headers = {}
-        if auth_key:
-            headers["Authorization"] = f"Bearer {auth_key}"
-        resp = requests.get(f"{register_url}/api/auto/status", headers=headers, timeout=10)
-        if resp.status_code >= 400:
-            return False
-        payload = resp.json()
-        state = str(payload.get("state") or "").lower()
+        from services import register_batch
+
+        state = str(register_batch.CONTROLLER.status().get("state") or "").lower()
         return state in {"running", "paused"}
-    except Exception as exc:
-        logger.debug("[auto-register] 查询注册机状态失败: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[auto-register] 查询批量注册状态失败: %s", exc)
         return False
 
 
 def trigger_registration(settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    """触发一轮注册。
+    """触发一轮注册（进程内直接启动批量控制器）。
 
     返回 {"ok": bool, "error": str, ...}
     """
     settings = settings or get_settings()
-    register_url = str(settings.get("register_url") or "").strip().rstrip("/")
-    if not register_url:
-        return {"ok": False, "error": "未配置 register_url"}
 
     options = dict(settings.get("register_options") or {})
     options["target_count"] = int(settings.get("target_batch") or 1)
-
-    headers = {"Content-Type": "application/json"}
-    auth_key = str(settings.get("register_auth_key") or "").strip()
-    if auth_key:
-        headers["Authorization"] = f"Bearer {auth_key}"
+    options["concurrency"] = int(settings.get("concurrency") or 1)
+    # 注册成功自动入号池 —— 守护的整个目的就是补号池
+    options.setdefault("auto_import", True)
 
     try:
-        resp = requests.post(
-            f"{register_url}/api/auto/start",
-            json=options,
-            headers=headers,
-            timeout=30,
-        )
-    except Exception as exc:
-        return {"ok": False, "error": f"调用注册机失败: {exc}"}
+        from services import register_batch
 
-    if resp.status_code >= 400:
-        return {"ok": False, "error": f"注册机返回 HTTP {resp.status_code}: {resp.text[:200]}"}
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {}
-    if not payload.get("ok", True):
-        return {"ok": False, "error": str(payload.get("error") or "注册机拒绝启动")}
-    return {"ok": True, "result": payload}
+        result = register_batch.CONTROLLER.start(options)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"启动批量注册失败: {exc}"}
+
+    if not result.get("ok"):
+        return {"ok": False, "error": str(result.get("error") or "批量注册拒绝启动")}
+    return {"ok": True, "result": result}
 
 
 def _check_once() -> dict[str, Any]:
@@ -211,9 +187,8 @@ def _check_once() -> dict[str, Any]:
             "active": active,
         }
 
-    register_url = str(settings.get("register_url") or "")
-    if _register_auto_running(register_url, str(settings.get("register_auth_key") or "")):
-        return {"skipped": True, "reason": "注册机已有任务在运行", "active": active}
+    if _batch_running():
+        return {"skipped": True, "reason": "批量注册已在运行", "active": active}
 
     result = trigger_registration(settings)
     if result.get("ok"):
