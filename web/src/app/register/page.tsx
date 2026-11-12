@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { toast } from "sonner";
+import { useState } from "react";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -29,6 +28,9 @@ import { SmsConfigPanel } from "./components/sms-config-panel";
  *   邮箱订单 —— Remail 订单（下手、取件、复用状态）
  *   接码配置 —— SMS 接码（取 refresh_token 时命中 add-phone 要用）
  *   自动补充 —— 号池低于阈值时自动注册
+ *
+ * 布局说明：宽度交给根布局的 max-w 容器统一控制（这里不再额外限宽，
+ * 否则表格类页面在宽屏上还是一窄条）。
  */
 export default function RegisterPage() {
   const { isCheckingAuth, session } = useAuthGuard(["admin"]);
@@ -42,52 +44,57 @@ export default function RegisterPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-7xl px-4 py-6 space-y-4">
-      <header className="space-y-1">
-        <h1 className="text-xl font-semibold">注册管理</h1>
+    <div className="w-full space-y-5 px-4 py-6 sm:px-6 lg:px-8">
+      <header className="flex flex-col gap-1.5">
+        <h1 className="text-2xl font-semibold tracking-tight">注册管理</h1>
         <p className="text-sm text-muted-foreground">
-          批量注册账号、查看注册结果，并直接导入到号池
+          批量注册账号、查看注册结果，并直接导入到「号池管理」
         </p>
       </header>
 
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList variant="line">
-          <TabsTrigger value="batch">批量注册</TabsTrigger>
-          <TabsTrigger value="registered">注册结果</TabsTrigger>
-          <TabsTrigger value="runs">运行记录</TabsTrigger>
-          <TabsTrigger value="proxies">代理池</TabsTrigger>
-          <TabsTrigger value="mail">邮箱配置</TabsTrigger>
-          <TabsTrigger value="pool">邮箱池</TabsTrigger>
-          <TabsTrigger value="orders">邮箱订单</TabsTrigger>
-          <TabsTrigger value="sms">接码配置</TabsTrigger>
-          <TabsTrigger value="auto">自动补充</TabsTrigger>
-        </TabsList>
+      <Tabs value={tab} onValueChange={setTab} className="space-y-5">
+        {/* 标签栏粘顶 —— 表格类页面很长，翻到下面还能随时切标签 */}
+        <div className="sticky top-2 z-30 -mx-1 overflow-x-auto px-1">
+          <div className="min-w-max rounded-2xl border border-white/80 bg-white/85 px-2 py-1.5 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-stone-900/85">
+            <TabsList variant="line" className="justify-start gap-1">
+              <TabsTrigger value="batch">批量注册</TabsTrigger>
+              <TabsTrigger value="registered">注册结果</TabsTrigger>
+              <TabsTrigger value="runs">运行记录</TabsTrigger>
+              <TabsTrigger value="proxies">代理池</TabsTrigger>
+              <TabsTrigger value="mail">邮箱配置</TabsTrigger>
+              <TabsTrigger value="pool">邮箱池</TabsTrigger>
+              <TabsTrigger value="orders">邮箱订单</TabsTrigger>
+              <TabsTrigger value="sms">接码配置</TabsTrigger>
+              <TabsTrigger value="auto">自动补充</TabsTrigger>
+            </TabsList>
+          </div>
+        </div>
 
-        <TabsContent value="batch" className="pt-4">
+        <TabsContent value="batch" className="pt-0">
           <BatchRegisterPanel />
         </TabsContent>
-        <TabsContent value="registered" className="pt-4">
+        <TabsContent value="registered" className="pt-0">
           <RegisteredPanel />
         </TabsContent>
-        <TabsContent value="runs" className="pt-4">
+        <TabsContent value="runs" className="pt-0">
           <RunsPanel />
         </TabsContent>
-        <TabsContent value="proxies" className="pt-4">
+        <TabsContent value="proxies" className="pt-0">
           <ProxyPoolPanel />
         </TabsContent>
-        <TabsContent value="mail" className="pt-4">
+        <TabsContent value="mail" className="pt-0">
           <MailConfigPanel />
         </TabsContent>
-        <TabsContent value="pool" className="pt-4">
+        <TabsContent value="pool" className="pt-0">
           <MailPoolPanel />
         </TabsContent>
-        <TabsContent value="orders" className="pt-4">
+        <TabsContent value="orders" className="pt-0">
           <MailOrdersPanel />
         </TabsContent>
-        <TabsContent value="sms" className="pt-4">
+        <TabsContent value="sms" className="pt-0">
           <SmsConfigPanel />
         </TabsContent>
-        <TabsContent value="auto" className="pt-4">
+        <TabsContent value="auto" className="pt-0">
           <AutoRegisterPanel />
         </TabsContent>
       </Tabs>

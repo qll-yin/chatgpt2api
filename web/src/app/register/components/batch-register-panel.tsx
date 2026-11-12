@@ -15,7 +15,7 @@ import { subscribeSSE } from "@/lib/sse";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -74,13 +74,18 @@ export function BatchRegisterPanel() {
   const selectedProvider = providers.find((p) => p.kind === mailSource) ?? null;
 
   const pushLog = useCallback((kind: string, message: string, level?: string) => {
-    logIdRef.current += 1;
+    // ⚠️ id 必须在**调用时**取，不能在 setState 的更新函数里读 logIdRef.current。
+    //    React 18 会把同一批里的多次 setState 合并，等真正执行更新函数时，
+    //    logIdRef.current 已经是最后的值 —— 这一批的每一行都会拿到**同一个 id**，
+    //    于是控制台刷「Encountered two children with the same key, `5`」。
+    //    （实测 SSE 一批推十几行日志，必现。）
+    const id = ++logIdRef.current;
     const now = new Date();
     const time = `${String(now.getHours()).padStart(2, "0")}:${String(
       now.getMinutes(),
     ).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
     setLogs((prev) =>
-      [...prev, { id: logIdRef.current, kind, message, level, time }].slice(-500),
+      [...prev, { id, kind, message, level, time }].slice(-500),
     );
   }, []);
 
@@ -257,12 +262,15 @@ export function BatchRegisterPanel() {
   const isRunning = state === "running";
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[minmax(320px,380px)_1fr]">
+    <div className="grid items-start gap-5 lg:grid-cols-[minmax(340px,400px)_minmax(0,1fr)] xl:grid-cols-[minmax(400px,460px)_minmax(0,1fr)]">
       {/* 左：参数 + 控制 */}
-      <div className="space-y-4">
+      <div className="space-y-5">
         <Card>
           <CardHeader>
             <CardTitle className="text-base">批量参数</CardTitle>
+            <CardDescription className="text-xs">
+              参数与旧注册机的 auto-loop 一致，邮箱来源以这里选的为准
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-1.5">
@@ -350,7 +358,10 @@ export function BatchRegisterPanel() {
               </div>
             </div>
 
-            <div className="space-y-2.5 border-t pt-3">
+            <div className="space-y-2.5 border-t pt-4">
+              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                凭证与入池
+              </div>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
                   checked={autoImport}
@@ -377,12 +388,12 @@ export function BatchRegisterPanel() {
                 绑定 2FA
               </label>
               <p className="text-xs text-muted-foreground">
-                自动导入写入的是左侧导航「号池管理」里的账号池（chatgpt2api 账号池），
+                自动导入写入的是顶部导航「号池管理」里的账号池（chatgpt2api 账号池），
                 不是本页的「注册结果」；批量结束后会自动刷一次额度。
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-2 border-t pt-3">
+            <div className="flex flex-wrap gap-2 border-t pt-4">
               <Button onClick={handleStart} disabled={busy || isRunning}>
                 {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Users className="size-4" />}
                 开始
@@ -418,9 +429,12 @@ export function BatchRegisterPanel() {
         <Card>
           <CardHeader>
             <CardTitle className="text-base">进度</CardTitle>
+            <CardDescription className="text-xs">
+              批次结束后「已用时」会冻结，不会一直累加
+            </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex items-center gap-2">
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
               <Badge variant={isRunning ? "default" : "secondary"}>
                 {stateLabel[state] ?? state}
               </Badge>
@@ -433,34 +447,47 @@ export function BatchRegisterPanel() {
                 {status?.last_message || "—"}
               </span>
             </div>
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
-              <dt className="text-muted-foreground">成功</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status?.registered_ok ?? 0}
-              </dd>
-              <dt className="text-muted-foreground">失败</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status?.registered_fail ?? 0}
-              </dd>
-              <dt className="text-muted-foreground">目标</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status?.target_count ? status.target_count : "不限"}
-              </dd>
-              <dt className="text-muted-foreground">剩余</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status?.remaining ?? "—"}
-              </dd>
-              <dt className="text-muted-foreground">已用时</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status ? `${Math.floor(status.elapsed / 60)}分${Math.floor(status.elapsed % 60)}秒` : "—"}
-              </dd>
-              <dt className="text-muted-foreground">邮箱池可用</dt>
-              <dd className="text-right font-medium tabular-nums">
-                {status?.pool_stats?.available ?? 0}
-              </dd>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">成功</dt>
+                <dd className="text-lg font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                  {status?.registered_ok ?? 0}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">失败</dt>
+                <dd className="text-lg font-semibold tabular-nums text-red-600 dark:text-red-400">
+                  {status?.registered_fail ?? 0}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">目标</dt>
+                <dd className="text-lg font-semibold tabular-nums">
+                  {status?.target_count ? status.target_count : "不限"}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">剩余</dt>
+                <dd className="text-lg font-semibold tabular-nums">
+                  {status?.remaining ?? "—"}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">已用时</dt>
+                <dd className="text-lg font-semibold tabular-nums">
+                  {status ? `${Math.floor(status.elapsed / 60)}分${Math.floor(status.elapsed % 60)}秒` : "—"}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">邮箱池可用</dt>
+                <dd className="text-lg font-semibold tabular-nums">
+                  {status?.pool_stats?.available ?? 0}
+                </dd>
+              </div>
             </dl>
             {status?.workers?.length ? (
-              <div className="space-y-1 border-t pt-2 text-xs text-muted-foreground">
+              <div className="space-y-1 border-t pt-3 text-xs text-muted-foreground">
+                <div className="font-medium">正在跑的 worker</div>
                 {status.workers.map((w) => (
                   <div key={w.id} className="truncate">
                     worker-{w.id}: {w.email || "准备中"}
@@ -473,7 +500,7 @@ export function BatchRegisterPanel() {
       </div>
 
       {/* 右：实时日志 */}
-      <Card className="flex min-h-[480px] flex-col">
+      <Card className="flex min-h-[520px] flex-col overflow-hidden">
         <CardHeader className="flex-row items-center justify-between gap-2">
           <CardTitle className="text-base">
             实时日志
@@ -492,7 +519,7 @@ export function BatchRegisterPanel() {
           </Button>
         </CardHeader>
         <CardContent className="flex-1 overflow-hidden">
-          <div className="h-[420px] overflow-y-auto rounded-md bg-stone-950 p-3 font-mono text-xs leading-relaxed text-stone-200">
+          <div className="h-[calc(100vh-300px)] min-h-[440px] overflow-y-auto rounded-2xl bg-stone-950 p-4 font-mono text-xs leading-relaxed text-stone-200">
             {logs.length === 0 ? (
               <div className="text-stone-500">暂无日志。点击「开始」启动批量注册。</div>
             ) : (

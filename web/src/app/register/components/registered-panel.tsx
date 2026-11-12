@@ -287,7 +287,7 @@ export function RegisteredPanel() {
 
       {/* 账户详情 */}
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-w-3xl">
           <DialogHeader>
             <DialogTitle>账户详情</DialogTitle>
             <DialogDescription>

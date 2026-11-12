@@ -555,10 +555,6 @@ export async function refreshImageModelCatalog() {
   });
 }
 
-export async function fetchThirdPartyApps() {
-  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps");
-}
-
 export async function testBackupConnection() {
   return httpRequest<{ result: { ok: boolean; status: number } }>("/api/backup/test", {
     method: "POST",
