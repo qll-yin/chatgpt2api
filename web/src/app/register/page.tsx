@@ -9,6 +9,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { AutoRegisterPanel } from "./components/auto-register-panel";
 import { BatchRegisterPanel } from "./components/batch-register-panel";
 import { MailConfigPanel } from "./components/mail-config-panel";
+import { MailOrdersPanel } from "./components/mail-orders-panel";
 import { ProxyPoolPanel } from "./components/proxy-pool-panel";
 import { RegisteredPanel } from "./components/registered-panel";
 import { RunsPanel } from "./components/runs-panel";
@@ -16,12 +17,13 @@ import { RunsPanel } from "./components/runs-panel";
 /**
  * 注册管理。
  *
- * 六个标签页：
+ * 七个标签页：
  *   批量注册 —— 起批量任务、实时日志、暂停/恢复/停止
- *   注册结果 —— 已注册的账号，勾选后批量导入号池
+ *   注册结果 —— 已注册的账号，勾选后批量导入号池 / 标注异常
  *   运行记录 —— 历史运行记录与错误分类
  *   代理池   —— 代理的启用/上限/用量
  *   邮箱配置 —— 邮箱来源与各 provider 的配置项
+ *   邮箱订单 —— Remail 订单（下手、取件、复用状态）
  *   自动补充 —— 号池低于阈值时自动注册
  */
 export default function RegisterPage() {
@@ -51,6 +53,7 @@ export default function RegisterPage() {
           <TabsTrigger value="runs">运行记录</TabsTrigger>
           <TabsTrigger value="proxies">代理池</TabsTrigger>
           <TabsTrigger value="mail">邮箱配置</TabsTrigger>
+          <TabsTrigger value="orders">邮箱订单</TabsTrigger>
           <TabsTrigger value="auto">自动补充</TabsTrigger>
         </TabsList>
 
@@ -68,6 +71,9 @@ export default function RegisterPage() {
         </TabsContent>
         <TabsContent value="mail" className="pt-4">
           <MailConfigPanel />
+        </TabsContent>
+        <TabsContent value="orders" className="pt-4">
+          <MailOrdersPanel />
         </TabsContent>
         <TabsContent value="auto" className="pt-4">
           <AutoRegisterPanel />

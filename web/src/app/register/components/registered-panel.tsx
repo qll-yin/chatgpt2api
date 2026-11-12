@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Download, LoaderCircle, RefreshCw } from "lucide-react";
+import { AlertTriangle, Download, LoaderCircle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +20,7 @@ import {
   fetchRegistered,
   importRegisteredToPool,
   importTokenTextToPool,
+  markRegisteredAbnormal,
   type RegisteredItem,
 } from "@/lib/register-api";
 
@@ -43,6 +44,7 @@ export function RegisteredPanel() {
   const [importing, setImporting] = useState(false);
   const [text, setText] = useState("");
   const [page, setPage] = useState(1);
+  const [marking, setMarking] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -103,6 +105,27 @@ export function RegisteredPanel() {
       toast.error(`导入失败：${(error as Error).message ?? error}`);
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleMarkAbnormal = async (abnormal: boolean) => {
+    if (selectedCount === 0) {
+      toast.error("请先勾选要标注的账号");
+      return;
+    }
+    setMarking(true);
+    try {
+      const result = await markRegisteredAbnormal([...selected], abnormal);
+      toast.success(
+        `已标注 ${result.updated} 个账号` +
+          (abnormal ? "，并释放了它们占用的代理配额" : ""),
+      );
+      setSelected(new Set());
+      await load();
+    } catch (error) {
+      toast.error(`标注失败：${(error as Error).message ?? error}`);
+    } finally {
+      setMarking(false);
     }
   };
 
@@ -182,6 +205,20 @@ export function RegisteredPanel() {
               <RefreshCw className="size-4" />
               刷新
             </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void handleMarkAbnormal(true)}
+              disabled={marking || selectedCount === 0}
+              title="标注异常会释放该号占用的代理配额"
+            >
+              {marking ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <AlertTriangle className="size-4" />
+              )}
+              标注异常（{selectedCount}）
+            </Button>
             <Button size="sm" onClick={handleImportSelected} disabled={importing || selectedCount === 0}>
               {importing ? (
                 <LoaderCircle className="size-4 animate-spin" />
@@ -199,6 +236,7 @@ export function RegisteredPanel() {
                 <TableHead className="w-10">
                   <Checkbox checked={allSelected} onCheckedChange={toggleAll} />
                 </TableHead>
+                <TableHead className="w-20">状态</TableHead>
                 <TableHead>邮箱</TableHead>
                 <TableHead className="w-24">access_token</TableHead>
                 <TableHead className="w-24">refresh_token</TableHead>
@@ -208,7 +246,7 @@ export function RegisteredPanel() {
             <TableBody>
               {items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
                     {loading ? "加载中…" : "还没有注册成功的账号"}
                   </TableCell>
                 </TableRow>
@@ -220,6 +258,13 @@ export function RegisteredPanel() {
                         checked={selected.has(item.email)}
                         onCheckedChange={() => toggleOne(item.email)}
                       />
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap">
+                      {item.abnormal ? (
+                        <Badge variant="danger">异常</Badge>
+                      ) : (
+                        <Badge variant="outline">正常</Badge>
+                      )}
                     </TableCell>
                     <TableCell className="font-medium">{item.email}</TableCell>
                     <TableCell>

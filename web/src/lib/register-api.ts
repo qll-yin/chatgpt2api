@@ -57,6 +57,8 @@ export type RegisteredItem = {
   has_refresh_token: boolean;
   proxy: string;
   created_at?: number | null;
+  /** 标注异常（被封 / 额度耗尽 / 不可用） */
+  abnormal: boolean;
 };
 
 export type MailProviderField = {
@@ -115,6 +117,34 @@ export type ImportToPoolResult = {
   imported: number;
   skipped: number;
   missing: string[];
+};
+
+export type MailOrder = {
+  order_no: string;
+  email: string;
+  suffix: string;
+  service_mode: string;
+  supply_policy: string;
+  project_id?: number | null;
+  order_status: string;
+  pay_amount: string;
+  received_at?: number | null;
+  used_email: string;
+  attempt_count: number;
+  max_attempts: number;
+  last_error?: string | null;
+  disabled: boolean;
+  has_token: boolean;
+  reusable: boolean;
+};
+
+export type MailOrderMail = {
+  id?: string | null;
+  sender: string;
+  subject: string;
+  receivedAt: string;
+  verificationCode: string;
+  bodyPreview: string;
 };
 
 export type AutoRegisterSettings = {
@@ -326,6 +356,95 @@ export async function saveRegisterSettings(
   return httpRequest<{ values: Record<string, string> }>("/api/register/settings", {
     method: "POST",
     body: { values },
+  });
+}
+
+// ──────────────────────── Remail 订单 ────────────────────────
+
+export async function fetchMailOrders(
+  limit = 50,
+  offset = 0,
+): Promise<{ items: MailOrder[]; total: number }> {
+  return httpRequest<{ items: MailOrder[]; total: number }>(
+    `/api/register/mail/orders?limit=${limit}&offset=${offset}`,
+  );
+}
+
+export async function createMailOrder(payload: {
+  suffix?: string;
+  project_id?: number;
+  service_mode?: string;
+  supply_policy?: string;
+}): Promise<{ ok: boolean; email: string; items: MailOrder[] }> {
+  return httpRequest<{ ok: boolean; email: string; items: MailOrder[] }>(
+    "/api/register/mail/orders",
+    { method: "POST", body: payload },
+  );
+}
+
+export async function fetchOrderMails(orderNo: string): Promise<{
+  email: string;
+  items: MailOrderMail[];
+}> {
+  return httpRequest<{ email: string; items: MailOrderMail[] }>(
+    `/api/register/mail/orders/${encodeURIComponent(orderNo)}/mails`,
+  );
+}
+
+export async function linkMailOrder(orderNo: string, email: string) {
+  return httpRequest<{ ok: boolean }>(
+    `/api/register/mail/orders/${encodeURIComponent(orderNo)}/link`,
+    { method: "POST", body: { email } },
+  );
+}
+
+export async function setOrderDisabled(orderNo: string, disabled: boolean) {
+  return httpRequest<{ ok: boolean }>(
+    `/api/register/mail/orders/${encodeURIComponent(orderNo)}/disabled`,
+    { method: "POST", body: { disabled } },
+  );
+}
+
+export async function deleteMailOrder(orderNo: string) {
+  return httpRequest<{ ok: boolean }>(
+    `/api/register/mail/orders/${encodeURIComponent(orderNo)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function bulkDeleteOrders(orderNos: string[]) {
+  return httpRequest<{ ok: boolean; deleted: number }>(
+    "/api/register/mail/orders/bulk_delete",
+    { method: "POST", body: { order_nos: orderNos } },
+  );
+}
+
+export async function fetchMailWallet(): Promise<{
+  balance: string;
+  enabled?: boolean;
+}> {
+  return httpRequest<{ balance: string; enabled?: boolean }>(
+    "/api/register/mail/wallet",
+  );
+}
+
+// ──────────────────────── 标注账号异常 ────────────────────────
+
+export async function markRegisteredAbnormal(
+  emails: string[],
+  abnormal = true,
+): Promise<{
+  updated: number;
+  total: number;
+  proxy_stats: RegisterProxyStats;
+}> {
+  return httpRequest<{
+    updated: number;
+    total: number;
+    proxy_stats: RegisterProxyStats;
+  }>("/api/register/registered/mark-abnormal", {
+    method: "POST",
+    body: { emails, abnormal },
   });
 }
 
