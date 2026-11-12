@@ -23,6 +23,10 @@ import {
   type RegisteredItem,
 } from "@/lib/register-api";
 
+import { Pagination } from "./pagination";
+
+const PAGE_SIZE = 20;
+
 /**
  * 注册结果：勾选账号 → 批量导入号池。
  *
@@ -38,11 +42,12 @@ export function RegisteredPanel() {
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [text, setText] = useState("");
+  const [page, setPage] = useState(1);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchRegistered(200, 0);
+      const data = await fetchRegistered(PAGE_SIZE, (page - 1) * PAGE_SIZE);
       setItems(data.items || []);
       setTotal(data.total || 0);
     } catch (error) {
@@ -50,7 +55,7 @@ export function RegisteredPanel() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     void load();
@@ -123,12 +128,19 @@ export function RegisteredPanel() {
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">按文本导入号池</CardTitle>
+          <CardTitle className="text-base">导入外部账号</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-xs text-muted-foreground">
-            每行一个账号，格式 <code className="rounded bg-stone-100 px-1">access_token----proxy</code>
-            ，proxy 可省略。也可直接粘贴注册机导出的文件内容。
+            <strong>用途</strong>：把<strong>不是本机注册出来的</strong>账号批量灌进号池 ——
+            比如别的机器上跑的注册机导出的文件、手头攒的账号、或从别处复制来的 token。
+            本机注册成功的号走下面的「注册结果 → 勾选 → 导入号池」即可，不用走这里。
+          </p>
+          <p className="text-xs text-muted-foreground">
+            每行一个账号，格式{" "}
+            <code className="rounded bg-stone-100 px-1 dark:bg-stone-800">access_token----proxy</code>
+            ，proxy 可省略（写成 <code className="rounded bg-stone-100 px-1 dark:bg-stone-800">access_token</code>{" "}
+            即可）。
           </p>
           <textarea
             value={text}
@@ -144,7 +156,7 @@ export function RegisteredPanel() {
               ) : (
                 <Download className="size-4" />
               )}
-              按文本导入
+              导入
             </Button>
           </div>
         </CardContent>
@@ -232,6 +244,12 @@ export function RegisteredPanel() {
               )}
             </TableBody>
           </Table>
+          <Pagination
+            page={page}
+            pageSize={PAGE_SIZE}
+            total={total}
+            onPageChange={setPage}
+          />
         </CardContent>
       </Card>
     </div>

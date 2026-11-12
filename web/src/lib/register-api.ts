@@ -62,9 +62,13 @@ export type RegisteredItem = {
 export type MailProviderField = {
   key: string;
   label?: string;
+  /** text / password / number / select */
   type?: string;
   placeholder?: string;
-  secret?: boolean;
+  required?: boolean;
+  help?: string;
+  /** type === "select" 时的候选项 */
+  options?: string[];
 };
 
 export type MailProvider = {
@@ -118,8 +122,7 @@ export type AutoRegisterSettings = {
   threshold: number;
   target_batch: number;
   check_interval_minute: number;
-  register_url: string;
-  register_auth_key: string;
+  concurrency: number;
   register_options: Record<string, unknown>;
   cooldown_minute: number;
 };
@@ -141,8 +144,13 @@ export async function fetchRegisterStatus(): Promise<RegisterStatus> {
   return httpRequest<RegisterStatus>("/api/register/status");
 }
 
-export async function fetchRegisterRuns(): Promise<{ items: RegisterRun[] }> {
-  return httpRequest<{ items: RegisterRun[] }>("/api/register/runs");
+export async function fetchRegisterRuns(
+  limit = 50,
+  offset = 0,
+): Promise<{ items: RegisterRun[]; total: number }> {
+  return httpRequest<{ items: RegisterRun[]; total: number }>(
+    `/api/register/runs?limit=${limit}&offset=${offset}`,
+  );
 }
 
 export async function fetchRegistered(
@@ -193,8 +201,119 @@ export async function importRegisterProxies(
   });
 }
 
+export async function updateRegisterProxy(
+  proxy: string,
+  patch: {
+    enabled?: boolean;
+    max_uses?: number;
+    note?: string;
+    proxy_type?: "static" | "dynamic";
+  },
+): Promise<{ items: RegisterProxy[]; stats: RegisterProxyStats }> {
+  return httpRequest<{ items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    "/api/register/proxies",
+    { method: "PATCH", body: { proxy, ...patch } },
+  );
+}
+
+export async function deleteRegisterProxy(proxy: string): Promise<{
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{ items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    `/api/register/proxies/${encodeURIComponent(proxy)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function clearRegisterProxies(): Promise<{
+  removed: number;
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{ removed: number; items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    "/api/register/proxies",
+    { method: "DELETE" },
+  );
+}
+
+export async function resetRegisterProxyUsage(proxy?: string): Promise<{
+  reset: number;
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{ reset: number; items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    "/api/register/proxies/reset",
+    { method: "POST", body: { proxy: proxy || null } },
+  );
+}
+
+export async function resetRegisterProxyCf(proxy?: string): Promise<{
+  reset: number;
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{ reset: number; items: RegisterProxy[]; stats: RegisterProxyStats }>(
+    "/api/register/proxies/cf-reset",
+    { method: "POST", body: { proxy: proxy || null } },
+  );
+}
+
+export type ProxyTestResult = {
+  ok: boolean;
+  latency_ms?: number;
+  ip?: string;
+  ipv6?: boolean;
+  ipv6_addr?: string;
+  error?: string;
+};
+
+export async function testRegisterProxies(
+  proxies: string[],
+  timeout = 8,
+): Promise<{ results: Record<string, ProxyTestResult> }> {
+  return httpRequest<{ results: Record<string, ProxyTestResult> }>(
+    "/api/register/proxies/test",
+    { method: "POST", body: { proxies, timeout } },
+  );
+}
+
+export async function testRegisterProxiesIpv6(
+  proxies: string[],
+  timeout = 10,
+): Promise<{
+  results: Record<string, ProxyTestResult>;
+  items: RegisterProxy[];
+  stats: RegisterProxyStats;
+}> {
+  return httpRequest<{
+    results: Record<string, ProxyTestResult>;
+    items: RegisterProxy[];
+    stats: RegisterProxyStats;
+  }>("/api/register/proxies/ipv6-test", { method: "POST", body: { proxies, timeout } });
+}
+
 export async function fetchMailProviders(): Promise<{ providers: MailProvider[] }> {
   return httpRequest<{ providers: MailProvider[] }>("/api/register/mail-providers");
+}
+
+export async function fetchMailConfig(): Promise<{ config: Record<string, string> }> {
+  return httpRequest<{ config: Record<string, string> }>("/api/register/mail-config");
+}
+
+export async function saveMailConfig(
+  values: Record<string, string>,
+): Promise<{ config: Record<string, string> }> {
+  return httpRequest<{ config: Record<string, string> }>("/api/register/mail-config", {
+    method: "POST",
+    body: values,
+  });
+}
+
+export async function testMailConnection(): Promise<{ ok: boolean; message?: string }> {
+  return httpRequest<{ ok: boolean; message?: string }>("/api/register/mail-test", {
+    method: "POST",
+  });
 }
 
 export async function fetchRegisterSettings(): Promise<{ values: Record<string, string> }> {

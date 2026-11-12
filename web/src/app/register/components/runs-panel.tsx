@@ -17,6 +17,10 @@ import {
 } from "@/components/ui/table";
 import { fetchRegisterRuns, type RegisterRun } from "@/lib/register-api";
 
+import { Pagination } from "./pagination";
+
+const PAGE_SIZE = 20;
+
 const categoryLabel: Record<string, string> = {
   network: "网络",
   account: "账号",
@@ -37,19 +41,22 @@ function formatTime(ts?: number | null) {
 
 export function RunsPanel() {
   const [items, setItems] = useState<RegisterRun[]>([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [page, setPage] = useState(1);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchRegisterRuns();
+      const data = await fetchRegisterRuns(PAGE_SIZE, (page - 1) * PAGE_SIZE);
       setItems(data.items || []);
+      setTotal(data.total || 0);
     } catch (error) {
       toast.error(`加载失败：${(error as Error).message ?? error}`);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     void load();
@@ -125,6 +132,12 @@ export function RunsPanel() {
             )}
           </TableBody>
         </Table>
+        <Pagination
+          page={page}
+          pageSize={PAGE_SIZE}
+          total={total}
+          onPageChange={setPage}
+        />
       </CardContent>
     </Card>
   );

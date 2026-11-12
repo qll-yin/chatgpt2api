@@ -1,9 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { LoaderCircle, Save } from "lucide-react";
+import { LoaderCircle, Plug, Save } from "lucide-react";
 import { toast } from "sonner";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -16,9 +17,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  fetchMailConfig,
   fetchMailProviders,
-  fetchRegisterSettings,
-  saveRegisterSettings,
+  saveMailConfig,
+  testMailConnection,
   type MailProvider,
 } from "@/lib/register-api";
 
@@ -27,24 +29,44 @@ import {
  *
  * 表单按 provider 自己声明的 config_fields 动态渲染 ——
  * 加一种邮箱不用改前端。
+ *
+ * 关于「长效 / 短效」：这不是 provider 的固有属性，而是**配置项的结果**
+ * （Remail 的 purchase = 长效可重复收件、code = 短效一次性）。
+ * 所以这里不硬编码任何「这是短效邮箱」的结论 —— 用户在「服务模式」
+ * 下拉框里选哪个，就决定了这个来源当下的行为，旁边的说明文字会跟着变。
  */
 export function MailConfigPanel() {
   const [providers, setProviders] = useState<MailProvider[]>([]);
   const [values, setValues] = useState<Record<string, string>>({});
+  const [saved, setSaved] = useState<Record<string, string>>({});
   const [mailSource, setMailSource] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [{ providers: list }, settings] = await Promise.all([
+      const [{ providers: list }, { config }] = await Promise.all([
         fetchMailProviders(),
-        fetchRegisterSettings(),
+        fetchMailConfig(),
       ]);
       setProviders(list);
-      setValues(settings.values || {});
-      setMailSource(settings.values?.mail_source || list[0]?.kind || "");
+      setSaved(config || {});
+      setMailSource(config?.mail_source || list[0]?.kind || "");
+      // 密码类字段回填成空 —— 后端返回的是 '***' 掩码，
+      // 填进去会把真值覆盖掉
+      const next: Record<string, string> = { ...(config || {}) };
+      for (const p of list) {
+        for (const f of p.config_fields ?? []) {
+          if (f.type === "password") next[f.key] = "";
+          // select 没存过值时默认选第一项，省得每次手动选
+          if (f.type === "select" && !next[f.key] && f.options?.length) {
+            next[f.key] = f.options[0];
+          }
+        }
+      }
+      setValues(next);
     } catch (error) {
       toast.error(`加载失败：${(error as Error).message ?? error}`);
     } finally {
@@ -67,14 +89,38 @@ export function MailConfigPanel() {
     setSaving(true);
     try {
       const payload: Record<string, string> = { ...values, mail_source: mailSource };
-      await saveRegisterSettings(payload);
+      // 密码字段留空 = 不修改（后端见到 '***' 或空会跳过）
+      await saveMailConfig(payload);
       toast.success("已保存");
+      await load();
     } catch (error) {
       toast.error(`保存失败：${(error as Error).message ?? error}`);
     } finally {
       setSaving(false);
     }
   };
+
+  const handleTest = async () => {
+    setTesting(true);
+    try {
+      const result = await testMailConnection();
+      toast.success(result.message || "连通正常");
+    } catch (error) {
+      toast.error(`测试失败：${(error as Error).message ?? error}`);
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const missing = fields
+    .filter((f) => f.required)
+    .filter((f) => {
+      const v = (values[f.key] ?? "").trim();
+      if (v) return false;
+      // 密码类：已存过（后端返回 '***'）就视为已填
+      if (f.type === "password" && saved[f.key] === "***") return false;
+      return true;
+    });
 
   return (
     <div className="space-y-4">
@@ -93,17 +139,27 @@ export function MailConfigPanel() {
                 {providers.map((p) => (
                   <SelectItem key={p.kind} value={p.kind}>
                     {p.display_name}
-                    {p.ephemeral ? "（短效）" : ""}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
 
-          {current?.ephemeral ? (
-            <p className="rounded-md bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-950 dark:text-amber-200">
-              这是短效（一次性）邮箱：只保留一封邮件，取不到验证码就会失效退款。
-              批量注册时不要勾选「获取 refresh_token」。
+          {/* 能力说明：来自 provider 自己的声明，不是猜的 */}
+          {current ? (
+            <div className="flex flex-wrap gap-2">
+              <Badge variant={current.pooled ? "outline" : "secondary"}>
+                {current.pooled ? "号池型：需先导入号，用完要补" : "自建型：自动生成地址"}
+              </Badge>
+              <Badge variant="outline">
+                {current.ephemeral ? "每次新地址" : "固定地址"}
+              </Badge>
+            </div>
+          ) : null}
+
+          {current?.pooled ? (
+            <p className="rounded-md bg-stone-100 p-2 text-xs text-stone-700 dark:bg-stone-900 dark:text-stone-300">
+              {current.display_name} 不需要在这里配置，去「批量注册」里把号导进邮箱池即可。
             </p>
           ) : null}
 
@@ -115,20 +171,70 @@ export function MailConfigPanel() {
             <div className="grid gap-3 md:grid-cols-2">
               {fields.map((field) => (
                 <div key={field.key} className="space-y-1.5">
-                  <Label htmlFor={`mail-${field.key}`}>{field.label || field.key}</Label>
-                  <Input
-                    id={`mail-${field.key}`}
-                    type={field.secret ? "password" : field.type === "number" ? "number" : "text"}
-                    placeholder={field.placeholder}
-                    value={values[field.key] ?? ""}
-                    onChange={(e) => setValue(field.key, e.target.value)}
-                  />
+                  <Label htmlFor={`mail-${field.key}`}>
+                    {field.label || field.key}
+                    {field.required ? (
+                      <span className="ml-1 text-red-500">*</span>
+                    ) : null}
+                  </Label>
+
+                  {/* type=select 的配置项（如 Remail 的服务模式 / 库存策略）
+                      用下拉框，候选项由 provider 在 config_fields[].options 里声明 */}
+                  {field.type === "select" ? (
+                    <Select
+                      value={values[field.key] ?? ""}
+                      onValueChange={(v) => setValue(field.key, v)}
+                    >
+                      <SelectTrigger id={`mail-${field.key}`}>
+                        <SelectValue placeholder={field.placeholder || "请选择"} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(field.options ?? []).map((opt) => (
+                          <SelectItem key={opt} value={opt}>
+                            {opt}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input
+                      id={`mail-${field.key}`}
+                      type={field.type === "password" ? "password" : field.type === "number" ? "number" : "text"}
+                      placeholder={
+                        field.type === "password" && saved[field.key] === "***"
+                          ? "已设置（留空则不修改）"
+                          : field.placeholder
+                      }
+                      value={values[field.key] ?? ""}
+                      onChange={(e) => setValue(field.key, e.target.value)}
+                    />
+                  )}
+
+                  {field.help ? (
+                    <p className="text-xs text-muted-foreground">{field.help}</p>
+                  ) : null}
                 </div>
               ))}
             </div>
           )}
 
-          <div className="flex justify-end border-t pt-3">
+          {missing.length > 0 ? (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              还没填：{missing.map((f) => f.label || f.key).join("、")}
+            </p>
+          ) : null}
+
+          <div className="flex justify-end gap-2 border-t pt-3">
+            {current && !current.pooled ? (
+              <Button variant="secondary" onClick={handleTest} disabled={testing}>
+                {testing ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <Plug className="size-4" />
+                )}
+                测试连通性
+              </Button>
+            ) : null}
             <Button onClick={handleSave} disabled={saving}>
               {saving ? (
                 <LoaderCircle className="size-4 animate-spin" />

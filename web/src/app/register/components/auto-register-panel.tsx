@@ -24,8 +24,7 @@ const DEFAULTS: AutoRegisterSettings = {
   threshold: 10,
   target_batch: 20,
   check_interval_minute: 30,
-  register_url: "",
-  register_auth_key: "",
+  concurrency: 3,
   register_options: {},
   cooldown_minute: 30,
 };
@@ -114,6 +113,7 @@ export function AutoRegisterPanel() {
         <CardContent className="space-y-4">
           <p className="text-sm text-muted-foreground">
             定时检查号池里的可用账号数，低于阈值时自动触发注册，让号池维持在目标水位。
+            注册能力就在本服务内（进程内直接启动批量注册），不依赖任何外部注册机服务。
           </p>
 
           <label className="flex items-center gap-2 text-sm">
@@ -146,6 +146,17 @@ export function AutoRegisterPanel() {
               />
             </div>
             <div className="space-y-1.5">
+              <Label htmlFor="auto-concurrency">注册并发数</Label>
+              <Input
+                id="auto-concurrency"
+                type="number"
+                min={1}
+                max={20}
+                value={settings.concurrency}
+                onChange={(e) => update("concurrency", Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
               <Label htmlFor="auto-interval">检测间隔（分钟）</Label>
               <Input
                 id="auto-interval"
@@ -165,29 +176,6 @@ export function AutoRegisterPanel() {
                 onChange={(e) => update("cooldown_minute", Number(e.target.value))}
               />
             </div>
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="auto-url">注册机地址</Label>
-            <Input
-              id="auto-url"
-              placeholder="http://register:8765"
-              value={settings.register_url}
-              onChange={(e) => update("register_url", e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              注册机独立部署时填它的地址；注册机已合并进本项目时留空即可。
-            </p>
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="auto-key">注册机 auth-key</Label>
-            <Input
-              id="auto-key"
-              type="password"
-              value={settings.register_auth_key}
-              onChange={(e) => update("register_auth_key", e.target.value)}
-            />
           </div>
 
           <div className="flex flex-wrap justify-end gap-2 border-t pt-3">

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Eraser,
   LoaderCircle,
   Pause,
   Play,
@@ -390,8 +391,22 @@ export function BatchRegisterPanel() {
 
       {/* 右：实时日志 */}
       <Card className="flex min-h-[480px] flex-col">
-        <CardHeader>
-          <CardTitle className="text-base">实时日志</CardTitle>
+        <CardHeader className="flex-row items-center justify-between gap-2">
+          <CardTitle className="text-base">
+            实时日志
+            <span className="ml-2 text-xs font-normal text-muted-foreground">
+              {logs.length} 行
+            </span>
+          </CardTitle>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setLogs([])}
+            disabled={logs.length === 0}
+          >
+            <Eraser className="size-4" />
+            清空
+          </Button>
         </CardHeader>
         <CardContent className="flex-1 overflow-hidden">
           <div className="h-[420px] overflow-y-auto rounded-md bg-stone-950 p-3 font-mono text-xs leading-relaxed text-stone-200">
