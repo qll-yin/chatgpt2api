@@ -57,12 +57,19 @@ _sdk_file_cache: Optional[Path] = None
 
 
 def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
-    """Download OpenAI's actual sdk.js to /tmp cache (one-shot per version)."""
+    """Download OpenAI's actual sdk.js to a local cache (one-shot per version).
+
+    缓存目录可用 OPENAI_SENTINEL_CACHE_DIR 覆盖。
+    ⚠️ 容器里默认的 /tmp 会被重建清空 —— sdk.js 下载失败会让注册**静默失败**
+    （验证码收不到，很难排查），所以部署时建议指向已挂载的持久化目录。
+    """
     global _sdk_file_cache
     if _sdk_file_cache and _sdk_file_cache.exists():
         return _sdk_file_cache
 
-    cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / SENTINEL_VERSION
+    override = (os.getenv("OPENAI_SENTINEL_CACHE_DIR", "") or "").strip()
+    base_dir = Path(override) if override else Path(tempfile.gettempdir()) / "openai-sentinel-demo"
+    cache_dir = base_dir / SENTINEL_VERSION
     cache_dir.mkdir(parents=True, exist_ok=True)
     sdk_file = cache_dir / "sdk.js"
     if sdk_file.exists() and sdk_file.stat().st_size > 0:
