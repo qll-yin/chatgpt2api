@@ -75,6 +75,12 @@ class ProxyResetRequest(BaseModel):
     proxy: str | None = None
 
 
+class ProxyInvalidStateRequest(BaseModel):
+    """清零某个代理的「会话失效」计数（409 invalid_state）。"""
+
+    proxy: str
+
+
 class ProxyTestRequest(BaseModel):
     proxies: list[str] = []
     timeout: int = 8
@@ -409,6 +415,22 @@ def create_router() -> APIRouter:
         else:
             reset = store.reset_all_proxy_cf_blocked()
         return {"reset": reset, "items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+
+    @router.post("/api/register/proxies/invalid-reset")
+    async def reset_proxy_invalid_state(
+        body: ProxyInvalidStateRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """清零单个代理的 409 invalid_state 计数。
+
+        场景：代理换了出口 IP / 供应商解封之后手动清一下，
+        不用删了重导（删了会丢 used_count 等统计）。
+        """
+        require_admin(authorization)
+        ok = store.reset_proxy_invalid_state(body.proxy)
+        if not ok:
+            raise HTTPException(status_code=404, detail={"error": "代理不存在"})
+        return {"items": store.list_proxies(), "stats": store.proxy_pool_stats()}
 
     @router.post("/api/register/proxies/test")
     async def test_proxy_conn(

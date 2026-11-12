@@ -147,7 +147,13 @@ class ProxyPoolModel(RegisterBase):
     ipv6_status = Column(String(16), nullable=False, default="untested")
     # 上次做 IPv6 检测的时间（Unix 时间戳）
     ipv6_checked_at = Column(Float, nullable=True)
-    ipv6_checked_at = Column(Float, nullable=True)
+    # 连续「注册会话失效」（409 invalid_state）的次数。
+    # ⚠️ 与 cf_blocked 分开计数：CF 403 是「这个出口 IP 被 Cloudflare 拒了」，
+    #    invalid_state 是「OpenAI 认为这个会话/设备失效」——
+    #    后者绝大多数也是出口 IP 的问题（同一个 IP 注册多了 / 被风控），
+    #    但成因不同、恢复路径也不同，混在一起就看不出到底是哪一层坏了。
+    # 达阈值 → 自动停用 static 代理（换 IP 可能就通，dynamic 不停用）。
+    invalid_state = Column(Integer, nullable=False, default=0, server_default="0")
     last_used_at = Column(Float, nullable=True)
     note = Column(Text, nullable=True)
     created_at = Column(Float, nullable=True)

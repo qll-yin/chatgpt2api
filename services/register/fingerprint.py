@@ -13,6 +13,69 @@ from __future__ import annotations
 
 import random
 
+
+# ---------------------------------------------------------------------------
+# curl_cffi impersonate 支持检测
+# ---------------------------------------------------------------------------
+#
+# ⚠️ 为什么必须运行时探测
+# ----------------------
+# 指纹表里写的是「目标浏览器版本」（比如 chrome150 / safari260），
+# 但 curl_cffi **不一定支持**这些 impersonate 名 —— 支持哪些取决于
+# 装的 curl_cffi 版本（0.15.0 最高到 chrome146，没有 chrome150）。
+#
+# 不支持的后果非常隐蔽：
+#   curl_cffi 每次请求都抛
+#   ``Impersonating chrome150 is not supported``
+#   → warmup 拿不到 oai-did cookie
+#   → authorize/continue 必然 409 invalid_state
+#   → 表现成「注册一直失败」，但根因跟账号、跟代理都没关系。
+#
+# 而且指纹是**随机**挑的，所以是间歇性的：有时挑到支持的版本能跑，
+# 有时挑到不支持的就全挂 —— 更难查。
+#
+# 所以这里在运行时问一遍 curl_cffi「你支持哪些」，只产出受支持的组合。
+# 以后升级/降级 curl_cffi 都不用改代码。
+
+_SUPPORTED_IMPERSONATES: frozenset[str] | None = None
+
+
+def _supported_impersonates() -> frozenset[str]:
+    """curl_cffi 当前版本支持的 impersonate 名集合（探测一次，缓存）。"""
+    global _SUPPORTED_IMPERSONATES
+    if _SUPPORTED_IMPERSONATES is not None:
+        return _SUPPORTED_IMPERSONATES
+    try:
+        from curl_cffi.requests import BrowserType
+
+        names = {
+            name
+            for name in dir(BrowserType)
+            if not name.startswith("_") and isinstance(getattr(BrowserType, name), str)
+        }
+    except Exception:  # noqa: BLE001
+        names = set()
+    # 探测失败 → 不过滤（保持旧行为）
+    _SUPPORTED_IMPERSONATES = frozenset(names)
+    return _SUPPORTED_IMPERSONATES
+
+
+def is_supported_impersonate(name: str) -> bool:
+    """这个 impersonate 名当前能不能用。"""
+    supported = _supported_impersonates()
+    if not supported:
+        return True  # 探测不出来就别拦
+    return str(name) in supported
+
+
+def _filter_supported(items: list, key: str = "impersonate") -> list:
+    """过滤掉不受支持的 impersonate 组合。
+
+    ⚠️ 过滤后如果**一个都不剩**，就返回空列表让调用方走兜底 ——
+       绝不能返回一个不支持的版本，那比没有还糟。
+    """
+    return [it for it in items if is_supported_impersonate(it.get(key, ""))]
+
 # ---------------------------------------------------------------------------
 # macOS Safari（保留原有）
 # ---------------------------------------------------------------------------
@@ -437,9 +500,9 @@ def _apply_hardware(fp: dict, r: random.Random) -> None:
 # ---------------------------------------------------------------------------
 
 def _gen_mac_safari(r: random.Random) -> dict:
-    safari = r.choice(_SAFARI_VERSIONS)
+    safari = r.choice(_filter_supported(_SAFARI_VERSIONS) or _SAFARI_VERSIONS)
     macos_ver = r.choice(safari["macos_versions"])
-    others = [s["impersonate"] for s in _SAFARI_VERSIONS if s["impersonate"] != safari["impersonate"]]
+    others = [s["impersonate"] for s in _filter_supported(_SAFARI_VERSIONS) if s["impersonate"] != safari["impersonate"]]
     return {
         "browser_type": "mac_safari",
         "impersonate": safari["impersonate"],
@@ -457,9 +520,9 @@ def _gen_mac_safari(r: random.Random) -> dict:
 
 
 def _gen_ios_safari(r: random.Random) -> dict:
-    safari = r.choice(_IOS_SAFARI_VERSIONS)
+    safari = r.choice(_filter_supported(_IOS_SAFARI_VERSIONS) or _IOS_SAFARI_VERSIONS)
     ios_ver = r.choice(safari["ios_versions"])
-    others = [s["impersonate"] for s in _IOS_SAFARI_VERSIONS if s["impersonate"] != safari["impersonate"]]
+    others = [s["impersonate"] for s in _filter_supported(_IOS_SAFARI_VERSIONS) if s["impersonate"] != safari["impersonate"]]
     fallbacks = [safari["impersonate"]] + others
     return {
         "browser_type": "ios_safari",
@@ -478,8 +541,8 @@ def _gen_ios_safari(r: random.Random) -> dict:
 
 
 def _gen_chrome(r: random.Random) -> dict:
-    chrome = r.choice(_CHROME_VERSIONS)
-    others = [c["impersonate"] for c in _CHROME_VERSIONS if c["impersonate"] != chrome["impersonate"]]
+    chrome = r.choice(_filter_supported(_CHROME_VERSIONS) or _CHROME_VERSIONS)
+    others = [c["impersonate"] for c in _filter_supported(_CHROME_VERSIONS) if c["impersonate"] != chrome["impersonate"]]
     # sec-ch-ua 直接用预存值（品牌顺序随版本变化，不能自己拼）
     sec_ch_ua = chrome["sec_ch_ua"]
     sec_ch_ua_full_version_list = chrome["sec_ch_ua_full_version_list"]
@@ -509,8 +572,8 @@ def _gen_chrome(r: random.Random) -> dict:
 
 
 def _gen_firefox(r: random.Random) -> dict:
-    ff = r.choice(_FIREFOX_VERSIONS)
-    others = [f["impersonate"] for f in _FIREFOX_VERSIONS if f["impersonate"] != ff["impersonate"]]
+    ff = r.choice(_filter_supported(_FIREFOX_VERSIONS) or _FIREFOX_VERSIONS)
+    others = [f["impersonate"] for f in _filter_supported(_FIREFOX_VERSIONS) if f["impersonate"] != ff["impersonate"]]
     fallbacks = [ff["impersonate"]] + others
     return {
         "browser_type": "firefox",

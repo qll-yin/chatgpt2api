@@ -30,6 +30,11 @@ class AutoLoopState:
     STOPPED = "stopped"
     RUNNING = "running"
     PAUSED = "paused"
+    # 等资源（号池空 / 代理用尽）—— 不是「运行中」，也不是「已停止」。
+    # ⚠️ 单独区分很重要：号池空的时候 worker 其实在空转，什么都没注册。
+    #    显示「运行中」会让人以为还在跑（用户实测：worker 都停了，
+    #    前端进度还在转）。显示「等待中」才如实。
+    WAITING = "waiting"
 
 
 def _parse_proxy_pool(text: str) -> list[str]:
@@ -72,6 +77,13 @@ class AutoLoopController:
         self._imported_tokens: list[str] = []
         # 当前每个 worker 在跑啥（worker_id → email）
         self._worker_status: dict[int, dict] = {}
+        # 活着的 worker（含还没进 run、正在 claim 的）。
+        # ⚠️ 不能只看 _worker_status —— 它只在 run 启动后才有值，
+        #    worker 在 claim 阶段退出时它是空的，会误判成「都退出了」。
+        # ⚠️ 用 (batch_id, worker_id) 而不是光 worker_id ——
+        #    上一批的 worker 没退干净时，光按 worker_id 算会把
+        #    新一批的 worker 也算进来（或反过来漏掉），导致误收敛。
+        self._alive_workers: set[tuple[str, int]] = set()
         self._last_message = ""
         # 熔断状态
         self._consecutive_network_fails = 0
@@ -90,8 +102,25 @@ class AutoLoopController:
 
     def start(self, options: dict) -> dict:
         with self._lock:
-            if self._state in (AutoLoopState.RUNNING, AutoLoopState.PAUSED):
+            # ⚠️ WAITING 也要算「已经在跑」——
+            #    worker 还在等号池/代理，只是暂时没在注册。
+            #    不拦住的话，用户点两次「开始」就会起两批 worker，
+            #    抢同一个邮箱池、互相踩代理配额。
+            if self._state in (
+                AutoLoopState.RUNNING,
+                AutoLoopState.PAUSED,
+                AutoLoopState.WAITING,
+            ):
                 return {"ok": False, "error": f"已经在跑了 (state={self._state})"}
+            # ⚠️ 状态可能还停在 stopped，但**上一批的 worker 还活着**
+            #    （比如它正在等号池、状态还没来得及切）。
+            #    只看 state 会漏判 → 起两批 worker 抢同一个号池。
+            #    所以再查一次「有没有活着的 worker」。
+            if self._alive_workers:
+                return {
+                    "ok": False,
+                    "error": f"上一批 worker 还没退出（{len(self._alive_workers)} 个），稍后再试",
+                }
             # 重置
             self._stop_event.clear()
             self._pause_event.clear()
@@ -106,6 +135,8 @@ class AutoLoopController:
             self._registered_ok = 0
             self._registered_fail = 0
             self._worker_status.clear()
+            # ⚠️ 不清 _alive_workers —— 旧批次的 worker 可能还活着，
+            #    它们带着自己的 batch_id，判定时会自动隔离。
             self._consecutive_network_fails = 0
             self._last_message = "auto-loop 启动"
             # 解析并发参数
@@ -136,6 +167,8 @@ class AutoLoopController:
 
     def pause(self) -> dict:
         with self._lock:
+            if self._state == AutoLoopState.WAITING:
+                return {"ok": False, "error": "当前在等资源，没在跑，不用暂停"}
             if self._state != AutoLoopState.RUNNING:
                 return {"ok": False, "error": f"当前 state={self._state}，不可暂停"}
             self._pause_event.set()
@@ -150,6 +183,7 @@ class AutoLoopController:
                 return {"ok": False, "error": f"当前 state={self._state}，不可恢复"}
             self._pause_event.clear()
             self._state = AutoLoopState.RUNNING
+            self._finished_at = 0.0
             self._last_message = "已恢复"
         self._broadcast("state", self._snapshot())
         return {"ok": True, "state": self._state}
@@ -160,7 +194,16 @@ class AutoLoopController:
                 return {"ok": False, "error": "没在跑"}
             self._stop_event.set()
             self._pause_event.clear()
-            self._last_message = "已请求停止（当前 worker 跑完才生效）"
+            # ⚠️ 「等待中」时**立刻**置为 stopped。
+            #    等资源的时候没有任何注册在跑，再等 worker 退出是白等 ——
+            #    用户点了停止却看着状态卡在「等待中」，会以为没点生效。
+            if self._state == AutoLoopState.WAITING:
+                self._state = AutoLoopState.STOPPED
+                if not self._finished_at:
+                    self._finished_at = time.time()
+                self._last_message = "已停止"
+            else:
+                self._last_message = "已请求停止（当前 worker 跑完才生效）"
         self._broadcast("state", self._snapshot())
         return {"ok": True}
 
@@ -228,6 +271,27 @@ class AutoLoopController:
                 q.put_nowait({"kind": kind, "data": data})
             except queue.Full:
                 pass
+
+    def _set_state(self, state: str, batch_id: str = "") -> None:
+        """切换状态（只在真的变了才广播，避免刷屏）。
+
+        ⚠️ 切到 RUNNING 时必须清掉 _finished_at ——
+           否则会出现「state=running 但 finished_at 有值」的矛盾状态，
+           前端显示「运行中」而「已用时」却被冻结住。
+
+        ⚠️ batch_id 守卫：worker 只能改**自己那一批**的状态。
+           上一批的 worker 若还没退干净，它领到号时调 _set_state(RUNNING)
+           会把新一轮已经结束的状态改回 running —— 前端就永远显示「运行中」。
+        """
+        with self._lock:
+            if batch_id and str(self._options.get("batch_id") or "") != batch_id:
+                return  # 不是当前批次，忽略
+            if self._state == state:
+                return
+            self._state = state
+            if state == AutoLoopState.RUNNING:
+                self._finished_at = 0.0
+        self._broadcast("state", self._snapshot())
 
     def _set_message(self, msg: str):
         with self._lock:
@@ -316,6 +380,12 @@ class AutoLoopController:
 
     def _manage_loop(self):
         """主控线程：启动 worker，等所有 worker 结束，更新最终状态。"""
+        # 本批次的标识 —— 用来识别「我是上一批残留的主控」。
+        # ⚠️ 没有它的话，用户「停止」后马上「开始」，
+        #    上一批的 manage_loop 收尾时会把**新一批**的状态
+        #    覆盖成 stopped —— 前端立刻显示「已停止」，
+        #    但新批次其实正在跑。
+        my_batch = str(self._options.get("batch_id") or "")
         try:
             workers = []
             for wid in range(self._concurrency):
@@ -334,13 +404,20 @@ class AutoLoopController:
         except Exception as e:
             logger.exception(f"manage_loop 异常: {e}")
         finally:
+            # ⚠️ 批次守卫 —— 上一批的收尾不能覆盖新一批的状态。
             with self._lock:
-                self._state = AutoLoopState.STOPPED
-                self._finished_at = time.time()
-                self._worker_status.clear()
-                self._last_message = (
-                    f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
-                )
+                stale = str(self._options.get("batch_id") or "") != my_batch
+                if not stale:
+                    self._state = AutoLoopState.STOPPED
+                    if not self._finished_at:
+                        self._finished_at = time.time()
+                    self._worker_status.clear()
+                    self._last_message = (
+                        f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                    )
+            if stale:
+                logger.info("[auto-loop] 上一批 manage_loop 收尾（不影响当前批次）")
+                return
             self._broadcast("state", self._snapshot())
             # 批量期间为了不拖慢 worker，入池时没刷额度。
             # 这里统一刷一次 —— 后台线程跑，不阻塞管理线程。
@@ -349,9 +426,34 @@ class AutoLoopController:
 
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
+        # 本轮批次的标识 —— 用来识别「我是上一批残留的 worker」。
+        # ⚠️ 没有它的话，上一批 worker 退出时会把**新一批**的状态误杀成 stopped
+        #    （start() 刚设好 running，旧 worker 的 finally 一跑就把它覆盖了）。
+        my_batch = str(self._options.get("batch_id") or "")
+        try:
+            self._worker_loop_inner(worker_id, my_batch)
+        finally:
+            with self._lock:
+                # ⚠️ 按 worker_id 清掉**所有**条目，不只 (my_batch, worker_id)。
+                #    因为 my_batch 是在函数入口读的 self._options["batch_id"]，
+                #    若中途 start() 换了批次，这个 key 就跟登记时的不一致，
+                #    discard((my_batch, worker_id)) 会删不掉 → worker 永远「活着」
+                #    → 之后再也 start 不了。
+                self._alive_workers = {
+                    item for item in self._alive_workers if item[1] != worker_id
+                }
+                stale = str(self._options.get("batch_id") or "") != my_batch
+            if stale:
+                logger.info("[auto-loop] 旧批次 worker 退出（不影响当前批次状态）")
+                return
+            self._settle_if_all_workers_done(worker_id, my_batch)
+
+    def _worker_loop_inner(self, worker_id: int, my_batch: str = ""):
         idle_round = 0
         no_proxy_round = 0
         logger.info(f"[worker-{worker_id}] 启动")
+        with self._lock:
+            self._alive_workers.add((my_batch, worker_id))
 
         while True:
             # 检查停止
@@ -427,17 +529,30 @@ class AutoLoopController:
                     self._set_message(
                         f"worker-{worker_id} 号池空，等待新号..."
                     )
-                # 空 10 轮（约 30s）就停掉这个 worker
-                if idle_round >= 10:
-                    logger.info(f"[worker-{worker_id}] 号池空 30s，停止")
-                    return
-                # 等 3s 再试
+                    # 状态切到「等待中」—— 此刻没有任何注册在跑，
+                    # 显示「运行中」是误导。
+                    self._set_state(
+                        AutoLoopState.WAITING,
+                        str(self._options.get("batch_id") or ""),
+                    )
+                # ⚠️ 号池空时**一直等**，不放弃。
+                #    原来空 10 轮（30s）就退出 —— 用户导入邮箱慢一点、
+                #    或者自动补充正好在等下一批号，都会白等一场。
+                #    现在改成无限等待，状态显示「等待资源」，
+                #    用户补上号后 worker 自己就继续跑。
+                #
+                #    停止靠 stop_event（用户点停止 / 目标达成 / 代理用尽），
+                #    不靠「等不到就放弃」这种隐式超时。
                 for _ in range(30):
                     if self._stop_event.is_set() or self._pause_event.is_set():
                         break
                     time.sleep(0.1)
                 continue
             idle_round = 0
+            # 领到号了 → 回到「运行中」
+            self._set_state(
+                AutoLoopState.RUNNING, str(self._options.get("batch_id") or "")
+            )
 
             # 给这个 run 注入 worker 自己的代理
             run_options = dict(self._options)
@@ -468,6 +583,12 @@ class AutoLoopController:
                 "run_id": run_id,
                 "proxy": proxy,
             })
+            # ── 把这个 run 的详细日志转发到 batch SSE ──
+            # ⚠️ 这一步原来完全缺失：registrar 把日志写进自己的 _run_queues，
+            #    而 batch 的 SSE 只广播 state / run_started / run_finished ——
+            #    两边**没接上**，所以实时日志只有一个「开始注册」就没了，
+            #    详细过程只能去「运行记录」里翻。
+            self._forward_run_logs(run_id, worker_id, account["email"])
 
             # 等当前 run 跑完
             ok, category = self._wait_run_finish(run_id)
@@ -499,6 +620,29 @@ class AutoLoopController:
                             f"（{cfres.get('proxy_type')} 类型，累计 "
                             f"{cfres.get('cf_blocked')} 次）→ 换下一个代理: {proxy[:60]}"
                         )
+                elif category == "invalid_state":
+                    # ── 409 invalid_state 的代理级处置 ──
+                    # ⚠️ 这个错误被分类成 account（不是 network），所以不会熔断
+                    #    整批 —— 但**根因往往就是这个出口 IP 被 OpenAI 记了**。
+                    #    不处置的话，被记死的静态代理会被反复挑中，
+                    #    每次都撞 409，每次都白烧一个付费邮箱。
+                    isres = db.mark_proxy_invalid_state(proxy)
+                    if isres.get("disabled"):
+                        logger.warning(
+                            f"[worker-{worker_id}] 静态代理连续 {isres.get('invalid_state')} 次"
+                            f"会话失效(409 invalid_state) → 已自动停用: {proxy[:60]}"
+                        )
+                        self._broadcast("proxy_disabled", {
+                            "proxy": proxy,
+                            "reason": "连续会话失效(409 invalid_state)",
+                            "count": isres.get("invalid_state"),
+                        })
+                    else:
+                        logger.info(
+                            f"[worker-{worker_id}] 代理会话失效(409 invalid_state)"
+                            f"（{isres.get('proxy_type')} 类型，累计 "
+                            f"{isres.get('invalid_state')} 次）→ 换下一个代理: {proxy[:60]}"
+                        )
 
             # ── 注册成功 → 写入号池 ──
             # ⚠️ 这一步原来完全缺失：auto_loop 是从旧注册机迁来的，
@@ -510,6 +654,11 @@ class AutoLoopController:
             with self._lock:
                 self._worker_status.pop(worker_id, None)
             self._record_finish(ok, category)
+            # ⚠️ 刚跑完一个 run —— 这是「worker 确实停下来了」的时刻。
+            #    如果此刻没有别的 worker 在跑（号池空 / provider 不可用 /
+            #    目标达成），状态要立刻收敛，别让前端一直显示「运行中」。
+            # ⚠️ 这里**不**收敛状态 —— worker 还活着，可能继续领下一个号。
+            #    收敛只在 worker 真正退出时做（见 _worker_loop 的 finally）。
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
@@ -526,6 +675,121 @@ class AutoLoopController:
                     if self._stop_event.is_set() or self._pause_event.is_set():
                         break
                     time.sleep(0.1)
+
+    def _forward_run_logs(self, run_id: str, worker_id: int, email: str) -> None:
+        """把某个 run 的详细日志转发到 batch 的 SSE 订阅者。
+
+        registrar 把日志写进 `registrar._run_queues[run_id]`（同时也写日志文件），
+        但 batch 的 SSE 频道只广播状态类事件 —— 两边不接的话，前端实时日志
+        只有「开始注册 xxx」，后面的每一步（warmup / PoW / 发码 / verify…）
+        全部收不到。
+
+        这里起一个后台线程读 run queue，转成 batch 的 "log" 事件广播出去。
+        并发 worker 各自读自己的 run —— registrar 的 QueueLogHandler 按
+        线程局部变量(_current_run)过滤，别的 run 的日志不会串进来。
+        """
+
+        def _run():
+            import queue as _queue
+
+            q = registrar.get_run_queue(run_id)
+            if q is None:
+                return
+            while True:
+                try:
+                    line = q.get(timeout=1.0)
+                except _queue.Empty:
+                    # run 可能还没结束（worker 还在等），继续等
+                    if not self._worker_status.get(worker_id) or (
+                        self._worker_status.get(worker_id) or {}
+                    ).get("run_id") != run_id:
+                        return  # 这个 run 已经收尾了
+                    continue
+                if line is None:
+                    return  # sentinel: 流结束
+                text = str(line)
+                # __EVENT__: 前缀是结构化状态事件（error / progress 等）
+                if text.startswith("__EVENT__:"):
+                    try:
+                        payload = json.loads(text[len("__EVENT__:"):])
+                    except Exception:  # noqa: BLE001
+                        payload = {"kind": "raw", "message": text}
+                    payload.setdefault("kind", "log")
+                    payload["worker_id"] = worker_id
+                    payload["email"] = email
+                    payload["run_id"] = run_id
+                    # ⚠️ 结构化事件的 kind 要单独带一个标记（如 "run_error"），
+                    #    不能直接用 payload["kind"] —— 那是**注册流程内部**的
+                    #    事件名（error / progress / warning…），前端会拿它
+                    #    当成 batch 的事件类型去匹配，匹配不上就掉进兜底分支，
+                    #    当成普通日志行显示。
+                    self._broadcast("run_event", payload)
+                    continue
+                self._broadcast("log", {
+                    "worker_id": worker_id,
+                    "email": email,
+                    "run_id": run_id,
+                    "message": text,
+                })
+
+        threading.Thread(
+            target=_run, daemon=True, name=f"auto-loop-log-{run_id}"
+        ).start()
+
+    def _settle_if_all_workers_done(self, worker_id: int, batch_id: str = "") -> None:
+        """如果已经没有 worker 在干活了，把状态立刻收敛到 stopped。
+
+        ⚠️ 为什么需要
+        ----------
+        worker 退出（号池空 / 目标达成 / provider 不可用）后，主控线程
+        要等所有 worker 都 join 完才把状态置为 STOPPED。问题是：
+
+        · 号池空的那个 worker 要空转 30s 才退出
+        · 其他 worker 可能还在跑一个长注册
+
+        这段时间里前端显示「运行中」，但实际可能一个号都没在注册 ——
+        用户看到的就是「worker 都停了，进度还在转」。
+
+        这里在 worker 退出时立刻检查：**还有没有别的 worker 在跑？**
+        没有就直接收敛状态，不必等主控线程。
+        """
+        with self._lock:
+            # ⚠️ 批次守卫：只收敛**当前批次**。旧批次的 worker 退出时
+            #    不能把新批次（正在跑的）说成 stopped。
+            if batch_id and str(self._options.get("batch_id") or "") != batch_id:
+                return
+            # 还有别的 worker 在跑 → 不动，等它们结束。
+            # ⚠️ 用 _alive_workers 而不是 _worker_status ——
+            #    后者只在 run 启动后才有值，worker 还在 claim 阶段时会误判。
+            cur_batch = str(self._options.get("batch_id") or "")
+            alive = {
+                wid for (bid, wid) in self._alive_workers if bid == cur_batch
+            }
+            # ⚠️ 收敛的前提是「**一个 worker 都不在了**」。
+            #    只看「除了自己还有没有别人」是不够的 —— 调用点可能
+            #    发生在 worker 还活着的时候（跑完一个 run），那时
+            #    排除自己后集合是空的，但这个 worker 还会去领下一个号，
+            #    收敛成 stopped 就把还在跑的批次说成结束了。
+            if alive:
+                return
+            if self._state == AutoLoopState.STOPPED:
+                return
+            # ⚠️ 「等待中」**不收敛** —— worker 还在等号池/代理，
+            #    用户补上号后它会自己继续跑。收敛成 stopped 就等于把
+            #    还在等待的批次说成「已结束」，用户会以为白跑了。
+            if self._state == AutoLoopState.WAITING:
+                return
+            self._state = AutoLoopState.STOPPED
+            # ⚠️ _finished_at 只在**第一次**结束时设置 —— 后面还有
+            #    _manage_loop 的 finally 和 stop() 都会再写一次，
+            #    每次都往后推 → 「已用时」显示得比实际长。
+            if not self._finished_at:
+                self._finished_at = time.time()
+            self._last_message = (
+                f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+            )
+        logger.info("[auto-loop] 所有 worker 已退出，状态收敛为 stopped")
+        self._broadcast("state", self._snapshot())
 
     def _refresh_pool_quota_async(self) -> None:
         """批量结束后统一刷新号池额度（后台线程）。"""

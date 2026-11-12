@@ -840,20 +840,34 @@ def create_run(
 
 def finish_run(
     run_id: str,
-    ok: bool,
+    status: str = "done",
     error: str = "",
-    error_category: str = "",
+    category: str = "",
     email: str = "",
 ) -> None:
+    """标记一次注册尝试结束。
+
+    ⚠️ status 是**字符串**（"done" / "failed"），不是 bool。
+       历史上这里用过 bool 语义（ok=True/False），但调用点是按字符串传的
+       —— "failed" 也是 truthy，会把失败记成成功。已统一成字符串，
+       与原注册机 webui/db.py 的签名一致。
+
+    ⚠️ 参数名是 category（不是 error_category）—— 调用方传的也是 category，
+       名字必须对齐，否则 TypeError 会让 run 永远停在 "running"，
+       worker 死等 1800 秒，前端永远显示「运行中」。
+    """
+    st = str(status or "failed").strip().lower()
+    if st not in ("done", "failed"):
+        st = "failed"
     with register_session_scope() as session:
         session.execute(
             sa_update(RunModel)
             .where(RunModel.run_id == run_id)
             .values(
-                status="done" if ok else "failed",
+                status=st,
                 finished_at=time.time(),
                 error=(error or None),
-                error_category=(error_category or None),
+                error_category=(category or None),
                 email=(email or None),
             )
         )
@@ -1210,6 +1224,62 @@ def mark_proxy_cf_blocked(proxy: str, max_blocked: int = 2) -> dict[str, Any]:
             "disabled": disabled,
             "proxy_type": row.proxy_type,
         }
+
+
+def mark_proxy_invalid_state(proxy: str, max_invalid: int = 2) -> dict[str, Any]:
+    """记录一次「注册会话失效」（409 invalid_state）。
+
+    ⚠️ 为什么单独记，而不是并进 failed_count
+    ----------------------------------------
+    failed_count 只是「这个代理失败过几次」的软信号 —— pick_proxy 拿它排序
+    但**不会**把代理排除掉。invalid_state 是更强的信号：
+    服务端明确说「Your sign-in session is no longer valid」，
+    几乎总是这个出口 IP 被 OpenAI 记了（同一 IP 注册次数太多 / 被风控）。
+
+    所以处置跟 cf_blocked 同构：
+      · static（固定出口 IP）→ 连续 N 次失效就自动停用，别再拿它试
+      · dynamic（每次换 IP）→ 只计数不停用，换个出口可能就通
+
+    不这么做的话，一个被 OpenAI 记死的静态代理会被反复挑中 ——
+    每个 worker 每次都撞 409，邮箱白白消耗（Remail 是要花钱的），
+    直到整个池子里的号都被浪费光。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return {}
+    with register_session_scope() as session:
+        row = session.execute(
+            select(ProxyPoolModel).where(ProxyPoolModel.proxy == proxy)
+        ).scalar_one_or_none()
+        if row is None:
+            return {}
+        row.invalid_state = int(row.invalid_state or 0) + 1
+        row.failed_count = int(row.failed_count or 0) + 1
+        row.last_used_at = time.time()
+        disabled = False
+        if row.proxy_type == "static" and row.invalid_state >= max(1, int(max_invalid)):
+            row.enabled = False
+            disabled = True
+        return {
+            "proxy": proxy,
+            "invalid_state": row.invalid_state,
+            "disabled": disabled,
+            "proxy_type": row.proxy_type,
+        }
+
+
+def reset_proxy_invalid_state(proxy: str) -> bool:
+    """清零某个代理的 invalid_state 计数（换了 IP / 供应商修了之后手动点一下）。"""
+    target = str(proxy or "").strip()
+    if not target:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(ProxyPoolModel.proxy == target)
+            .values(invalid_state=0)
+        )
+        return bool(result.rowcount)
 
 
 def proxy_pool_stats() -> dict[str, Any]:

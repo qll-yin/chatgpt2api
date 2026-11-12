@@ -119,6 +119,22 @@ class AuthFlow:
             "fallback_impersonates",
             [self._fingerprint["impersonate"], "safari17_0", "safari15_5"],
         )
+        # ⚠️ 过滤掉当前 curl_cffi 不支持的 impersonate 名。
+        #    不支持的名字会让**每个**请求抛
+        #    「Impersonating xxx is not supported」→
+        #    warmup 拿不到 oai-did → authorize/continue 必然 409 invalid_state，
+        #    而错误信息完全看不出真因。详见 register/fingerprint.py 的说明。
+        try:
+            from services.register.fingerprint import is_supported_impersonate
+
+            _supported = [
+                c for c in self._impersonate_candidates
+                if is_supported_impersonate(c)
+            ]
+            if _supported:
+                self._impersonate_candidates = _supported
+        except Exception:  # noqa: BLE001
+            pass
         self._impersonate_idx = 0
         self.session = create_http_session(
             proxy=config.proxy,
