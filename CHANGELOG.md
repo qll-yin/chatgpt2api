@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 1.10.0 - 2026-11-11
+
++ [新增] 文生图支持 GIF 输出：`/v1/images/generations`、`/api/image-tasks/generations` 与 `/v1/responses` 的 `image_generation` 工具新增 `output_format`（`png`/`gif`）、`frame_count`（2-64，默认 9）、`frame_duration_ms`（20-2000 且为 10 的倍数，默认 200）。
++ [新增] 生图页新增格式切换与帧数、帧时长输入，随会话记录保存；Codex 来源模型通过 `image_generation` 工具真实参数请求动图，网页来源模型通过提示词请求。
++ [修复] GIF 原始字节全程保留：存储按真实字节写入 `.gif` 后缀、WebDAV 使用正确 `Content-Type`、下载与展示按后缀返回 `image/gif`，结果新增 `mime_type` 与 `animated` 字段。
++ [修复] 请求 GIF 却拿到静态图或单帧 GIF 时明确报错（`output_format_mismatch`），不把 PNG 改名成 `.gif`。
++ [优化] GIF 请求的上游生图等待预算提升到 300 秒（静态图仍按 `image_poll_timeout_secs`），避免逐帧生成被 120 秒掐断。
++ [边界] 图片编辑与带参考图的链路不支持 GIF，直接返回 400。
++ [修复] 对话保存、批量更新和重新读取时保留 GIF 格式、帧数及帧时长，避免重新生成时丢失动画参数；新增前端回归测试。
+
+## 1.9.5 - 2026-11-05
+
++ [新增] 内置支持 `gpt-image-2.6-flare` 和 `gpt-image-2.6-sunburst`，可在全局设置及生图对话中选择，并通过兼容 API 使用。
++ [修复] 合并内置模型与历史缓存列表，避免升级后新增模型被旧缓存隐藏。
++ [测试] 覆盖旧缓存下新模型选择与持久化、生图及编辑请求的模型透传，以及兼容 API 模型列表。
+
 ## 1.9.4 - 2026-11-02
 
 + [优化] 文本流在上游把消息标记为完成后立即收尾，不再等它自己关闭连接；新增 `text_stream_metrics` 日志，其中 `tail_gap_ms` 就是「最后一段文本到流结束」的间隔，用于定位收尾等待。

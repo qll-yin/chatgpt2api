@@ -119,6 +119,8 @@ def _upsert(session, model, values: dict[str, Any], pk_cols: list[str]) -> None:
 
 _TASK_FIELDS = (
     "status", "mode", "model", "size", "quality",
+    # GIF 输出三件套（output_format / frame_count / frame_duration_ms）
+    "output_format", "frame_count", "frame_duration_ms",
     "created_at", "updated_at", "created_ts", "updated_ts",
     "started_ts", "duration_ms", "progress", "error", "conversation_id",
 )
@@ -132,6 +134,7 @@ _TASK_STR_DEFAULTS = {
     "model": "",
     "size": "",
     "quality": "auto",
+    "output_format": "png",
     "created_at": "",
     "updated_at": "",
 }
@@ -161,6 +164,10 @@ def _task_from_row(row) -> dict[str, Any]:
         "model": row.model,
         "size": row.size,
         "quality": row.quality,
+        # GIF 输出三件套
+        "output_format": row.output_format or "png",
+        "frame_count": row.frame_count,
+        "frame_duration_ms": row.frame_duration_ms,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "created_ts": row.created_ts,

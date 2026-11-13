@@ -95,7 +95,12 @@ DEFAULT_THIRD_PARTY_APPS = {
 }
 
 DEFAULT_IMAGE_MODELS = [
+    # 2.6 三兄弟都留：裸名是上游目录里出现的名字，-flare/-sunburst 是
+    # 作者 v1.9.5 加的两个变体。模型列表是「内置 + 上游目录」合并的，
+    # 多一个名字不会冲突，真不存在也不会被误选。
     "gpt-image-2.6",
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2",
@@ -161,6 +166,10 @@ def _image_models_with_cache(cache: object, legacy_custom_models: object = None)
     保留内置可以保证"代码里声明支持的模型"始终可选。
 
     合并顺序：内置在前（保持稳定顺序），上游新发现的在后。
+
+    ⚠️ 作者 v1.9.5 的实现是「有缓存就直接 return 内置+缓存」——
+       那样**用户自定义模型（legacy）会被整段丢弃**（用户在设置里加的
+       模型凭空消失）。所以这里保留三合一合并：内置 + 缓存 + 自定义。
     """
     cached = _normalize_image_model_list(cache)
     legacy = _normalize_custom_image_models(legacy_custom_models)

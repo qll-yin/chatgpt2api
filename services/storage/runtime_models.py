@@ -62,6 +62,13 @@ class ImageTaskModel(RuntimeBase):
     size = Column(String(32), nullable=False, default="")
     quality = Column(String(32), nullable=False, default="auto")
 
+    # GIF 输出（作者 v1.10.0 的生图动图能力）。
+    # ⚠️ 这三列是后加的，生产库里已存在的 image_tasks 表没有它们 ——
+    #    create_runtime_tables() → ensure_columns() 会在启动时自动补上。
+    output_format = Column(String(16), nullable=False, default="png")
+    frame_count = Column(Integer, nullable=True)
+    frame_duration_ms = Column(Integer, nullable=True)
+
     created_at = Column(String(32), nullable=False, default="")
     updated_at = Column(String(32), nullable=False, default="")
     created_ts = Column(Float, nullable=True)

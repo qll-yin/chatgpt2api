@@ -12,6 +12,7 @@ from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.storage import runtime_store as store
+from utils.helper import normalize_image_output
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -51,6 +52,9 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "model": task.get("model"),
         "size": task.get("size"),
         "quality": task.get("quality"),
+        "output_format": task.get("output_format", "png"),
+        "frame_count": task.get("frame_count"),
+        "frame_duration_ms": task.get("frame_duration_ms"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
@@ -123,14 +127,23 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        output_format: object = "png",
+        frame_count: object = None,
+        frame_duration_ms: object = None,
         base_url: str = "",
     ) -> dict[str, Any]:
+        output_format, frame_count, frame_duration_ms = normalize_image_output(
+            output_format, frame_count, frame_duration_ms
+        )
         payload = {
             "prompt": prompt,
             "model": model,
             "n": 1,
             "size": size,
             "quality": quality,
+            "output_format": output_format,
+            "frame_count": frame_count,
+            "frame_duration_ms": frame_duration_ms,
             "response_format": "url",
             "base_url": base_url,
         }
@@ -202,6 +215,9 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), config.default_image_model),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "output_format": _clean(payload.get("output_format"), "png"),
+                "frame_count": payload.get("frame_count"),
+                "frame_duration_ms": payload.get("frame_duration_ms"),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -438,12 +454,17 @@ class ImageTaskService:
             task = store.get_image_task(owner, task_id)
             quality = _clean(task.get("quality"), "auto") if task else "auto"
             size = _clean(task.get("size")) if task else None
+            # ⚠️ output_format 必须传给 format_image_result：它内部有一道防线
+            #    ——「要 GIF 却拿到静态图就报错，不把 PNG 改名成 .gif」。
+            #    不传的话默认 png，GIF 结果会被静默标成 png。
+            output_format = _clean(task.get("output_format"), "png") if task else "png"
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
                 "b64_json",
                 "",
                 int(time.time()),
+                output_format=output_format,
             )["data"]
             self._update_task(owner, task_id, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
