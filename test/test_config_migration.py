@@ -163,15 +163,35 @@ class ValidationTests(unittest.TestCase):
 
 
 class RetentionTests(unittest.TestCase):
-    def test_retention_defaults_to_24_hours(self):
-        self.assertEqual(normalize({})["remote_retention_hours"], 24)
+    def test_retention_defaults_to_one_day(self):
+        self.assertEqual(normalize({})["remote_retention_days"], 1)
 
     def test_retention_is_clamped(self):
-        self.assertEqual(normalize({"remote_retention_hours": 0})["remote_retention_hours"], 1)
-        self.assertEqual(normalize({"remote_retention_hours": 999999})["remote_retention_hours"], 8760)
+        self.assertEqual(normalize({"remote_retention_days": 0})["remote_retention_days"], 1)
+        self.assertEqual(normalize({"remote_retention_days": 999999})["remote_retention_days"], 3650)
+
+    def test_legacy_hours_converted_to_days(self):
+        """老配置是小时 —— 换算成天，不能丢掉用户的设置。"""
+        self.assertEqual(normalize({"remote_retention_hours": 24})["remote_retention_days"], 1)
+        self.assertEqual(normalize({"remote_retention_hours": 48})["remote_retention_days"], 2)
+        # 不足一天向上取整，至少 1 天
+        self.assertEqual(normalize({"remote_retention_hours": 30})["remote_retention_days"], 2)
+        self.assertEqual(normalize({"remote_retention_hours": 1})["remote_retention_days"], 1)
+
+    def test_legacy_hours_from_existing_are_used(self):
+        prior = normalize({"remote_retention_hours": 72})
+        self.assertEqual(normalize({}, existing=prior)["remote_retention_days"], 3)
+
+    def test_days_take_priority_over_legacy_hours(self):
+        prior = normalize({"remote_retention_hours": 72})
+        result = normalize({"remote_retention_days": 5}, existing=prior)
+        self.assertEqual(result["remote_retention_days"], 5)
 
     def test_cleanup_disabled_by_default(self):
         self.assertFalse(normalize({})["remote_cleanup_enabled"])
+
+    def test_fallback_disabled_by_default(self):
+        self.assertFalse(normalize({})["remote_cleanup_fallback"])
 
     def test_path_style_defaults_to_true(self):
         """R2 必须 path-style —— 默认就要是对的。"""

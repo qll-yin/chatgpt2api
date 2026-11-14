@@ -380,8 +380,16 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
         except Exception:
             pass
 
-        # 远端对象过期清理（默认关闭，配置项 remote_cleanup_enabled）。
-        # 单独 try —— 远端不可达不应该影响本地清理那一轮。
+        # 远端过期清理 —— 主路径是生命周期规则（下发到桶上，R2 服务端执行）。
+        # 指纹比对：配置没变就跳过，不发任何请求。
+        try:
+            lifecycle = image_storage_service.apply_remote_lifecycle()
+            if lifecycle.get("applied"):
+                logger.info({"event": "image_remote_lifecycle_applied", **lifecycle})
+        except Exception:
+            pass
+
+        # 应用侧兜底扫描（默认关闭）—— 单独 try，不影响上面那一轮
         try:
             remote_result = image_storage_service.cleanup_remote()
             if remote_result.get("deleted"):

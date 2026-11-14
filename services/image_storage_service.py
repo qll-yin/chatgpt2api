@@ -333,6 +333,98 @@ class S3Client:
                 raise ImageStorageError(f"S3 batch DELETE failed: {exc}") from exc
         return deleted
 
+    # ── 生命周期规则（R2 的服务端过期删除）───────────────────────────────
+    #
+    # put_bucket_lifecycle_configuration 是**整桶替换**语义 ——
+    # 直接写会把桶上原有的其它规则（备份、日志保留…）全部冲掉。
+    # 所以每次写之前先读回来，只替换/删除「我们自己那条」，
+    # 别的规则原样保留。
+
+    LIFECYCLE_RULE_ID = "chatgpt2api-expire"
+
+    def get_lifecycle_configuration(self) -> dict[str, object]:
+        """读桶上的生命周期规则。桶没配过时返回空列表。"""
+        try:
+            response = self.client.get_bucket_lifecycle_configuration(Bucket=self.bucket)
+        except Exception as exc:
+            code = ""
+            error = getattr(exc, "response", None)
+            if isinstance(error, dict):
+                code = str((error.get("Error") or {}).get("Code") or "")
+            if code in {"NoSuchLifecycleConfiguration", "NoSuchLifecycleConfigurationError", "404"}:
+                return {"rules": []}
+            raise ImageStorageError(f"S3 GET lifecycle failed: {exc}") from exc
+        return response if isinstance(response, dict) else {"rules": []}
+
+    def _our_lifecycle_rule(self, days: int) -> dict[str, object]:
+        prefix = f"{self.root_path}/" if self.root_path else ""
+        return {
+            "ID": self.LIFECYCLE_RULE_ID,
+            "Status": "Enabled",
+            "Filter": {"Prefix": prefix},
+            "Expiration": {"Days": int(days)},
+        }
+
+    @staticmethod
+    def _rule_prefix(rule: dict[str, object]) -> str:
+        raw = rule.get("Filter")
+        if isinstance(raw, dict):
+            return str(raw.get("Prefix") or "")
+        return str(rule.get("Prefix") or "")
+
+    def put_lifecycle_configuration(self, days: int) -> dict[str, object]:
+        """把「超过 N 天自动删除」的生命周期规则写到桶上。
+
+        保留桶上其它规则不动 —— 只替换我们自己那一条（按规则 ID 认）。
+        """
+        days = max(1, int(days))
+        current = self.get_lifecycle_configuration()
+        rules = list(current.get("Rules") or [])
+        kept = [
+            rule for rule in rules
+            if isinstance(rule, dict)
+            and str(rule.get("ID") or "") != self.LIFECYCLE_RULE_ID
+            # 兜底：老版本可能没写 ID，但 prefix 跟我们的一样 —— 也当自己的处理
+            and not (not rule.get("ID") and self._rule_prefix(rule).rstrip("/") == self.root_path.rstrip("/"))
+        ]
+        merged = kept + [self._our_lifecycle_rule(days)]
+        try:
+            self.client.put_bucket_lifecycle_configuration(
+                Bucket=self.bucket,
+                LifecycleConfiguration={"Rules": merged},
+            )
+        except Exception as exc:
+            raise ImageStorageError(f"S3 PUT lifecycle failed: {exc}") from exc
+        return {"rules": merged, "replaced": len(rules) - len(kept), "kept": len(kept)}
+
+    def remove_lifecycle_configuration(self) -> dict[str, object]:
+        """移除「我们自己那条」生命周期规则，桶上其它规则保留。
+
+        桶上只剩我们这一条时，整份配置删掉（R2 对空规则列表不接受）。
+        """
+        current = self.get_lifecycle_configuration()
+        rules = list(current.get("Rules") or [])
+        kept = [
+            rule for rule in rules
+            if isinstance(rule, dict)
+            and str(rule.get("ID") or "") != self.LIFECYCLE_RULE_ID
+            and not (not rule.get("ID") and self._rule_prefix(rule).rstrip("/") == self.root_path.rstrip("/"))
+        ]
+        removed = len(rules) - len(kept)
+        if not removed:
+            return {"removed": 0, "kept": len(kept)}
+        try:
+            if kept:
+                self.client.put_bucket_lifecycle_configuration(
+                    Bucket=self.bucket,
+                    LifecycleConfiguration={"Rules": kept},
+                )
+            else:
+                self.client.delete_bucket_lifecycle(Bucket=self.bucket)
+        except Exception as exc:
+            raise ImageStorageError(f"S3 DELETE lifecycle failed: {exc}") from exc
+        return {"removed": removed, "kept": len(kept)}
+
     def test(self) -> dict[str, object]:
         if not self.endpoint:
             return {"ok": False, "status": 0, "error": "S3 Endpoint is required"}
@@ -641,30 +733,30 @@ class ImageStorageService:
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
     def cleanup_remote(self) -> dict[str, object]:
-        """按保留时长清理远端对象。
+        """应用侧兜底清理：按保留时长扫描并删除远端对象。
 
-        默认关闭（配置项 ``remote_cleanup_enabled``）。
+        ⚠️ 这是**兜底**，不是主路径。主路径是 ``apply_remote_lifecycle()``
+        —— 把生命周期规则下发到桶上，由 R2 服务端删除（零扫描、零成本、
+        应用停机也照清）。这里每 30 分钟扫一遍全桶，桶大了很贵也很慢，
+        所以默认关闭（``remote_cleanup_fallback``）。
 
         判据用的是**对象自己的 LastModified**（R2/S3 返回的上传时间），
         不是本地索引里的创建时间 —— 索引可能丢、也可能和实际对不上，
         用对象自身的时间戳才准。
-
-        ⚠️ 更好的做法是在 R2 控制台配一条 Lifecycle Rule（服务端执行，
-        不消耗应用资源、也没有扫描延迟）。这里的应用侧清理只作兜底。
         """
         settings = self.settings()
-        if not bool(settings.get("remote_cleanup_enabled")):
-            return {"enabled": False, "scanned": 0, "deleted": 0, "reason": "远端清理未开启"}
+        if not bool(settings.get("remote_cleanup_fallback")):
+            return {"enabled": False, "scanned": 0, "deleted": 0, "reason": "应用侧兜底清理未开启"}
         mode = _clean(settings.get("mode"))
         if mode not in {"remote", "both"}:
             return {"enabled": True, "scanned": 0, "deleted": 0, "reason": "远端存储未启用"}
         if self.provider() != "s3":
             return {"enabled": True, "scanned": 0, "deleted": 0, "reason": "当前远端协议不支持列举清理"}
         try:
-            hours = max(1, int(settings.get("remote_retention_hours") or 24))
+            days = max(1, int(settings.get("remote_retention_days") or 1))
         except (TypeError, ValueError):
-            hours = 24
-        cutoff = time.time() - hours * 3600
+            days = 1
+        cutoff = time.time() - days * 86400
         try:
             client = self._remote_client()
             objects = client.list_objects()
@@ -678,8 +770,120 @@ class ImageStorageService:
             logger.warning("[image-storage] 远端清理失败: %s", exc)
             return {"enabled": True, "scanned": 0, "deleted": 0, "error": str(exc)}
         if deleted:
-            logger.info("[image-storage] 远端清理：删除 %s 个过期对象（保留 %s 小时）", deleted, hours)
-        return {"enabled": True, "scanned": len(objects), "deleted": deleted, "retention_hours": hours}
+            logger.info("[image-storage] 远端兜底清理：删除 %s 个过期对象（保留 %s 天）", deleted, days)
+        return {"enabled": True, "scanned": len(objects), "deleted": deleted, "retention_days": days}
+
+    def _lifecycle_fingerprint(self) -> str:
+        """期望的生命周期规则指纹。变了才需要重新下发。"""
+        settings = self.settings()
+        return "|".join([
+            self.provider(),
+            _clean(settings.get("s3_bucket")),
+            _clean(settings.get("remote_root_path")),
+            str(int(settings.get("remote_retention_days") or 1)),
+            "on" if bool(settings.get("remote_cleanup_enabled")) else "off",
+        ])
+
+    def apply_remote_lifecycle(self, force: bool = False) -> dict[str, object]:
+        """把生命周期规则下发到远端桶（R2 服务端执行过期删除）。
+
+        这是远端过期清理的**主路径**：规则写进桶后，R2 自己会按天删除
+        过期对象 —— 不占应用资源、没有扫描延迟，应用停机也照清。
+
+        指纹没变就跳过（``force=True`` 强制重下）。
+        关掉「远端过期清理」时会把我们那条规则从桶上摘掉
+        （只摘自己那一条，桶上其它规则不动）。
+        """
+        settings = self.settings()
+        mode = _clean(settings.get("mode"))
+        if mode not in {"remote", "both"}:
+            return {"applied": False, "reason": "远端存储未启用"}
+        if self.provider() != "s3":
+            return {"applied": False, "reason": "当前远端协议不支持生命周期规则"}
+
+        enabled = bool(settings.get("remote_cleanup_enabled"))
+        fingerprint = self._lifecycle_fingerprint()
+        applied = _clean(settings.get("remote_lifecycle_applied"))
+
+        if not enabled:
+            # 关掉了 → 摘掉我们那条规则（之前下发过的才需要摘）
+            if not applied and not force:
+                return {"applied": False, "reason": "远端过期清理未开启"}
+            result = self._remote_client().remove_lifecycle_configuration()
+            config.set_image_storage_lifecycle_applied("")
+            return {
+                "applied": True,
+                "removed": result.get("removed", 0),
+                "kept_rules": result.get("kept", 0),
+            }
+
+        if not force and fingerprint == applied:
+            return {"applied": False, "reason": "规则已是最新", "fingerprint": fingerprint}
+
+        days = max(1, int(settings.get("remote_retention_days") or 1))
+        client = self._remote_client()
+        result = client.put_lifecycle_configuration(days)
+        config.set_image_storage_lifecycle_applied(fingerprint)
+        logger.info(
+            "[image-storage] 已下发生命周期规则：保留 %s 天（桶=%s 前缀=%s，保留其它规则 %s 条）",
+            days,
+            _clean(settings.get("s3_bucket")),
+            _clean(settings.get("remote_root_path")),
+            result.get("kept"),
+        )
+        return {
+            "applied": True,
+            "days": days,
+            "fingerprint": fingerprint,
+            "kept_rules": result.get("kept"),
+            "note": "R2 通常在过期时间后 24 小时内完成删除",
+        }
+
+    def remove_remote_lifecycle(self) -> dict[str, object]:
+        """把「我们自己那条」生命周期规则从桶上摘掉（桶上其它规则保留）。"""
+        if self.provider() != "s3":
+            return {"removed": 0, "reason": "当前远端协议不支持生命周期规则"}
+        result = self._remote_client().remove_lifecycle_configuration()
+        config.set_image_storage_lifecycle_applied("")
+        return {"removed": result.get("removed", 0), "kept_rules": result.get("kept", 0)}
+
+    def get_remote_lifecycle(self) -> dict[str, object]:
+        """读桶上当前的规则（给设置页展示）。"""
+        settings = self.settings()
+        if self.provider() != "s3":
+            return {"supported": False, "rules": [], "reason": "当前远端协议不支持生命周期规则"}
+        if not _clean(settings.get("s3_bucket")):
+            return {"supported": True, "rules": [], "reason": "还没填 Bucket 名称"}
+        try:
+            current = self._remote_client().get_lifecycle_configuration()
+        except Exception as exc:  # noqa: BLE001
+            return {"supported": True, "rules": [], "error": str(exc)}
+        rules = current.get("Rules") or current.get("rules") or []
+        summary = []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            expiration = rule.get("Expiration") if isinstance(rule.get("Expiration"), dict) else {}
+            summary.append({
+                "id": str(rule.get("ID") or ""),
+                "status": str(rule.get("Status") or "Enabled"),
+                "prefix": self._rule_prefix_of(rule),
+                "days": expiration.get("Days"),
+            })
+        return {
+            "supported": True,
+            "rules": summary,
+            "ours": any(item["id"] == S3Client.LIFECYCLE_RULE_ID for item in summary),
+            "fingerprint": self._lifecycle_fingerprint(),
+            "applied_fingerprint": _clean(settings.get("remote_lifecycle_applied")),
+        }
+
+    @staticmethod
+    def _rule_prefix_of(rule: dict[str, object]) -> str:
+        raw = rule.get("Filter")
+        if isinstance(raw, dict):
+            return str(raw.get("Prefix") or "")
+        return str(rule.get("Prefix") or "")
 
     def test_remote(self) -> dict[str, object]:
         """连通性测试（按 provider 分发）。"""
@@ -703,7 +907,8 @@ class ImageStorageService:
             "remote_enabled": mode in {"remote", "both"},
             "remote_count": remote_count,
             "remote_cleanup_enabled": bool(settings.get("remote_cleanup_enabled")),
-            "remote_retention_hours": int(settings.get("remote_retention_hours") or 0),
+            "remote_cleanup_fallback": bool(settings.get("remote_cleanup_fallback")),
+            "remote_retention_days": int(settings.get("remote_retention_days") or 0),
             "public_base_url": _clean(settings.get("public_base_url")),
             "remote_root_path": _clean(settings.get("remote_root_path")),
         }

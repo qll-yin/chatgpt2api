@@ -23,7 +23,25 @@ export type ImageStorageSettings = {
   remote_root_path: string;
   public_base_url: string;
   remote_cleanup_enabled: boolean;
-  remote_retention_hours: number;
+  remote_cleanup_fallback: boolean;
+  remote_retention_days: number;
+};
+
+export type RemoteLifecycleRule = {
+  id: string;
+  status: string;
+  prefix: string;
+  days: number | null;
+};
+
+export type RemoteLifecycleStatus = {
+  supported: boolean;
+  rules: RemoteLifecycleRule[];
+  ours?: boolean;
+  fingerprint?: string;
+  applied_fingerprint?: string;
+  reason?: string;
+  error?: string;
 };
 
 export type Account = {
@@ -613,8 +631,21 @@ export async function syncImageStorage() {
 
 export async function cleanupRemoteImages() {
   return httpRequest<{
-    result: { enabled: boolean; scanned: number; deleted: number; reason?: string; error?: string; retention_hours?: number };
+    result: { enabled: boolean; scanned: number; deleted: number; reason?: string; error?: string; retention_days?: number };
   }>("/api/image-storage/cleanup-remote", {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function fetchRemoteLifecycle() {
+  return httpRequest<{ result: RemoteLifecycleStatus }>("/api/image-storage/lifecycle");
+}
+
+export async function applyRemoteLifecycle(force = true) {
+  return httpRequest<{
+    result: { applied: boolean; days?: number; removed?: number; kept_rules?: number; reason?: string; note?: string };
+  }>(`/api/image-storage/lifecycle?force=${force ? "true" : "false"}`, {
     method: "POST",
     body: {},
   });
@@ -716,7 +747,8 @@ export type ImageStorageStats = {
     remote_enabled: boolean;
     remote_count: number;
     remote_cleanup_enabled: boolean;
-    remote_retention_hours: number;
+    remote_cleanup_fallback: boolean;
+    remote_retention_days: number;
     public_base_url: string;
     remote_root_path: string;
   };

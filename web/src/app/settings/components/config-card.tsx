@@ -1,7 +1,7 @@
 "use client";
 
-import { Cloud, LoaderCircle, PlugZap, RefreshCw, Save, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { Cloud, LoaderCircle, PlugZap, RefreshCw, Save, ShieldCheck, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -56,10 +56,25 @@ export function ConfigCard() {
   const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
   const cleanupRemoteImages = useSettingsStore((state) => state.cleanupRemoteImages);
   const isCleaningRemoteImages = useSettingsStore((state) => state.isCleaningRemoteImages);
+  const applyRemoteLifecycle = useSettingsStore((state) => state.applyRemoteLifecycle);
+  const isApplyingRemoteLifecycle = useSettingsStore((state) => state.isApplyingRemoteLifecycle);
+  const loadRemoteLifecycle = useSettingsStore((state) => state.loadRemoteLifecycle);
+  const remoteLifecycle = useSettingsStore((state) => state.remoteLifecycle);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
   const loadConfig = useSettingsStore((state) => state.loadConfig);
 
   const availableImageModels = config?.image_models || fallbackImageModels;
+
+  // 远端是 S3 时读一次桶上的生命周期规则，展示当前状态
+  useEffect(() => {
+    if (config?.image_storage?.enabled && config?.image_storage?.provider === "s3") {
+      void loadRemoteLifecycle();
+    }
+  }, [
+    config?.image_storage?.enabled,
+    config?.image_storage?.provider,
+    loadRemoteLifecycle,
+  ]);
 
   const handleSaveImageModels = async () => {
     await saveConfig();
@@ -410,16 +425,6 @@ export function ConfigCard() {
                   {isSyncingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                   全量同步
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
-                  onClick={() => void cleanupRemoteImages()}
-                  disabled={isCleaningRemoteImages || !config?.image_storage?.remote_cleanup_enabled}
-                >
-                  {isCleaningRemoteImages ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
-                  清理过期
-                </Button>
               </div>
             </div>
             <p className="text-xs leading-6 text-stone-500">
@@ -630,19 +635,91 @@ export function ConfigCard() {
                   <Input
                     type="number"
                     min={1}
-                    max={8760}
-                    value={Number(config?.image_storage?.remote_retention_hours || 24)}
-                    onChange={(event) => setImageStorageField("remote_retention_hours", Number(event.target.value) || 24)}
+                    max={3650}
+                    value={Number(config?.image_storage?.remote_retention_days || 1)}
+                    onChange={(event) => setImageStorageField("remote_retention_days", Number(event.target.value) || 1)}
                     disabled={!config?.image_storage?.enabled || !config?.image_storage?.remote_cleanup_enabled}
-                    className="h-9 w-28 rounded-xl border-stone-200 bg-white"
+                    className="h-9 w-24 rounded-xl border-stone-200 bg-white"
                   />
-                  <span className="text-sm text-stone-600">小时后删除</span>
+                  <span className="text-sm text-stone-600">天后删除</span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-9 rounded-xl border-stone-200 bg-white px-3 text-stone-700"
+                    onClick={() => void applyRemoteLifecycle()}
+                    disabled={isApplyingRemoteLifecycle || !config?.image_storage?.enabled}
+                  >
+                    {isApplyingRemoteLifecycle ? <LoaderCircle className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
+                    立即应用规则
+                  </Button>
                 </div>
               </div>
               <p className="text-xs leading-6 text-stone-500">
-                按图片在远端的上传时间判断过期。后台每 30 分钟跑一次，也可以点上面的「清理过期」立刻执行。
-                更省事的做法是在 R2 控制台配一条 Lifecycle Rule（服务端执行，不占应用资源）。
+                保存后自动在桶上下发一条生命周期规则（保留天数 = 上面的天数），
+                由 R2 服务端删除过期图片 —— 不占应用资源、没有扫描延迟，服务停了也照清。
+                R2 通常在过期时间后 24 小时内完成删除。桶上你其它规则不受影响。
               </p>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <label className="flex items-center gap-3 text-sm text-stone-700">
+                  <Checkbox
+                    checked={Boolean(config?.image_storage?.remote_cleanup_fallback)}
+                    onCheckedChange={(checked) => setImageStorageField("remote_cleanup_fallback", Boolean(checked))}
+                    disabled={!config?.image_storage?.enabled}
+                  />
+                  额外用应用侧扫描兜底
+                </label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-9 rounded-xl border-stone-200 bg-white px-3 text-stone-700"
+                  onClick={() => void cleanupRemoteImages()}
+                  disabled={isCleaningRemoteImages || !config?.image_storage?.remote_cleanup_fallback}
+                >
+                  {isCleaningRemoteImages ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                  立即扫描清理
+                </Button>
+              </div>
+              <p className="text-xs leading-6 text-stone-500">
+                兜底扫描：每 30 分钟列一遍桶、按上传时间删过期对象。
+                桶大了很贵也很慢，一般不需要开 —— 服务端规则已经够了。
+              </p>
+              {remoteLifecycle ? (
+                <div className="rounded-md border border-stone-100 bg-white px-3 py-2 text-xs text-stone-600">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-stone-800">桶上当前规则</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="h-6 px-2 text-xs text-stone-500"
+                      onClick={() => void loadRemoteLifecycle()}
+                    >
+                      <RefreshCw className="size-3" />
+                      刷新
+                    </Button>
+                  </div>
+                  {remoteLifecycle.error ? (
+                    <p className="mt-1 text-red-600">读取失败：{remoteLifecycle.error}</p>
+                  ) : !remoteLifecycle.supported ? (
+                    <p className="mt-1 text-stone-500">{remoteLifecycle.reason || "当前远端协议不支持生命周期规则"}</p>
+                  ) : remoteLifecycle.rules.length === 0 ? (
+                    <p className="mt-1 text-stone-500">桶上还没有生命周期规则。</p>
+                  ) : (
+                    <ul className="mt-1 space-y-0.5">
+                      {remoteLifecycle.rules.map((rule) => (
+                        <li key={rule.id || rule.prefix} className="flex flex-wrap gap-2">
+                          <span className="text-stone-800">{rule.id || "(无 ID)"}</span>
+                          <span className="text-stone-500">
+                            前缀 {rule.prefix || "(全部)"} · {rule.days ? `${rule.days} 天后删除` : "无过期条件"}
+                          </span>
+                          {rule.id === "chatgpt2api-expire" ? (
+                            <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-700">本应用</span>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
             </div>
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">

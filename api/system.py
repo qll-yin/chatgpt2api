@@ -90,10 +90,19 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
+        payload = body.model_dump(mode="python")
         try:
-            return {"config": config.update(body.model_dump(mode="python"))}
+            result = {"config": config.update(payload)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        # 图片存储配置变了 → 立刻把生命周期规则对齐到桶上
+        # （指纹没变会跳过，不会白发请求）
+        if "image_storage" in payload:
+            try:
+                await run_in_threadpool(image_storage_service.apply_remote_lifecycle)
+            except Exception:
+                pass
+        return result
 
     @router.get("/api/image-models")
     async def get_image_models(authorization: str | None = Header(default=None)):
@@ -211,13 +220,44 @@ def create_router(app_version: str) -> APIRouter:
 
     @router.post("/api/image-storage/cleanup-remote")
     async def cleanup_remote_images_endpoint(authorization: str | None = Header(default=None)):
-        """手动触发一次远端过期清理。
+        """手动触发一次远端过期清理（应用侧兜底扫描）。
 
-        平时由后台定时器每 30 分钟跑一次；这里给用户一个「立刻清」的入口，
-        改完保留时长后不用等定时器。
+        平时由后台定时器每 30 分钟跑一次；这里给用户一个「立刻清」的入口。
+        主路径是生命周期规则（服务端执行），这个只是兜底。
         """
         require_admin(authorization)
         return {"result": await run_in_threadpool(image_storage_service.cleanup_remote)}
+
+    @router.get("/api/image-storage/lifecycle")
+    async def get_image_storage_lifecycle(authorization: str | None = Header(default=None)):
+        """读远端桶上当前的生命周期规则（设置页展示用）。"""
+        require_admin(authorization)
+        return {"result": await run_in_threadpool(image_storage_service.get_remote_lifecycle)}
+
+    @router.post("/api/image-storage/lifecycle")
+    async def apply_image_storage_lifecycle(
+        force: bool = False,
+        authorization: str | None = Header(default=None),
+    ):
+        """把生命周期规则下发到远端桶（R2 服务端按天删除过期对象）。
+
+        指纹没变会自动跳过；``?force=true`` 强制重下
+        （比如在控制台手改过规则，或想确认规则确实生效）。
+        """
+        require_admin(authorization)
+        try:
+            return {"result": await run_in_threadpool(image_storage_service.apply_remote_lifecycle, force)}
+        except ImageStorageError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.delete("/api/image-storage/lifecycle")
+    async def remove_image_storage_lifecycle(authorization: str | None = Header(default=None)):
+        """摘掉我们那条生命周期规则（桶上其它规则保留）。"""
+        require_admin(authorization)
+        try:
+            return {"result": await run_in_threadpool(image_storage_service.remove_remote_lifecycle)}
+        except ImageStorageError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/backups")
     async def get_backups(authorization: str | None = Header(default=None)):

@@ -15,7 +15,9 @@ import {
   syncImageStorage,
   startCPAImport,
   testBackupConnection,
+  applyRemoteLifecycle as applyRemoteLifecycleApi,
   cleanupRemoteImages,
+  fetchRemoteLifecycle,
   testImageStorageConnection,
   updateCPAPool,
   updateSettingsConfig,
@@ -27,6 +29,7 @@ import {
   type ImageStorageMode,
   type ImageStorageProvider,
   type ImageStorageSettings,
+  type RemoteLifecycleStatus,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
@@ -174,7 +177,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       remote_root_path: "chatgpt2api/images",
       public_base_url: "",
       remote_cleanup_enabled: false,
-      remote_retention_hours: 24,
+      remote_cleanup_fallback: false,
+      remote_retention_days: 1,
     };
   // mode 已经被后端归一化过（local|remote|both），这里只做兜底。
   // 老配置（mode="webdav"）后端已经映射成 remote+provider，这里不再重复处理。
@@ -256,7 +260,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       remote_root_path: String(imageStorage.remote_root_path || "chatgpt2api/images"),
       public_base_url: String(imageStorage.public_base_url || ""),
       remote_cleanup_enabled: Boolean(imageStorage.remote_cleanup_enabled),
-      remote_retention_hours: Math.max(1, Number(imageStorage.remote_retention_hours) || 24),
+      remote_cleanup_fallback: Boolean(imageStorage.remote_cleanup_fallback),
+      remote_retention_days: Math.max(1, Number(imageStorage.remote_retention_days) || 1),
     },
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
@@ -316,6 +321,8 @@ type SettingsStore = {
   isTestingImageStorage: boolean;
   isSyncingImageStorage: boolean;
   isCleaningRemoteImages: boolean;
+  isApplyingRemoteLifecycle: boolean;
+  remoteLifecycle: RemoteLifecycleStatus | null;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -373,6 +380,8 @@ type SettingsStore = {
   testImageStorage: () => Promise<void>;
   syncImagesToWebDAV: () => Promise<void>;
   cleanupRemoteImages: () => Promise<void>;
+  applyRemoteLifecycle: () => Promise<void>;
+  loadRemoteLifecycle: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
@@ -410,6 +419,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isTestingImageStorage: false,
   isSyncingImageStorage: false,
   isCleaningRemoteImages: false,
+  isApplyingRemoteLifecycle: false,
+  remoteLifecycle: null,
 
   pools: [],
   isLoadingPools: true,
@@ -514,7 +525,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           remote_root_path: String(config.image_storage?.remote_root_path || "chatgpt2api/images").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
           remote_cleanup_enabled: Boolean(config.image_storage?.remote_cleanup_enabled),
-          remote_retention_hours: Math.max(1, Number(config.image_storage?.remote_retention_hours) || 24),
+          remote_cleanup_fallback: Boolean(config.image_storage?.remote_cleanup_fallback),
+          remote_retention_days: Math.max(1, Number(config.image_storage?.remote_retention_days) || 1),
         },
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),
@@ -826,6 +838,41 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.error(error instanceof Error ? error.message : "远端清理失败");
     } finally {
       set({ isCleaningRemoteImages: false });
+    }
+  },
+
+  applyRemoteLifecycle: async () => {
+    set({ isApplyingRemoteLifecycle: true });
+    try {
+      const saved = await get().saveConfig();
+      if (!saved) {
+        return;
+      }
+      const data = await applyRemoteLifecycleApi(true);
+      const result = data.result;
+      if (result.applied) {
+        toast.success(
+          result.days
+            ? `生命周期规则已下发：超过 ${result.days} 天的图片自动删除`
+            : "生命周期规则已从桶上移除",
+        );
+      } else {
+        toast.info(result.reason || "无需变更");
+      }
+      await get().loadRemoteLifecycle();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "下发生命周期规则失败");
+    } finally {
+      set({ isApplyingRemoteLifecycle: false });
+    }
+  },
+
+  loadRemoteLifecycle: async () => {
+    try {
+      const data = await fetchRemoteLifecycle();
+      set({ remoteLifecycle: data.result });
+    } catch {
+      set({ remoteLifecycle: null });
     }
   },
 

@@ -1,7 +1,7 @@
-"""远端过期清理策略。
+"""远端过期清理：应用侧兜底扫描（Lifecycle Rule 才是主路径）。
 
-用户诉求：远端对象不能只增不减（桶的计费一直在涨），要能按
-「上传时间隔 N 小时后自动删除」来清，且开关默认关闭。
+兜底扫描每 30 分钟列一遍全桶、按对象上传时间删过期对象 ——
+桶大了很贵也很慢，所以默认关闭（``remote_cleanup_fallback``）。
 """
 from __future__ import annotations
 
@@ -68,8 +68,10 @@ class RemoteCleanupTests(unittest.TestCase):
             "s3_secret_access_key": "SK",
             "remote_root_path": "chatgpt2api/images",
             "public_base_url": "",
-            "remote_cleanup_enabled": False,
-            "remote_retention_hours": 24,
+            "remote_cleanup_enabled": True,
+            "remote_cleanup_fallback": False,
+            "remote_retention_days": 1,
+            "remote_lifecycle_applied": "",
         }
         patcher = mock.patch("services.image_storage_service.config")
         self.mock_config = patcher.start()
@@ -88,8 +90,8 @@ class RemoteCleanupTests(unittest.TestCase):
     def _patch_client(self):
         return mock.patch("services.image_storage_service.S3Client", FakeS3Client)
 
-    def test_cleanup_disabled_by_default(self):
-        """开关默认关闭 —— 不能擅自删用户桶里的东西。"""
+    def test_fallback_disabled_by_default(self):
+        """兜底扫描默认关闭 —— 不能擅自扫用户的桶。"""
         FakeS3Client.objects = [{"key": "chatgpt2api/images/old.png", "last_modified": 0, "size": 1}]
         with self._patch_client():
             result = self.service().cleanup_remote()
@@ -98,9 +100,9 @@ class RemoteCleanupTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 0)
         self.assertEqual(FakeS3Client.deleted_keys, [])
 
-    def test_cleanup_deletes_only_expired_objects(self):
-        self.settings["remote_cleanup_enabled"] = True
-        self.settings["remote_retention_hours"] = 24
+    def test_fallback_deletes_only_expired_objects(self):
+        self.settings["remote_cleanup_fallback"] = True
+        self.settings["remote_retention_days"] = 1
         now = time.time()
         FakeS3Client.objects = [
             {"key": "chatgpt2api/images/old.png", "last_modified": now - 48 * 3600, "size": 1},
@@ -114,41 +116,40 @@ class RemoteCleanupTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 1)
         self.assertEqual(FakeS3Client.deleted_keys, ["chatgpt2api/images/old.png"])
 
-    def test_cleanup_uses_upload_time_threshold(self):
-        """保留 1 小时 → 上传超过 1 小时的对象被删。"""
-        self.settings["remote_cleanup_enabled"] = True
-        self.settings["remote_retention_hours"] = 1
+    def test_fallback_uses_retention_days(self):
+        self.settings["remote_cleanup_fallback"] = True
+        self.settings["remote_retention_days"] = 7
         now = time.time()
         FakeS3Client.objects = [
-            {"key": "chatgpt2api/images/a.png", "last_modified": now - 7200, "size": 1},
-            {"key": "chatgpt2api/images/b.png", "last_modified": now - 1800, "size": 1},
+            {"key": "chatgpt2api/images/a.png", "last_modified": now - 3 * 86400, "size": 1},
+            {"key": "chatgpt2api/images/b.png", "last_modified": now - 10 * 86400, "size": 1},
         ]
         with self._patch_client():
             result = self.service().cleanup_remote()
 
         self.assertEqual(result["deleted"], 1)
-        self.assertEqual(result["retention_hours"], 1)
-        self.assertEqual(FakeS3Client.deleted_keys, ["chatgpt2api/images/a.png"])
+        self.assertEqual(result["retention_days"], 7)
+        self.assertEqual(FakeS3Client.deleted_keys, ["chatgpt2api/images/b.png"])
 
-    def test_cleanup_skipped_when_remote_disabled(self):
-        self.settings["remote_cleanup_enabled"] = True
+    def test_fallback_skipped_when_remote_disabled(self):
+        self.settings["remote_cleanup_fallback"] = True
         self.settings["mode"] = "local"
         with self._patch_client():
             result = self.service().cleanup_remote()
         self.assertEqual(result["deleted"], 0)
         self.assertIn("未启用", result["reason"])
 
-    def test_cleanup_unsupported_for_webdav(self):
-        """WebDAV 没有列举接口 —— 明确说不支持，别静默当成「删了 0 个」。"""
-        self.settings["remote_cleanup_enabled"] = True
+    def test_fallback_unsupported_for_webdav(self):
+        """WebDAV 没有列举接口 —— 明确说不支持。"""
+        self.settings["remote_cleanup_fallback"] = True
         self.settings["provider"] = "webdav"
         result = self.service().cleanup_remote()
         self.assertEqual(result["deleted"], 0)
         self.assertIn("不支持", result["reason"])
 
-    def test_cleanup_survives_remote_error(self):
+    def test_fallback_survives_remote_error(self):
         """远端不可达时不能抛异常 —— 定时器那一轮要能继续跑。"""
-        self.settings["remote_cleanup_enabled"] = True
+        self.settings["remote_cleanup_fallback"] = True
         FakeS3Client.list_error = RuntimeError("connection reset")
         with self._patch_client():
             result = self.service().cleanup_remote()

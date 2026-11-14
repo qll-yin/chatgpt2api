@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -52,8 +53,11 @@ DEFAULT_IMAGE_STORAGE = {
     "remote_root_path": "chatgpt2api/images",  # 远端目录（对象 key 前缀），两个协议共用
     "public_base_url": "",                     # 公开访问前缀，留空则走本应用 /images 代理
     # ── 远端过期清理 ──
-    "remote_cleanup_enabled": False,           # 默认关闭；开启后按保留时长清理远端对象
-    "remote_retention_hours": 24,              # 远端对象保留时长（小时）
+    "remote_cleanup_enabled": False,           # 总开关：开启后自动在桶上配生命周期规则
+    "remote_retention_days": 1,               # 远端对象保留天数（Lifecycle Rule 只能按天）
+    "remote_cleanup_fallback": False,         # 额外用应用侧定时扫描兜底（默认不需要）
+    # 内部字段：上次已应用的规则指纹，用来判断是否需要重新下发
+    "remote_lifecycle_applied": "",
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -240,8 +244,8 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
 
 _IMAGE_STORAGE_MODES = {"local", "remote", "both"}
 _IMAGE_STORAGE_PROVIDERS = {"webdav", "s3"}
-# 远端对象保留时长上限（1 年）—— 防止手滑填个 999999 把桶当成永久存储。
-_IMAGE_STORAGE_MAX_RETENTION_HOURS = 8760
+# 远端对象保留天数上限（10 年）—— 防止手滑填个 999999 把桶当成永久存储。
+_IMAGE_STORAGE_MAX_RETENTION_DAYS = 3650
 
 
 def _looks_like_legacy_webdav(source: dict, prior: dict) -> bool:
@@ -321,6 +325,28 @@ def _normalize_image_storage_settings(
             raw = default
         return max(low, min(high, raw))
 
+    # 保留时长统一按「天」。
+    # 兼容老配置（当时是小时）：按 24 小时/天向上取整，至少 1 天 —— 不丢用户设置。
+    retention_days = source.get("remote_retention_days")
+    if retention_days in (None, ""):
+        retention_days = prior.get("remote_retention_days")
+    if retention_days in (None, ""):
+        legacy_hours = source.get("remote_retention_hours") or prior.get("remote_retention_hours")
+        try:
+            legacy_days = int(legacy_hours) / 24 if legacy_hours not in (None, "") else 0
+        except (TypeError, ValueError):
+            legacy_days = 0
+        retention_days = (
+            int(DEFAULT_IMAGE_STORAGE["remote_retention_days"])
+            if legacy_days <= 0
+            else math.ceil(legacy_days)
+        )
+    try:
+        retention_days = int(retention_days)
+    except (TypeError, ValueError):
+        retention_days = int(DEFAULT_IMAGE_STORAGE["remote_retention_days"])
+    retention_days = max(1, min(_IMAGE_STORAGE_MAX_RETENTION_DAYS, retention_days))
+
     # 远端目录：老配置存在 webdav_root_path，新字段是 remote_root_path（两协议共用）。
     # ⚠️ incoming 的两个字段都要排在 prior 前面 —— 否则配置一旦被归一化保存过，
     #    prior.remote_root_path 会把老配置里的 webdav_root_path 顶掉。
@@ -348,9 +374,9 @@ def _normalize_image_storage_settings(
         "remote_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["remote_root_path"]),
         "public_base_url": str(source.get("public_base_url") or prior.get("public_base_url") or "").strip().rstrip("/"),
         "remote_cleanup_enabled": _normalize_bool(source.get("remote_cleanup_enabled"), False),
-        "remote_retention_hours": _int(
-            "remote_retention_hours", 1, _IMAGE_STORAGE_MAX_RETENTION_HOURS, int(DEFAULT_IMAGE_STORAGE["remote_retention_hours"])
-        ),
+        "remote_cleanup_fallback": _normalize_bool(source.get("remote_cleanup_fallback"), False),
+        "remote_retention_days": retention_days,
+        "remote_lifecycle_applied": str(source.get("remote_lifecycle_applied") or prior.get("remote_lifecycle_applied") or "").strip(),
     }
 
 
@@ -978,6 +1004,23 @@ class ConfigStore:
 
     def get_image_storage_settings(self) -> dict[str, object]:
         return _normalize_image_storage_settings(self.data.get("image_storage"))
+
+    def set_image_storage_lifecycle_applied(self, fingerprint: str) -> None:
+        """记录「已下发到桶上的生命周期规则指纹」。
+
+        这是内部状态，用来判断需不需要重新下发规则 ——
+        指纹变了（换桶 / 改保留天数 / 改远端目录）才重写，
+        避免每次都发一次 put_bucket_lifecycle_configuration。
+
+        走 _save() 而不是 update()：这是应用内部写回的状态，
+        不该触发一遍配置校验（会要求填 S3 凭据）。
+        """
+        storage = _normalize_image_storage_settings(self.data.get("image_storage"))
+        storage["remote_lifecycle_applied"] = str(fingerprint or "").strip()
+        next_data = dict(self.data)
+        next_data["image_storage"] = storage
+        self.data = next_data
+        self._save()
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
