@@ -26,6 +26,29 @@ from services.register.mail_providers import MailProviderError, get_provider_cla
 logger = logging.getLogger("auto_loop")
 
 
+# ── worker 级重试：哪些失败值得「换个姿势再来一次」──────────────────
+#
+# ⚠️ 这跟 auth_flow 内部的 signup 重试是**两个层次**，别混：
+#
+#   · auth_flow 内部：signup 链撞 409 invalid_state 时重建会话 + 刷 device_id
+#     再试（max_attempts=3），**复用同一个邮箱**，不额外花钱。
+#     它解决的是「session 过期」这种可自愈的问题。
+#
+#   · worker 级（本表）：整个流程跑完了还是失败 —— 换代理 / 换号再跑一遍。
+#     它解决的是「出口 IP 不通」「环境抽风」这类**换条件才有救**的问题。
+#
+# 一整个流程（含 auth_flow 内部的重建会话重试）只算**一次**尝试，
+# 这才是旧注册机的语义：「按整个流程重试次数算」。
+RETRYABLE_CATEGORIES = frozenset({"cf_blocked", "network", "unknown"})
+
+# 不可重试的分类及原因（写清楚是为了以后有人问「为什么不重试」）：
+#   account     —— 号/邮箱本身废了（user_already_exists / 邮箱已注册 /
+#                  已有账号 / refresh_token 失效）。重试同一个号毫无意义，
+#                  换号继续才是对的。
+#   mail_limited—— 邮箱侧固有限制（短效邮箱已消耗）。重试只会再撞一次。
+NON_RETRYABLE_CATEGORIES = frozenset({"account", "mail_limited"})
+
+
 class AutoLoopState:
     STOPPED = "stopped"
     RUNNING = "running"
@@ -97,6 +120,9 @@ class AutoLoopController:
         self._concurrency: int = 1
         # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
         self._target_count: int = 0
+        # worker 级重试：整个流程失败后，同一个 worker 再跑几遍。
+        # 0 = 不重试（失败一次就换号继续）；默认 3（首次 + 3 次重试）。
+        self._max_retries: int = 3
 
     # ──────────────────────── 公共 API ────────────────────────
 
@@ -151,6 +177,14 @@ class AutoLoopController:
                 self._proxy_pool = []
             # 目标成功数（0=不限量）
             self._target_count = max(0, int(self._options.get("target_count") or 0))
+            # worker 级重试次数（不含首次尝试）。0 = 不重试。
+            # ⚠️ 不能用 `or 3` —— 那会把「0 = 不重试」当成「没传」给覆盖掉。
+            _raw_retries = self._options.get("max_retries")
+            self._max_retries = (
+                3
+                if _raw_retries is None or _raw_retries == ""
+                else max(0, min(20, int(_raw_retries)))
+            )
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -451,6 +485,11 @@ class AutoLoopController:
     def _worker_loop_inner(self, worker_id: int, my_batch: str = ""):
         idle_round = 0
         no_proxy_round = 0
+        # ── worker 级重试计数 ──
+        # 连续「可重试」的失败次数。成功一次就清零。
+        # ⚠️ 这是 **per-worker** 的局部计数，不是全局 —— 一个 worker 挂了
+        #    不该把别的 worker 也拖下水。
+        consecutive_retryable_fails = 0
         logger.info(f"[worker-{worker_id}] 启动")
         with self._lock:
             self._alive_workers.add((my_batch, worker_id))
@@ -650,6 +689,48 @@ class AutoLoopController:
             #    形同虚设 —— 号注册出来了，但号池里一个都没有。
             if ok:
                 self._import_to_pool(account, proxy, run_id)
+                consecutive_retryable_fails = 0
+
+            # ── worker 级重试判定 ──
+            #
+            # 一个完整流程（含 auth_flow 内部的重建会话重试）算**一次**尝试。
+            # 失败后：
+            #   · 可重试分类（cf_blocked / network / unknown）→ 换个代理再跑一遍
+            #   · 不可重试分类（account / mail_limited）→ 重试也没意义，换号继续
+            #
+            # 连续可重试失败超过 max_retries → 这个 worker 停下来。
+            # 为什么是「停 worker」而不是「无限换号」：出口 IP 不通时换多少个号
+            # 都是同一个死路，一直空转只会白烧付费邮箱。
+            if not ok:
+                retryable = category in RETRYABLE_CATEGORIES
+                if not retryable:
+                    # 换号继续 —— 这次失败不算「连续失败」，重试计数清零。
+                    consecutive_retryable_fails = 0
+                    if category in NON_RETRYABLE_CATEGORIES:
+                        logger.info(
+                            f"[worker-{worker_id}] 失败分类 {category} 不可重试"
+                            f"（号/邮箱本身的问题）→ 换下一个号继续"
+                        )
+                else:
+                    consecutive_retryable_fails += 1
+                    if consecutive_retryable_fails > self._max_retries:
+                        msg = (
+                            f"worker-{worker_id} 连续 {self._max_retries} 次重试仍失败"
+                            f"（最后原因：{category or '未知'}），已停止该 worker"
+                        )
+                        logger.warning(msg)
+                        self._set_message(msg)
+                        # ⚠️ 必须在 return 前结算 —— 这次失败也要算进批次统计，
+                        #    否则「成功 X / 失败 Y」里的 Y 会少算这一次。
+                        self._record_finish(False, category)
+                        with self._lock:
+                            self._worker_status.pop(worker_id, None)
+                        self._broadcast("state", self._snapshot())
+                        return
+                    logger.info(
+                        f"[worker-{worker_id}] 第 {consecutive_retryable_fails}/{self._max_retries} "
+                        f"次重试（原因：{category or '未知'}）→ 换条件再试一遍"
+                    )
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)

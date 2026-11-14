@@ -37,6 +37,7 @@ const DEFAULTS: AutoRegisterSettings = {
   mail_source: "",
   register_options: {},
   cooldown_minute: 30,
+  max_retries: 3,
 };
 
 export function AutoRegisterPanel() {
@@ -222,6 +223,17 @@ export function AutoRegisterPanel() {
                 min={0}
                 value={settings.cooldown_minute}
                 onChange={(e) => update("cooldown_minute", Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-retries">失败重试次数</Label>
+              <Input
+                id="auto-retries"
+                type="number"
+                min={0}
+                max={20}
+                value={settings.max_retries}
+                onChange={(e) => update("max_retries", Number(e.target.value))}
               />
             </div>
           </div>

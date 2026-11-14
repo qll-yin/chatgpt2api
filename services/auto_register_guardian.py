@@ -63,6 +63,10 @@ DEFAULT_SETTINGS = {
     "register_options": {},
     # 触发后多久内不再重复触发（分钟），防止注册还没跑完就又触发
     "cooldown_minute": 30,
+    # worker 级重试次数（不含首次尝试）。
+    # 守护触发的注册走的是同一套批量控制器 —— 出口 IP 不通时同样要重试，
+    # 否则一次 CF 拦截就白烧一批付费邮箱然后收工。
+    "max_retries": 3,
 }
 
 # 守护进程状态（供 API 查询）
@@ -100,6 +104,7 @@ def get_settings() -> dict[str, Any]:
     settings["target_batch"] = max(1, int(settings.get("target_batch") or 1))
     settings["check_interval_minute"] = max(1, int(settings.get("check_interval_minute") or 1))
     settings["cooldown_minute"] = max(0, int(settings.get("cooldown_minute") or 0))
+    settings["max_retries"] = max(0, min(20, int(settings.get("max_retries") or 0)))
     settings["concurrency"] = max(1, min(20, int(settings.get("concurrency") or 1)))
     settings["mail_source"] = str(settings.get("mail_source") or "").strip()
     settings["enabled"] = bool(settings.get("enabled"))
@@ -150,6 +155,14 @@ def trigger_registration(settings: dict[str, Any] | None = None) -> dict[str, An
     options = dict(settings.get("register_options") or {})
     options["target_count"] = int(settings.get("target_batch") or 1)
     options["concurrency"] = int(settings.get("concurrency") or 1)
+    # worker 级重试 —— 守护触发的注册同样会遇到出口 IP 不通。
+    # ⚠️ 用 setdefault：用户在 register_options 里显式写了就以那个为准。
+    #    缺字段时回退 3（与批量注册的默认值一致）—— trigger_registration
+    #    也可能被直接调用（不经过 get_settings），那时拿不到 DEFAULT_SETTINGS。
+    _raw_retries = settings.get("max_retries")
+    options.setdefault(
+        "max_retries", 3 if _raw_retries is None else int(_raw_retries or 0)
+    )
     # 邮箱来源：优先用守护自己配的，留空则用「邮箱配置」里选的那个
     mail_source = str(settings.get("mail_source") or "").strip()
     if mail_source:

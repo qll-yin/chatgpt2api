@@ -153,9 +153,19 @@ export type BatchStartOptions = {
   otp_timeout: number;
   auto_import: boolean;
   with_proxy: boolean;
+  /**
+   * worker 级重试次数（不含首次尝试）。
+   * 一个完整注册流程算 1 次；失败后同一个 worker 再跑 N 遍，
+   * 都不行才停掉这个 worker。0 = 不重试（失败一次就换号继续）。
+   */
+  max_retries: number;
 };
 
-export type RegisterOnceOptions = Omit<BatchStartOptions, "concurrency" | "target_count" | "cool_down_seconds">;
+// 单次注册没有「重试次数」这个概念 —— 重试是 worker 级的。
+export type RegisterOnceOptions = Omit<
+  BatchStartOptions,
+  "concurrency" | "target_count" | "cool_down_seconds" | "max_retries"
+>;
 
 export type ImportToPoolResult = {
   total: number;
@@ -249,6 +259,8 @@ export type AutoRegisterSettings = {
   mail_source: string;
   register_options: Record<string, unknown>;
   cooldown_minute: number;
+  /** worker 级重试次数（不含首次尝试）—— 出口 IP 不通时同一 worker 再跑几遍 */
+  max_retries: number;
 };
 
 export type AutoRegisterState = {

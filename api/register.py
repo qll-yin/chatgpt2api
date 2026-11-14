@@ -176,6 +176,9 @@ class BatchStartRequest(BaseModel):
     otp_timeout: int = 180
     auto_import: bool = True          # 注册成功自动导入号池
     with_proxy: bool = True           # 入池时是否带代理
+    # worker 级重试：整个流程失败后，同一个 worker 再跑几遍（0-20，默认 3）。
+    # ⚠️ 这是**按整个流程**算的 —— 流程内部撞 409 重建会话那种重试不额外计数。
+    max_retries: int = 3
 
 
 class RegisterOnceRequest(BaseModel):

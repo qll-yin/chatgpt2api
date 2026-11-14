@@ -25,6 +25,7 @@ class AutoRegisterSettingsRequest(BaseModel):
     mail_source: str | None = None
     register_options: dict | None = None
     cooldown_minute: int | None = None
+    max_retries: int | None = None
 
 
 def create_router() -> APIRouter:

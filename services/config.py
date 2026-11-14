@@ -81,6 +81,10 @@ DEFAULT_AUTO_REGISTER = {
     "mail_source": "",          # 触发的批量注册用哪个邮箱来源（留空 = 用「邮箱配置」里选的）
     "register_options": {},     # 传给批量控制器的额外参数
     "cooldown_minute": 30,       # 触发后的冷却期（分钟）
+    # worker 级重试次数（不含首次尝试）。守护触发的注册走的是同一套
+    # 批量控制器，出口 IP 不通时同样需要重试 —— 否则一次 CF 拦截就
+    # 白烧一批付费邮箱然后收工。
+    "max_retries": 3,
 }
 
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
@@ -418,6 +422,7 @@ def _normalize_auto_register_settings(value: object) -> dict[str, object]:
         "mail_source": str(source.get("mail_source") or "").strip(),
         "register_options": options if isinstance(options, dict) else {},
         "cooldown_minute": _int("cooldown_minute", 0, 10080),
+        "max_retries": _int("max_retries", 0, 20),
     }
 
 

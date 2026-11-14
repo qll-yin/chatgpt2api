@@ -61,6 +61,7 @@ export function BatchRegisterPanel() {
   const [concurrency, setConcurrency] = useState(1);
   const [targetCount, setTargetCount] = useState(0);
   const [coolDown, setCoolDown] = useState(3);
+  const [maxRetries, setMaxRetries] = useState(3);
   const [otpTimeout, setOtpTimeout] = useState(180);
   const [wantRefreshToken, setWantRefreshToken] = useState(false);
   const [want2fa, setWant2fa] = useState(false);
@@ -233,6 +234,8 @@ export function BatchRegisterPanel() {
         otp_timeout: Number(otpTimeout) || 180,
         auto_import: autoImport,
         with_proxy: withProxy,
+        // ⚠️ 不能用 `|| 3` —— 那会把「0 = 不重试」覆盖掉。
+        max_retries: Math.max(0, Math.min(20, Number(maxRetries) || 0)),
       });
       setLogs([]);
       toast.success("批量注册已启动");
@@ -357,6 +360,30 @@ export function BatchRegisterPanel() {
                 />
               </div>
             </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="reg-retries">失败重试次数</Label>
+                <Input
+                  id="reg-retries"
+                  type="number"
+                  min={0}
+                  max={20}
+                  value={maxRetries}
+                  onChange={(e) => setMaxRetries(Number(e.target.value))}
+                />
+              </div>
+              <div className="space-y-1.5" />
+            </div>
+            <p className="text-xs leading-5 text-muted-foreground">
+              一个完整注册流程算 1 次（流程内部撞 409 重建会话那种重试不额外计数）。
+              流程失败后同一个 worker 会换个条件再跑
+              <span className="font-medium text-foreground">{maxRetries || 0}</span>{" "}
+              遍，都不行才停掉这个 worker。填 0 表示不重试，失败一次就换号继续。
+              <br />
+              只对「出口 IP 被拦 / 网络抽风」这类失败重试；邮箱或账号本身的问题
+              （如邮箱已注册）不消耗重试次数，直接换号。
+            </p>
 
             <div className="space-y-2.5 border-t pt-4">
               <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">

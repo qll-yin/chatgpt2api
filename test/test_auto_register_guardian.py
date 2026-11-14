@@ -107,6 +107,25 @@ class AutoRegisterGuardianTests(unittest.TestCase):
         guardian._check_once()
         self.assertTrue(self.controller.start_calls[0]["auto_import"])
 
+    def test_max_retries_is_forwarded(self):
+        """守护触发的注册走同一套批量控制器 —— 出口 IP 不通时同样要重试。
+
+        否则一次 CF 拦截就白烧一批付费邮箱然后收工。
+        """
+        guardian._check_once()
+        self.assertEqual(self.controller.start_calls[0]["max_retries"], 3)
+
+    def test_max_retries_can_be_configured(self):
+        self.settings["max_retries"] = 7
+        guardian._check_once()
+        self.assertEqual(self.controller.start_calls[0]["max_retries"], 7)
+
+    def test_register_options_can_override_max_retries(self):
+        """用户在 register_options 里显式写了就以那个为准。"""
+        self.settings["register_options"] = {"max_retries": 1}
+        guardian._check_once()
+        self.assertEqual(self.controller.start_calls[0]["max_retries"], 1)
+
     def test_register_options_are_forwarded(self):
         self.settings["register_options"] = {"want_refresh_token": True, "mail_source": "remail"}
         guardian._check_once()
@@ -192,6 +211,7 @@ class AutoRegisterConfigTests(unittest.TestCase):
         self.assertEqual(result["target_batch"], 20)
         self.assertEqual(result["check_interval_minute"], 30)
         self.assertEqual(result["concurrency"], 3)
+        self.assertEqual(result["max_retries"], 3)
 
     def test_numeric_clamping(self):
         from services.config import _normalize_auto_register_settings
