@@ -11,6 +11,7 @@ from services.protocol.conversation import (
     ImageGenerationError,
     collect_image_outputs,
     count_text_tokens,
+    effective_image_quality,
     encode_images,
     stream_image_chunks,
     stream_image_outputs_with_pool,
@@ -89,6 +90,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
-        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
+        output_tokens=count_image_output_items_tokens(
+            result.get("data"), size, effective_image_quality(quality, model)
+        ),
     )
     return result

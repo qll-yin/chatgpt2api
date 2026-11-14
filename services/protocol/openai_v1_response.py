@@ -14,6 +14,7 @@ from services.protocol.conversation import (
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
+    effective_image_quality,
     encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
@@ -392,7 +393,9 @@ def stream_image_response(
             usage = image_usage(
                 input_text_tokens=count_text_tokens(prompt, model),
                 input_image_tokens=input_image_tokens,
-                output_tokens=count_image_output_items_tokens(output.data, size, quality),
+                output_tokens=count_image_output_items_tokens(
+                    output.data, size, effective_image_quality(quality, model)
+                ),
             )
             for output_index, item in enumerate(items):
                 yield {"type": "response.output_item.done", "output_index": output_index, "item": item}

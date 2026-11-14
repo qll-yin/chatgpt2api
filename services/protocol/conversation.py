@@ -367,6 +367,46 @@ def _image_size_prompt(size: str | None) -> str:
     return f"输出图片尺寸为 {size}。"
 
 
+def normalize_web_image_quality(quality: object) -> str:
+    """网页生图链路的 quality 归一化：low 一律提升到 medium。
+
+    背景
+    ----
+    网页链路（/backend-api/conversation + picture_v2）没有 quality 结构化
+    请求字段，quality 只能靠提示词传达。而上游对「低质量」这个语义的理解
+    是字面的 —— 实测 quality=low 会真的产出低清图：
+
+        1254×1254 @ low    → 425 output tokens，字节/像素 0.96  （糊）
+        1254×1254 @ medium → 1650 output tokens，字节/像素 1.40 （清晰）
+
+    尺寸一样、细节密度差 25%，确认是「按 low 档渲染」而非下载过早。
+
+    所以这里把 low 直接提升到 medium：拿到清晰图，且计费口径与实际渲染
+    档位一致（否则会按 low 收 425 token、实际出 medium 的活）。
+
+    ⚠️ 只作用于网页链路。codex 链路（codex-gpt-image-2）的 quality 是
+    **真参数**，会原样传给上游 —— 那里 low 真实生效且上游按 low 计价
+    （官方定价 low $0.006/张 vs medium $0.053/张），提升反而是白花钱。
+    codex 路径不经过本函数（见 stream_codex_image_outputs）。
+    """
+    normalized = str(quality or "auto").strip().lower()
+    return "medium" if normalized == "low" else normalized
+
+
+def effective_image_quality(quality: object, model: object = None) -> str:
+    """按模型区分的 quality 归一化 —— 计费口径必须跟实际渲染档位一致。
+
+    网页链路：low → medium（见 normalize_web_image_quality）。
+    codex 链路：quality 是真参数，原样保留。
+
+    计费必须用这个函数的返回值，而不是用户传的原始值 —— 否则会出现
+    「按 medium 渲染、按 low 收 token」的错配。
+    """
+    if model is not None and is_codex_image_model(model):
+        return str(quality or "auto").strip().lower()
+    return normalize_web_image_quality(quality)
+
+
 def build_image_prompt(
     prompt: str,
     size: str | None,
@@ -385,7 +425,7 @@ def build_image_prompt(
     if size_hint:
         hints.append(size_hint)
     # 质量提示放在最后 —— 它是这段里最重要的一句，紧邻生成指令更容易被遵守。
-    quality_key = str(quality or "auto").strip().lower()
+    quality_key = normalize_web_image_quality(quality)
     quality_hint = _IMAGE_QUALITY_PROMPTS.get(quality_key)
     if quality_hint is None:
         # 未知档位（如上游新增的枚举）：不猜，按 auto 处理并保留原词。

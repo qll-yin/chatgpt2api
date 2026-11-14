@@ -11,6 +11,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol.conversation import effective_image_quality
 from services.storage import runtime_store as store
 from utils.helper import normalize_image_output
 
@@ -214,7 +215,10 @@ class ImageTaskService:
                 "mode": mode,
                 "model": _clean(payload.get("model"), config.default_image_model),
                 "size": _clean(payload.get("size")),
-                "quality": _clean(payload.get("quality"), "auto"),
+                "quality": effective_image_quality(
+                    _clean(payload.get("quality"), "auto"),
+                    _clean(payload.get("model"), config.default_image_model),
+                ),
                 "output_format": _clean(payload.get("output_format"), "png"),
                 "frame_count": payload.get("frame_count"),
                 "frame_duration_ms": payload.get("frame_duration_ms"),

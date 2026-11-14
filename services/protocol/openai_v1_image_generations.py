@@ -7,6 +7,7 @@ from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
     count_text_tokens,
+    effective_image_quality,
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
@@ -41,6 +42,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     result = collect_image_outputs(outputs)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
-        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
+        # 计费口径必须跟实际渲染档位一致：网页链路 low 会被提升成 medium，
+        # 这里若还用原始 low，就会「按 medium 渲染、按 low 收 token」。
+        output_tokens=count_image_output_items_tokens(
+            result.get("data"), size, effective_image_quality(quality, model)
+        ),
     )
     return result

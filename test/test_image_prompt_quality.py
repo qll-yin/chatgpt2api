@@ -58,6 +58,73 @@ class ImageQualityPromptTests(unittest.TestCase):
         self.assertIn("模糊", prompt)
         self.assertIn("像素感", prompt)
 
+    def test_low_is_promoted_to_medium_on_web_path(self):
+        """网页链路把 low 提升到 medium —— 上游对「低质量」的理解是字面的。
+
+        实测 1254×1254：low → 425 output tokens / 字节每像素 0.96（糊），
+        medium → 1650 tokens / 1.40（清晰）。尺寸一样、细节密度差 25%。
+        """
+        low_prompt = conversation.build_image_prompt("x", "1024x1024", "low")
+        medium_prompt = conversation.build_image_prompt("x", "1024x1024", "medium")
+
+        self.assertEqual(low_prompt, medium_prompt)
+        self.assertIn("标准生产质量", low_prompt)
+
+    def test_low_promotion_is_case_insensitive(self):
+        self.assertEqual(
+            conversation.normalize_web_image_quality("LOW"),
+            "medium",
+        )
+        self.assertEqual(
+            conversation.normalize_web_image_quality(" Low "),
+            "medium",
+        )
+
+    def test_non_low_quality_untouched(self):
+        """只有 low 被提升，其余档位原样透传。"""
+        for quality in ("medium", "high", "xhigh", "max", "auto"):
+            self.assertEqual(
+                conversation.normalize_web_image_quality(quality),
+                quality,
+            )
+
+    def test_codex_path_keeps_low(self):
+        """codex 链路的 quality 是真参数 —— low 真实生效且上游按 low 计价。
+
+        提升反而是白花钱（官方定价 low $0.006/张 vs medium $0.053/张）。
+        """
+        self.assertEqual(
+            conversation.effective_image_quality("low", "codex-gpt-image-2"),
+            "low",
+        )
+        self.assertEqual(
+            conversation.effective_image_quality("low", "plus-codex-gpt-image-2"),
+            "low",
+        )
+
+    def test_codex_path_normalizes_other_qualities(self):
+        self.assertEqual(
+            conversation.effective_image_quality("medium", "codex-gpt-image-2"),
+            "medium",
+        )
+        self.assertEqual(
+            conversation.effective_image_quality("auto", "codex-gpt-image-2"),
+            "auto",
+        )
+
+    def test_web_path_promotes_low_regardless_of_model(self):
+        """网页模型（gpt-image-2 / 2.5-*）走归一化。"""
+        for model in ("gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.6"):
+            self.assertEqual(
+                conversation.effective_image_quality("low", model),
+                "medium",
+            )
+
+    def test_effective_quality_without_model_defaults_to_web(self):
+        """不传 model 时按网页链路处理（保守：提后不会出糊图）。"""
+        self.assertEqual(conversation.effective_image_quality("low"), "medium")
+        self.assertEqual(conversation.effective_image_quality("high"), "high")
+
     def test_auto_prompt_defaults_to_medium_or_better(self):
         prompt = conversation.build_image_prompt("x", "1024x1024", "auto")
 
@@ -101,6 +168,61 @@ class ImageQualityPromptTests(unittest.TestCase):
         self.assertIn("GIF", prompt)
         self.assertIn("4 帧", prompt)
         self.assertIn("100 毫秒", prompt)
+
+
+class ImageQualityBillingTests(unittest.TestCase):
+    """计费口径必须跟实际渲染档位一致。
+
+    否则会出现「按 medium 渲染、按 low 收 token」—— 对外服务就是亏的，
+    而且 token 数对不上会让排障时误判画质档位。
+    """
+
+    def test_billing_uses_promoted_quality_on_web_path(self):
+        from utils.image_tokens import count_image_output_items_tokens
+
+        size = "1254x1254"
+        low_billing = count_image_output_items_tokens(
+            [{"url": "http://x/a.png"}], size, "low"
+        )
+        medium_billing = count_image_output_items_tokens(
+            [{"url": "http://x/a.png"}], size, "medium"
+        )
+        promoted = conversation.effective_image_quality("low", "gpt-image-2")
+        actual_billing = count_image_output_items_tokens(
+            [{"url": "http://x/a.png"}], size, promoted
+        )
+
+        self.assertNotEqual(low_billing, medium_billing)
+        self.assertEqual(actual_billing, medium_billing)
+
+    def test_billing_matches_prompt_for_low(self):
+        """提示词按 medium 渲染 → 计费也必须按 medium。"""
+        from utils.image_tokens import count_image_output_items_tokens
+
+        size = "1024x1024"
+        prompt = conversation.build_image_prompt("x", size, "low")
+        billing_quality = conversation.effective_image_quality("low", "gpt-image-2")
+
+        # 提示词里已经是 medium 的措辞
+        self.assertIn("标准生产质量", prompt)
+        # 计费也是 medium
+        self.assertEqual(
+            count_image_output_items_tokens([{"url": "http://x/a.png"}], size, billing_quality),
+            count_image_output_items_tokens([{"url": "http://x/a.png"}], size, "medium"),
+        )
+
+    def test_codex_billing_keeps_low(self):
+        """codex 链路 low 真实生效，计费也必须是 low。"""
+        from utils.image_tokens import count_image_output_items_tokens
+
+        size = "1024x1024"
+        billing_quality = conversation.effective_image_quality("low", "codex-gpt-image-2")
+
+        self.assertEqual(billing_quality, "low")
+        self.assertEqual(
+            count_image_output_items_tokens([{"url": "http://x/a.png"}], size, billing_quality),
+            count_image_output_items_tokens([{"url": "http://x/a.png"}], size, "low"),
+        )
 
 
 if __name__ == "__main__":
