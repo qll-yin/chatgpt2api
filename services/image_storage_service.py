@@ -796,14 +796,29 @@ class ImageStorageService:
         """
         settings = self.settings()
         mode = _clean(settings.get("mode"))
+        applied = _clean(settings.get("remote_lifecycle_applied"))
+
+        if self.provider() != "s3":
+            # ⚠️ 从 R2 切到 WebDAV（或别的协议）时，之前下发给 R2 的那条规则
+            #    还留在桶上 —— 不摘掉的话，桶会继续按那条规则删图。
+            #    指纹带 provider 前缀，正好能识别出「之前是 S3」。
+            if applied.startswith("s3|"):
+                result = S3Client(settings).remove_lifecycle_configuration()
+                config.set_image_storage_lifecycle_applied("")
+                logger.info("[image-storage] 远端协议已切换，摘掉 R2 上残留的生命周期规则")
+                return {
+                    "applied": True,
+                    "removed": result.get("removed", 0),
+                    "kept_rules": result.get("kept", 0),
+                    "note": "远端协议已切换，已清理 R2 上残留的规则",
+                }
+            return {"applied": False, "reason": "当前远端协议不支持生命周期规则"}
+
         if mode not in {"remote", "both"}:
             return {"applied": False, "reason": "远端存储未启用"}
-        if self.provider() != "s3":
-            return {"applied": False, "reason": "当前远端协议不支持生命周期规则"}
 
         enabled = bool(settings.get("remote_cleanup_enabled"))
         fingerprint = self._lifecycle_fingerprint()
-        applied = _clean(settings.get("remote_lifecycle_applied"))
 
         if not enabled:
             # 关掉了 → 摘掉我们那条规则（之前下发过的才需要摘）

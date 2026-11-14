@@ -313,6 +313,28 @@ class ApplyRemoteLifecycleTests(unittest.TestCase):
         self.assertFalse(result["applied"])
         self.assertIn("不支持", result["reason"])
 
+    def test_switching_away_from_s3_removes_leftover_rule(self):
+        """从 R2 切到 WebDAV 时，桶上残留的规则必须摘掉 —— 否则桶会继续删图。"""
+        self.settings["provider"] = "webdav"
+        self.settings["remote_lifecycle_applied"] = "s3|my-images|chatgpt2api/images|1|on"
+        with self._patch_client():
+            result = self.service().apply_remote_lifecycle()
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(FakeS3Client.remove_calls, 1)
+        self.assertEqual(self.settings["remote_lifecycle_applied"], "")
+
+    def test_switching_away_without_previous_s3_rule_does_nothing(self):
+        """没下发过 S3 规则就别去动 WebDAV。"""
+        self.settings["provider"] = "webdav"
+        self.settings["remote_lifecycle_applied"] = ""
+        with self._patch_client():
+            result = self.service().apply_remote_lifecycle()
+
+        self.assertFalse(result["applied"])
+        self.assertEqual(FakeS3Client.remove_calls, 0)
+
     def test_local_mode_is_skipped(self):
         self.settings["mode"] = "local"
         with self._patch_client():
