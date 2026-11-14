@@ -277,6 +277,96 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("content") or "") for item in messages if item.get("role") == "assistant" and item.get("content")]
 
 
+# ── 网页生图的质量提示词 ────────────────────────────────────────────
+#
+# 为什么需要这么啰嗦：
+#
+# 网页生图链路（/backend-api/conversation + picture_v2）**没有** quality /
+# size 这类结构化请求字段 —— 实抓确认上游请求体里只有 model、system_hints、
+# partial_query，压根没有质量参数。唯一能影响上游的就是提示词本身。
+#
+# 而上游是「对话模型 + 图片工具」，它对提示词里 quality 一词的理解是**概率性**
+# 的：同一个"输出图片质量为 medium"，有时按 medium 渲染、有时按 low 渲染。
+# 这正是「同样的请求配置，有的图清晰有的图糊」的根因。
+#
+# 实测反推（1254×1254）：
+#   low 档    → 425 output tokens，字节/像素 0.96  （糊）
+#   medium 档 → 1650 output tokens，字节/像素 1.40 （清晰）
+#
+# 所以这里的提示词要做到三件事：
+#   1. 把 quality 译成**具体的视觉描述**（而不是只丢一个英文枚举值）；
+#   2. 显式**排除**低质量特征（模糊/像素感/涂抹感），给模型一个明确的反面锚点；
+#   3. 补上尺寸与构图要求 —— 上游只能靠提示词控制输出。
+#
+# ⚠️ 措辞要避免踩坑：
+#   - 不要写「低质量」「快速草稿」这类词 —— 哪怕是 low 档也要正向描述；
+#   - 不要写「不要像素感」以外还要写「高清/锐利/真实细节」，正面要求比反面
+#     排除更有效（模型更容易照着「要什么」画，而不是「不要什么」）。
+_IMAGE_QUALITY_PROMPTS: dict[str, str] = {
+    "low": (
+        "以清晰度优先的最低成本档渲染：保持主体轮廓与光影结构完整、边缘干净可辨，"
+        "确保画面不出现任何模糊、像素感或涂抹感。"
+    ),
+    "medium": (
+        "以标准生产质量渲染：主体细节丰富且清晰锐利，皮肤与材质纹理真实可辨，"
+        "边缘干净无锯齿，光影过渡自然。"
+        "务必保证成品是高清图像 —— 画面中不能出现模糊、像素感、涂抹感、"
+        "过度降噪或细节丢失。"
+    ),
+    "high": (
+        "以最高生产质量渲染：呈现照片级真实细节，主体边缘与发丝级纹理清晰锐利，"
+        "皮肤质感与材质纹理自然真实，光影层次丰富细腻。"
+        "务必保证成品是高清图像 —— 画面中绝对不能出现模糊、像素感、涂抹感、"
+        "过度降噪、锯齿或任何细节丢失。"
+    ),
+    "xhigh": (
+        "以最高生产质量渲染：呈现照片级真实细节，主体边缘与发丝级纹理清晰锐利，"
+        "皮肤质感与材质纹理自然真实，光影层次丰富细腻。"
+        "务必保证成品是高清图像 —— 画面中绝对不能出现模糊、像素感、涂抹感、"
+        "过度降噪、锯齿或任何细节丢失。"
+    ),
+    "max": (
+        "以最高生产质量渲染：呈现照片级真实细节，主体边缘与发丝级纹理清晰锐利，"
+        "皮肤质感与材质纹理自然真实，光影层次丰富细腻。"
+        "务必保证成品是高清图像 —— 画面中绝对不能出现模糊、像素感、涂抹感、"
+        "过度降噪、锯齿或任何细节丢失。"
+    ),
+    "auto": (
+        "以标准或更高生产质量渲染：主体细节丰富且清晰锐利，材质纹理真实，"
+        "边缘干净无锯齿。"
+        "务必保证成品是高清图像 —— 画面中不能出现模糊、像素感、涂抹感或细节丢失。"
+    ),
+}
+
+
+def _image_size_prompt(size: str | None) -> str:
+    """把 size 参数译成上游能理解的构图要求。
+
+    上游没有 size 字段，输出尺寸由模型依据提示词里的构图/比例描述自主决定
+    （实抓：正方形描述 → 1254×1254，横版描述 → 1536×1024）。
+    所以这里既给尺寸数字，也给构图描述，两边都写上提高命中率。
+    """
+    if not size:
+        return ""
+    text = str(size).lower().replace(" ", "")
+    width = height = 0
+    if "x" in text:
+        left, _, right = text.partition("x")
+        try:
+            width, height = int(left), int(right)
+        except ValueError:
+            width = height = 0
+    if width and height:
+        if width == height:
+            layout = "采用 1:1 正方形构图，主体居中，完整入画"
+        elif width > height:
+            layout = "采用横向构图，主体完整入画，背景横向延展"
+        else:
+            layout = "采用竖向构图，主体完整入画，背景纵向延展"
+        return f"输出图片尺寸为 {width}x{height}，{layout}。"
+    return f"输出图片尺寸为 {size}。"
+
+
 def build_image_prompt(
     prompt: str,
     size: str | None,
@@ -291,10 +381,17 @@ def build_image_prompt(
         frames = f"{frame_count} 帧" if frame_count else "多帧"
         duration = f"，每帧 {frame_duration_ms} 毫秒" if frame_duration_ms else ""
         hints.append(f"输出可循环播放的动画 GIF（{frames}{duration}），不要输出静态图片。")
-    if size:
-        hints.append(f"输出图片尺寸为 {size}。")
-    if quality:
-        hints.append(f"输出图片质量为 {quality}。")
+    size_hint = _image_size_prompt(size)
+    if size_hint:
+        hints.append(size_hint)
+    # 质量提示放在最后 —— 它是这段里最重要的一句，紧邻生成指令更容易被遵守。
+    quality_key = str(quality or "auto").strip().lower()
+    quality_hint = _IMAGE_QUALITY_PROMPTS.get(quality_key)
+    if quality_hint is None:
+        # 未知档位（如上游新增的枚举）：不猜，按 auto 处理并保留原词。
+        quality_hint = _IMAGE_QUALITY_PROMPTS["auto"]
+    if quality_hint:
+        hints.append(quality_hint)
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
