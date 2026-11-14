@@ -41,9 +41,7 @@ git --version
 
 升级和迁移时重点保留以上内容。
 
-## 方式一：普通 Docker 部署
-
-适合不需要 WARP / FlareSolverr 清障的场景。
+## 方式一：Docker 部署
 
 ```bash
 git clone https://github.com/qll-yin/chatgpt2api.git
@@ -91,62 +89,7 @@ docker logs -f chatgpt2api
 docker compose down
 ```
 
-## 方式二：WARP / FlareSolverr 部署
-
-适合上游请求经常遇到 Cloudflare 拦截的场景。该方式会启动：
-
-- `warp-proxy`
-- `privoxy`
-- `flaresolverr`
-- `init-config`
-- `app`
-
-复制环境变量模板：
-
-```bash
-cp .env.example .env
-```
-
-至少修改 `.env` 中的：
-
-```text
-CHATGPT2API_AUTH_KEY=your_secret_key_here
-```
-
-启动：
-
-```bash
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-访问：
-
-```text
-http://localhost:3000
-```
-
-FlareSolverr 相关配置可以在后台设置页的 `FlareSolverr` tab 中查看和测试。
-
-查看容器状态：
-
-```bash
-docker compose -f docker-compose.warp.yml ps
-```
-
-查看日志：
-
-```bash
-docker logs -f chatgpt2api-warp
-docker logs -f chatgpt2api-flaresolverr
-```
-
-停止：
-
-```bash
-docker compose -f docker-compose.warp.yml down
-```
-
-## 方式三：源码运行
+## 方式二：源码运行
 
 适合本地开发或临时调试。
 
@@ -172,35 +115,50 @@ bun run dev
 
 ## 存储后端
 
-默认使用本地 JSON 文件：
+默认使用 **Postgres**（`docker-compose.yml` 里已内置 db 容器，开箱即用）：
 
 ```text
-STORAGE_BACKEND=json
+STORAGE_BACKEND=postgres
+DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
 ```
 
 可选值：
 
 | 值 | 说明 |
 | --- | --- |
-| `json` | 本地 JSON 文件，默认方式 |
+| `postgres` | PostgreSQL，默认方式；compose 里带 db 服务 |
 | `sqlite` | 本地 SQLite，通常存放在 `data/accounts.db` |
-| `postgres` | 外部 PostgreSQL |
+| `json` | 本地 JSON 文件（账号数据用 `data/accounts.json`） |
 | `git` | Git 私有仓库存储账号数据 |
 
-PostgreSQL 示例：
+> ⚠️ 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、注册数据）
+> **无论 `STORAGE_BACKEND` 是什么都会走数据库** —— `DATABASE_URL` 才是关键那项。
+> 没配 `DATABASE_URL` 时回退到本地 SQLite：`sqlite:////app/data/chatgpt2api.db`。
+
+**为什么默认 Postgres 而不是 SQLite**：运行态数据写入非常频繁，SQLite 在高并发写
++ WAL 模式下容易出现 `database is locked`；日均几万张图的量级下 Postgres 明显更稳。
+
+换成 SQLite / JSON（不想多起一个容器）：
+
+```yaml
+environment:
+  - STORAGE_BACKEND=sqlite
+  - DATABASE_URL=sqlite:////app/data/chatgpt2api.db
+# 并删掉 app.depends_on 里的 db，以及整个 db 服务
+```
+
+或者直接用现成的轻量版（SQLite，端口 8000）：
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+外部 PostgreSQL 示例：
 
 ```yaml
 environment:
   - STORAGE_BACKEND=postgres
   - DATABASE_URL=postgresql://user:password@host:5432/dbname
-```
-
-SQLite 示例：
-
-```yaml
-environment:
-  - STORAGE_BACKEND=sqlite
-  - DATABASE_URL=sqlite:////app/data/accounts.db
 ```
 
 ## 图片存储（Cloudflare R2 / S3 兼容）
@@ -323,35 +281,6 @@ docker logs -f chatgpt2api
   迁移老数据，不需要手工执行 SQL。
 - 如果升级前用的是 WebDAV，升级后远端存储类型默认仍保持 WebDAV，不受影响。
 
-## 升级：WARP / FlareSolverr 部署
-
-进入项目目录：
-
-```bash
-cd chatgpt2api
-```
-
-备份：
-
-```bash
-mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
-```
-
-拉取最新代码并重新构建：
-
-```bash
-git pull
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-查看状态：
-
-```bash
-docker compose -f docker-compose.warp.yml ps
-docker logs -f chatgpt2api-warp
-```
-
 ## 升级：源码运行
 
 ```bash
@@ -379,16 +308,10 @@ git log --oneline -n 20
 git checkout <旧版本commit>
 ```
 
-普通 Docker 部署：
+Docker 部署：
 
 ```bash
 docker compose up -d --build
-```
-
-WARP / FlareSolverr 部署：
-
-```bash
-docker compose -f docker-compose.warp.yml up -d --build
 ```
 
 如果需要恢复数据：
@@ -403,11 +326,6 @@ tar -xzf backups/你的备份文件.tgz
 docker compose down
 ```
 
-或：
-
-```bash
-docker compose -f docker-compose.warp.yml down
-```
 
 ## 常用维护命令
 
@@ -423,22 +341,10 @@ docker compose ps
 docker logs -f chatgpt2api
 ```
 
-查看 WARP 部署主服务日志：
-
-```bash
-docker logs -f chatgpt2api-warp
-```
-
 重启普通部署：
 
 ```bash
 docker compose restart
-```
-
-重启 WARP 部署：
-
-```bash
-docker compose -f docker-compose.warp.yml restart
 ```
 
 清理未使用镜像：

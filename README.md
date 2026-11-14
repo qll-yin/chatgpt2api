@@ -33,6 +33,17 @@ vi config.json          # 至少改掉 auth-key
 docker compose up -d --build
 ```
 
+> 默认会**同时起一个 Postgres 容器**（`chatgpt2api-db`）——
+> 生图任务状态、图片索引、标签这些写入非常频繁的数据走 Postgres，
+> 高并发下比 SQLite 稳得多（SQLite 的 WAL 模式容易撞 `database is locked`）。
+> 数据落在宿主机 `./pgdata`。
+>
+> 不想多起一个容器？用 `docker-compose.local.yml`（SQLite 版，端口 8000）：
+>
+> ```bash
+> docker compose -f docker-compose.local.yml up -d --build
+> ```
+
 启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
 
 - Web 面板：`http://localhost:3000`
@@ -66,27 +77,6 @@ docker compose up -d --build
 > 容器**启动**阶段不需要外网：Python 依赖在构建期已装好，运行时不会再去下载。
 > 真正需要联网的是生图请求本身。
 
-### WARP / FlareSolverr 稳定代理部署
-
-如果图片链路经常遇到 Cloudflare 拦截，可以启用附带的 WARP + Privoxy + FlareSolverr 方案：
-
-```bash
-cp .env.example .env
-docker compose -f docker-compose.warp.yml up -d --build
-```
-
-该 compose 会启动：
-
-- `warp-proxy`：提供 WARP SOCKS5 出口。
-- `privoxy`：把 WARP SOCKS5 转成 HTTP 代理。
-- `flaresolverr`：刷新 Cloudflare clearance。
-- `init-config`：幂等写入 `proxy_runtime` 默认配置。
-- `app`：启动 ChatGPT2API 主服务。
-
-默认只让上游 OpenAI / ChatGPT 请求走稳定代理，账号邮箱、CPA 等辅助链路不会被强制接管。账号自身配置的代理优先级最高，其次是稳定代理运行时，再其次是显式代理和旧版全局代理。
-
-可在 `.env` 中调整端口和代理运行时参数，也可在后台设置页的「稳定代理运行时」面板手动保存、测试代理和测试 clearance。
-
 ### 本地开发
 
 启动后端：
@@ -118,12 +108,15 @@ bun install && bun run build
 
 支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
 
-- `json` - 本地 JSON 文件（默认）
+- `postgres` - 外部 PostgreSQL / 内置 Postgres 容器（**默认**）
 - `sqlite` - 本地 SQLite 数据库
-- `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
+- `json` - 本地 JSON 文件
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
 
-示例：使用 PostgreSQL
+> 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、注册数据）
+> **无论 `STORAGE_BACKEND` 是什么都会走数据库** —— 所以 `DATABASE_URL` 才是关键那项。
+
+示例：改用外部 PostgreSQL
 
 ```yaml
 environment:
@@ -204,7 +197,7 @@ R2 配置项（后台填或写进 `config.json` 的 `image_storage`）：
 - 定时检查限流账号并自动刷新
 - 支持密码重新登录恢复异常账号，刷新后可自动重登
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
-- 支持 WARP / FlareSolverr 稳定代理运行时
+- 支持稳定代理运行时（可接自建的 FlareSolverr 刷新 CF clearance，配置在后台设置页）
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
 - 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
@@ -235,9 +228,6 @@ eyJhbGciOi...                                    # 不带代理
 - 带代理的账号走**账号级代理**路径，优先级高于全局代理与稳定代理运行时
 - 典型用法：与注册机配合——注册时用什么 IP，就用什么 IP 跑后续请求，避免账号在多个 IP 间跳变触发风控
 
-### 实验性 / 规划中
-
-- 详细状态说明见：[功能清单](./docs/feature-status.en.md)
 
 ## 与 gpt-outlook-register 配合
 

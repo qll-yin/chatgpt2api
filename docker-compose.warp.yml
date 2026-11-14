@@ -96,13 +96,37 @@ services:
         condition: service_started
       flaresolverr:
         condition: service_started
+      db:
+        condition: service_healthy
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
-      DATABASE_URL: ${DATABASE_URL:-}
+      # 默认 postgres（见下方 db 服务）。想换 SQLite / JSON：
+      # 在 .env 里改 STORAGE_BACKEND 与 DATABASE_URL，并删掉 app.depends_on 里的 db。
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+
+  # ── Postgres（默认启用）──────────────────────────────────────────────
+  # 运行态数据（生图任务状态、图片索引、标签）写入非常频繁，
+  # SQLite 在高并发写 + WAL 模式下容易出现 database is locked。
+  # ⚠️ 上线前记得改掉 POSTGRES_PASSWORD —— 它同时出现在 DATABASE_URL 里。
+  db:
+    image: postgres:16-alpine
+    container_name: chatgpt2api-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-chatgpt2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatgpt2api}
+      POSTGRES_DB: ${POSTGRES_DB:-chatgpt2api}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatgpt2api} -d ${POSTGRES_DB:-chatgpt2api}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

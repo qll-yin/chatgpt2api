@@ -55,6 +55,13 @@ def _default_literal(default: Any, dialect: str) -> str | None:
         return None
     value = default.arg
     if isinstance(value, bool):
+        # ⚠️ Postgres 不接受整数给布尔列：
+        #    `ADD COLUMN remote BOOLEAN DEFAULT 0` →
+        #    "column \"remote\" is of type boolean but default expression is of type integer"
+        #    → 补列失败 → 后续查询直接 no such column。
+        #    SQLite / MySQL 用 0/1，Postgres 必须用 true/false。
+        if dialect == "postgresql":
+            return "true" if value else "false"
         return "1" if value else "0"
     if isinstance(value, (int, float)):
         return str(value)
