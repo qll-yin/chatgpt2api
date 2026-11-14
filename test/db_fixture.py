@@ -44,6 +44,15 @@ def use_temp_database(prefix: str = "chatgpt2api-test-") -> str:
             reset_engine()
         except Exception:
             pass
+        # ⚠️ 必须把临时目录删掉 —— 每个测试模块建一个，跑几十轮测试就会在
+        #    系统临时目录里攒几百个垃圾目录（SQLite 还在被 WAL 占用时可能
+        #    删不掉，ignore_errors 兜住，最坏情况留给系统清理临时目录）。
+        try:
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
     atexit.register(_cleanup)
     return str(db_path)

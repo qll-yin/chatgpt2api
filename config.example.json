@@ -78,11 +78,21 @@
   "image_storage": {
     "enabled": false,
     "mode": "local",
+    "provider": "s3",
+    "s3_endpoint": "",
+    "s3_region": "auto",
+    "s3_bucket": "",
+    "s3_access_key_id": "",
+    "s3_secret_access_key": "",
+    "s3_path_style": true,
     "webdav_url": "",
     "webdav_username": "",
     "webdav_password": "",
-    "webdav_root_path": "chatgpt2api/images",
-    "public_base_url": ""
+    "remote_root_path": "chatgpt2api/images",
+    "public_base_url": "",
+    "remote_cleanup_enabled": false,
+    "remote_cleanup_fallback": false,
+    "remote_retention_days": 1
   },
   "image_min_free_mb": 500,
   "chat_completion_cache": {

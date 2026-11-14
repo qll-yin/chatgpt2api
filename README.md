@@ -1,7 +1,7 @@
 <h1 align="center">ChatGPT2API</h1>
 
 
-<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成在线画图、号池管理、多种账号导入方式与 Docker 自托管部署能力。</p>
+<p align="center">ChatGPT2API 主要是对 ChatGPT 官网相关能力进行逆向整理与封装，提供面向 ChatGPT 图片生成、图片编辑、多图组图编辑场景的 OpenAI 兼容图片 API / 代理，并集成在线画图、号池管理、批量注册管理、多种账号导入方式、Cloudflare R2 对象存储与 Docker 自托管部署能力。</p>
 
 > [!WARNING]
 > 免责声明：
@@ -52,6 +52,19 @@ docker compose up -d --build
 ```
 
 `./data` 与 `./config.json` 都在宿主机上，`git pull` 与容器重建都不会丢数据。
+
+**服务器出站网络要求**：
+
+| 目标 | 用途 | 必需性 |
+| --- | --- | --- |
+| `chatgpt.com` | 生图、编辑、账号刷新 | **必需** |
+| `registry.npmjs.org` | 构建期装前端依赖 | **必需**（仅构建期） |
+| `mirrors.aliyun.com/pypi` | 构建期装 Python 依赖（`uv.lock` 里锁的源） | **必需**（仅构建期） |
+| `*.r2.cloudflarestorage.com` | 存图到 Cloudflare R2 | 用 R2 存储时必需 |
+| `sentinel.openai.com` | 注册功能下载 sentinel sdk.js | 用注册功能时必需 |
+
+> 容器**启动**阶段不需要外网：Python 依赖在构建期已装好，运行时不会再去下载。
+> 真正需要联网的是生图请求本身。
 
 ### WARP / FlareSolverr 稳定代理部署
 
@@ -135,12 +148,13 @@ environment:
 
 ### 图像模型目录
 
-- 内置模型：`gpt-image-2.6`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`
+- 内置模型：`gpt-image-2.6`、`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`
 - 后台设置页提供「刷新模型目录」：调用 `POST /api/image-models/refresh`，
   内部请求 `GET chatgpt.com/backend-api/models` 拉取上游真实模型列表并缓存到 `config.json`
 - **内置模型永远保留**，上游拉取只做追加 —— 上游目录同步慢或服务器上存着旧缓存时，
   代码里声明支持的模型（如 `gpt-image-2.6`）依然可选，不会被旧缓存覆盖
-- `gpt-image-2.5-flare` 直接透传官方 slug，不做 `auto` 映射；只有 `gpt-image-2` 会映射到 `gpt-5-5-thinking`
+- `gpt-image-2.6-flare` / `gpt-image-2.6-sunburst` / `gpt-image-2.5-flare` 直接透传官方 slug，
+  不做 `auto` 映射；只有 `gpt-image-2` 会映射到 `gpt-5-5-thinking`
 
 ### 在线画图功能
 
@@ -152,6 +166,35 @@ environment:
 - 支持服务端缓存图片URL
 - 图片生成进度追踪，超时后可继续等待
 - 图片懒加载与滚动位置记忆，优化大量图片场景性能
+
+### 图片存储：Cloudflare R2 / S3 兼容
+
+生成的图片默认存在服务器本地 `data/images/`。后台「设置 → 图片存储」可以改成存到对象存储：
+
+- **支持 Cloudflare R2**（推荐），同时兼容 MinIO、阿里云 OSS（S3 兼容模式）、AWS S3、腾讯云 COS 等任意 S3 兼容服务
+- 也保留 **WebDAV** 作为可选项（老配置不受影响）
+- 三种保存模式：`仅本机` / `仅远端` / `本机 + 远端`
+- **远端上传失败会自动降级存到本机**，返回本机链接 —— 远端挂了不影响出图，失败原因记录在图片索引里
+
+R2 配置项（后台填或写进 `config.json` 的 `image_storage`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `s3_endpoint` | R2：`https://<AccountID>.r2.cloudflarestorage.com` |
+| `s3_region` | R2 固定 `auto` |
+| `s3_bucket` | 存储桶名称 |
+| `s3_access_key_id` | S3 API 凭据的 Access Key ID |
+| `s3_secret_access_key` | S3 API 凭据的 Secret（**明文存于 `config.json`**，建议只给该桶权限） |
+| `s3_path_style` | R2 必须 `true`（默认就是） |
+| `remote_root_path` | 远端目录（对象 key 前缀），两个协议共用 |
+| `public_base_url` | 公开访问前缀。留空 → 返回本应用 `/images/...` 代理地址；填 `https://pub-xxx.r2.dev` 或自定义域 → 直接返回远端直链（**R2 出网流量免费，推荐**） |
+
+**远端过期清理**：开启「自动清理远端过期图片」并填写保留天数后，应用会把一条**生命周期规则（Lifecycle Rule）直接下发到桶上**，由 R2 服务端按天删除过期对象 —— 不占应用资源、没有扫描延迟，服务停了也照清。
+
+- 规则只作用在 `remote_root_path` 前缀下，**桶上你其它规则不受影响**
+- R2 通常在过期时间后 24 小时内完成删除
+- 需要小时级精度时，可另外打开「额外用应用侧扫描兜底」（会定时列桶扫描，桶大了较贵）
+- 从 R2 切到 WebDAV 时，会自动把桶上残留的那条规则摘掉
 
 ### 号池管理功能
 
@@ -165,6 +208,18 @@ environment:
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
 - 支持四种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
+
+### 注册管理功能
+
+内置的批量注册管理台（后台「注册管理」），把独立的注册机整合进了本项目：
+
+- **邮箱来源**：Remail 长效/短效订单、Outlook 邮箱池、CF 临时邮箱等，可在批量启动时按需选择
+- **Remail 订单管理**：下单、取件、复用、禁用、删除、余额查询
+- **代理池**：静态/动态类型、单代理注册配额上限、CF 拦截计数、IPv6 检测、删除/停用/改上限/改类型/重置/用量重置
+- **批量注册**：可设并发数、目标成功数、冷却时间、验证码超时；实时日志逐行输出，耗时在停止后冻结
+- **注册成功自动入号池**：写进左侧导航的「号池管理」（chatgpt2api 账号池），并携带注册时用的代理 —— 注册和使用阶段走同一个出口 IP，避免触发风控
+- **远端失败降级**：远端上传失败自动落本地，不中断出图
+- **号池自动补充**：可用账号数低于阈值时自动触发批量注册（后台守护进程，无需外部注册机服务）
 
 ### 账号导入与代理绑定
 
@@ -187,6 +242,9 @@ eyJhbGciOi...                                    # 不带代理
 ## 与 gpt-outlook-register 配合
 
 配套项目：[Regert888/gpt-outlook-register](https://github.com/Regert888/gpt-outlook-register)（批量注册 ChatGPT 账号的纯协议注册机）。
+
+> 提示：本项目已内置**注册管理**页（见上文），常规批量注册不再需要单独部署注册机。
+> 下面这条链路适合「注册机跑在另一台机器 / 另一套流程」时，把结果并进本项目号池。
 
 典型工作流：
 
@@ -240,7 +298,7 @@ curl http://localhost:3000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | 内置 `gpt-image-2.6`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`，以及上游目录自动拉取到的其他模型；实际以接口返回为准 |
+| 返回模型 | 内置 `gpt-image-2.6`、`gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-image-2`、`gpt-5-5-thinking`、`gpt-5-5`、`gpt-5-3`，以及上游目录自动拉取到的其他模型；实际以接口返回为准 |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,9 +19,10 @@ from services.storage import runtime_store as store  # noqa: E402
 
 
 def png_bytes() -> bytes:
-    path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.png"
-    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
-    return path.read_bytes()
+    """直接生成 PNG 字节 —— 不落盘，免得在系统临时目录里留垃圾文件。"""
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class FakeWebDAVClient:

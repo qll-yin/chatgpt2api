@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.11.0 - 2026-11-14
+
++ [新增] 图片存储支持 Cloudflare R2（及任意 S3 兼容服务：MinIO / 阿里云 OSS / AWS S3 / 腾讯云 COS）：后台「设置 → 图片存储」新增「远端存储类型」选择，S3 走 boto3 的 SigV4 path-style 客户端，WebDAV 作为兼容选项保留。
++ [新增] 远端过期清理改为**服务端生命周期规则**：应用把规则直接下发到桶上（`put_bucket_lifecycle_configuration`），由 R2 服务端按天删除过期对象 —— 不占应用资源、无扫描延迟，服务停机也照清。规则只作用在远端目录前缀下，桶上其它规则不受影响；从 R2 切到 WebDAV 时会自动摘掉残留规则。
++ [新增] 远端上传失败自动降级存到本机并返回本机链接（不再抛异常打断出图），失败原因记录在图片索引的 `remote_error`。
++ [新增] 注册管理页：内置批量注册（邮箱来源、代理池、并发/目标/冷却/验证码超时、实时日志）、Remail 订单管理、注册成功自动写入「号池管理」并携带注册时使用的代理、号池自动补充守护进程。
++ [优化] 图片存储配置正交化为「mode（本地开关）× provider（远端协议）」，老配置（`mode=webdav` / `mode=both`）自动映射，**已有 WebDAV 配置无需修改**；`webdav_root_path` 更名为 `remote_root_path`（两协议共用），公开访问前缀与远端目录解耦 —— 目录由程序自动拼接，不再需要两处维护。
++ [优化] 图片索引表补齐远端相关字段（`remote` / `remote_provider` / `remote_error` / `remote_uploaded_at` / `remote_uploaded_ts`），老数据自动迁移；修复 `created_at` 非空列缺默认值导致调用方漏传即 500 的问题。
++ [优化] 修复 SQLite 连接池并发缺陷：文件库从全进程共用单连接改为真正的连接池，避免多 worker 批量注册时随机出现 `IndexError` / 状态错乱。
++ [优化] Docker 镜像：补 `ca-certificates`；启动命令加 `--frozen --no-dev`，避免容器每次启动都联网同步 dev 依赖（无外网时会导致启动失败）。
++ [优化] 前端：注册管理页 UI 重做（粘性标签栏、加宽布局）、移除「无限画布」入口、全站容器与弹窗加宽。
++ [合并] 合并上游 v1.10.0，把 GIF 输出能力移植到数据库任务存储（任务表补 `output_format` / `frame_count` / `frame_duration_ms` 三列并自动补列迁移）。
 
 ## 1.10.0 - 2026-11-11
 

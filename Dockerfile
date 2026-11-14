@@ -35,11 +35,13 @@ WORKDIR /app
 # - libpq-dev: PostgreSQL 客户端库
 # - gcc: 编译 psycopg2-binary 需要
 # - libstdc++6: node 二进制的动态依赖（node 官方 tarball 不自带）
+# - ca-certificates: HTTPS 出站（boto3 连 R2 / S3、curl_cffi 连上游都要验签）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
     openssl \
+    ca-certificates \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -90,4 +92,16 @@ COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+# ⚠️ 必须带 --frozen --no-dev：
+#
+#   `uv run` 默认会**重新同步环境**并把 dev 依赖组（httpx/httpcore）也装上。
+#   上面 `uv sync --no-dev` 明确排除了 dev 依赖，镜像里本来没有 httpx 的
+#   wheel 缓存 —— 运行时 `uv run` 要联网下载。
+#   服务器无外网 / 出网被限时，容器会**卡在启动阶段**（装不上依赖直接退出）。
+#
+#   --frozen：不重新解析 lock（构建时已经装好，lock 与 pyproject 一致）
+#   --no-dev：不装 dev 依赖（生产运行不需要）
+#
+#   实测：不带这两个参数时每次启动都会打印 "Installed 2 packages"；
+#   带上之后启动零安装，纯离线也能起。
+CMD ["uv", "run", "--frozen", "--no-dev", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
