@@ -913,12 +913,17 @@ def list_runs(limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], i
 
 
 def _proxy_to_dict(row) -> dict[str, Any]:
-    """ORM 行 → dict，并派生 status 字段。
+    """ORM 行 → dict，并派生 status / bind_status 字段。
 
     status 三态（与原注册机一致，前端按这个展示「可用 N / 停用 M / 已满 K」）：
       available —— 启用中且未超配额
       disabled  —— 被手动停用，或连续被 CF 拦截自动停用
       exhausted —— 启用中但成功数已达上限
+
+    bind_status 是**号池绑定**的独立状态：
+      不适用   —— 动态代理（只用于注册，不给账号绑定）
+      available—— 静态代理，还能继续绑账号
+      exhausted—— 静态代理，绑定数已达上限
     """
     item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
     enabled = bool(item.get("enabled"))
@@ -930,6 +935,19 @@ def _proxy_to_dict(row) -> dict[str, Any]:
         item["status"] = "exhausted"
     else:
         item["status"] = "available"
+
+    # ── 号池绑定状态（与注册配额互不影响）──────────────────────
+    bind_max = int(item.get("bind_max_uses") or 0)
+    bind_used = int(item.get("bind_used_count") or 0)
+    item["bind_remaining"] = (max(0, bind_max - bind_used) if bind_max else -1)
+    if item.get("proxy_type") != "static":
+        item["bind_status"] = "not_applicable"
+    elif not enabled:
+        item["bind_status"] = "disabled"
+    elif bind_max and bind_used >= bind_max:
+        item["bind_status"] = "exhausted"
+    else:
+        item["bind_status"] = "available"
     return item
 
 
@@ -1013,11 +1031,16 @@ def update_proxy(
     *,
     enabled: Optional[bool] = None,
     max_uses: Optional[int] = None,
+    bind_max_uses: Optional[int] = None,
     note: Optional[str] = None,
     proxy_type: Optional[str] = None,
     ipv6_status: Optional[str] = None,
 ) -> bool:
-    """改单个代理的启用状态 / 上限 / 备注 / 类型。返回是否命中。"""
+    """改单个代理的启用状态 / 上限 / 备注 / 类型。返回是否命中。
+
+    bind_max_uses 是**号池绑定配额**（能绑多少个账号），与 max_uses
+    （成功注册多少次）互相独立。
+    """
     proxy = str(proxy or "").strip()
     if not proxy:
         return False
@@ -1026,6 +1049,8 @@ def update_proxy(
         payload["enabled"] = bool(enabled)
     if max_uses is not None:
         payload["max_uses"] = max(0, int(max_uses))
+    if bind_max_uses is not None:
+        payload["bind_max_uses"] = max(0, int(bind_max_uses))
     if note is not None:
         payload["note"] = str(note)
     if proxy_type is not None:
@@ -1159,6 +1184,140 @@ def pick_proxy() -> str:
             if result.rowcount:
                 return candidate.proxy
         return ""
+
+
+# ─────────────────── 号池绑定（静态代理专用）───────────────────
+#
+# 为什么要跟注册配额分开
+# --------------------
+# 动态代理只用于**注册**过程 —— 出口 IP 每次连接都变，注册时 IP 分散，
+# 正是防风控要的。账号注册完导入号池后要长期使用，IP 不能每次都变，
+# 否则同一账号在多个出口之间跳变反而更容易触发风控。
+#
+# 所以静态代理在号池侧有**独立的绑定配额**：
+#   max_uses / used_count        → 限制「成功注册多少次」（注册阶段）
+#   bind_max_uses / bind_used_count → 限制「能绑多少个账号」（号池阶段）
+#
+# 两个配额互不干扰 —— 一个静态代理可以注册 50 次、同时绑 10 个账号。
+
+
+def pick_bind_proxy() -> str:
+    """挑一个可绑账号的静态代理：启用中 + 未超绑定配额 + 绑得少的优先。
+
+    与 pick_proxy 同构，同样是「选中即预占」—— 条件 UPDATE 保证并发下
+    只有一个调用方拿到这个代理，不会超绑。
+
+    只挑 proxy_type='static'：动态代理出口 IP 会变，绑给账号等于没绑
+    （账号每次请求都可能从不同 IP 出去）。
+    """
+    now = time.time()
+    with register_session_scope() as session:
+        stmt = (
+            select(ProxyPoolModel)
+            .where(ProxyPoolModel.enabled.is_(True))
+            .where(ProxyPoolModel.proxy_type == "static")
+            .where(
+                (ProxyPoolModel.bind_max_uses == 0)
+                | (ProxyPoolModel.bind_used_count < ProxyPoolModel.bind_max_uses)
+            )
+            .order_by(
+                ProxyPoolModel.bind_used_count.asc(),
+                ProxyPoolModel.used_count.asc(),
+            )
+            .limit(50)
+        )
+        candidates = list(session.execute(stmt).scalars())
+        for candidate in candidates:
+            # 条件 UPDATE 保证并发下只有一个调用方拿到
+            result = session.execute(
+                sa_update(ProxyPoolModel)
+                .where(
+                    ProxyPoolModel.proxy == candidate.proxy,
+                    ProxyPoolModel.enabled.is_(True),
+                    ProxyPoolModel.proxy_type == "static",
+                    (ProxyPoolModel.bind_max_uses == 0)
+                    | (ProxyPoolModel.bind_used_count < ProxyPoolModel.bind_max_uses),
+                )
+                .values(bind_used_count=ProxyPoolModel.bind_used_count + 1, last_used_at=now)
+            )
+            if result.rowcount:
+                return candidate.proxy
+        return ""
+
+
+def bind_proxy(proxy: str) -> bool:
+    """给指定代理占用一个绑定名额。成功返回 True。
+
+    与 pick_bind_proxy 的区别：这是**指定**代理（用户在前端选的），
+    不做均衡挑选，但同样要检查配额 —— 超额就不给绑。
+
+    ⚠️ 幂等性由调用方保证：同一个账号重复导入同一个代理时，
+    调用方应该先检查账号是否已绑定（见 list_bindings）。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return False
+    with register_session_scope() as session:
+        row = session.execute(
+            select(ProxyPoolModel).where(ProxyPoolModel.proxy == proxy)
+        ).scalar_one_or_none()
+        if row is None:
+            return False
+        if row.proxy_type != "static" or not bool(row.enabled):
+            return False
+        bind_max = int(row.bind_max_uses or 0)
+        if bind_max and int(row.bind_used_count or 0) >= bind_max:
+            return False
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(
+                ProxyPoolModel.proxy == proxy,
+                ProxyPoolModel.enabled.is_(True),
+                ProxyPoolModel.proxy_type == "static",
+                (ProxyPoolModel.bind_max_uses == 0)
+                | (ProxyPoolModel.bind_used_count < ProxyPoolModel.bind_max_uses),
+            )
+            .values(bind_used_count=ProxyPoolModel.bind_used_count + 1, last_used_at=time.time())
+        )
+        return bool(result.rowcount)
+
+
+def release_bind_proxy(proxy: str) -> bool:
+    """归还一个绑定名额（导入失败时回滚）。"""
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(ProxyPoolModel.proxy == proxy)
+            .values(
+                bind_used_count=func.max(0, ProxyPoolModel.bind_used_count - 1),
+                last_used_at=time.time(),
+            )
+        )
+        return bool(result.rowcount)
+
+
+def list_bind_proxies() -> list[dict[str, Any]]:
+    """可绑账号的静态代理列表（含剩余名额），供前端选择。"""
+    return [
+        item
+        for item in list_proxies()
+        if item.get("proxy_type") == "static" and item.get("bind_status") == "available"
+    ]
+
+
+def bind_proxy_stats() -> dict[str, Any]:
+    """绑定配额概览，供前端展示。"""
+    items = [i for i in list_proxies() if i.get("proxy_type") == "static"]
+    return {
+        "static_total": len(items),
+        "bindable": sum(1 for i in items if i.get("bind_status") == "available"),
+        "bind_exhausted": sum(1 for i in items if i.get("bind_status") == "exhausted"),
+        "bind_used": sum(int(i.get("bind_used_count") or 0) for i in items),
+        "bind_capacity": sum(int(i.get("bind_max_uses") or 0) for i in items),
+    }
 
 
 def proxy_used(proxy: str, *, ok: bool) -> bool:

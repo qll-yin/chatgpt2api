@@ -188,22 +188,46 @@ def import_registered_to_pool(
     with_proxy: bool = True,
     source_type: str = "register",
     refresh: bool = True,
+    bind_proxy: str | None = None,
+    auto_bind: bool = False,
 ) -> dict[str, Any]:
     """把已注册的账号批量导入号池。
 
     with_proxy=True  → 带 `access_token----proxy`（proxy 为空则不带）
     with_proxy=False → 只导入 access_token
 
-    返回 {"total", "imported", "skipped", "missing", "items"}
+    ★ bind_proxy / auto_bind —— 号池绑定静态代理
+    ---------------------------------------------
+    注册时用的是**动态代理**（出口 IP 每次都变，防注册风控）。但账号导入
+    号池后要长期使用，IP 不能每次都变 —— 否则同一账号在多个出口之间跳变，
+    反而更容易触发使用侧风控。
+
+    所以导入时改绑**静态代理**：
+      - bind_proxy="http://..." → 全部绑到这一个静态代理
+      - auto_bind=True           → 从静态代理池里自动挑（绑得少的优先），
+                                   每个代理受 bind_max_uses 限制
+      - 两者都不给              → 保持原行为（沿用注册时的代理）
+
+    绑定会占用代理的绑定配额（bind_used_count）；名额不够时该账号跳过，
+    不会硬绑超额。
+
+    返回 {"total", "imported", "skipped", "missing", "items", "bind_stats"}
     """
     from services.storage import register_store as store
 
     keys = [str(e or "").strip().lower() for e in (emails or []) if str(e or "").strip()]
     if not keys:
-        return {"total": 0, "imported": 0, "skipped": 0, "missing": [], "items": []}
+        return {
+            "total": 0, "imported": 0, "skipped": 0, "missing": [], "items": [],
+            "bind_stats": {"bound": 0, "skipped_no_quota": 0, "no_proxy": 0},
+        }
 
     payloads: list[dict[str, Any]] = []
     missing: list[str] = []
+    # 实际绑上代理的记录 —— 导入失败时要还回名额
+    bound: list[str] = []
+    bind_stats = {"bound": 0, "skipped_no_quota": 0, "no_proxy": 0}
+
     for email in keys:
         record = store.get_registered(email)
         if not record:
@@ -224,10 +248,30 @@ def import_registered_to_pool(
         id_token = str(record.get("id_token") or "").strip()
         if id_token:
             payload["id_token"] = id_token
-        if with_proxy:
+
+        # ── 绑定静态代理（优先于注册时的动态代理）────────────────
+        assigned_proxy = ""
+        if bind_proxy:
+            assigned_proxy = str(bind_proxy).strip()
+            # 指定代理也要占配额 —— 超额就跳过这个账号
+            if not store.bind_proxy(assigned_proxy):
+                bind_stats["skipped_no_quota"] += 1
+                assigned_proxy = ""
+        elif auto_bind:
+            assigned_proxy = store.pick_bind_proxy()
+            if not assigned_proxy:
+                bind_stats["skipped_no_quota"] += 1
+
+        if assigned_proxy:
+            payload["proxy"] = assigned_proxy
+            bound.append(assigned_proxy)
+            bind_stats["bound"] += 1
+        elif with_proxy:
+            # 没绑到静态代理 → 回落到注册时用的代理（通常是动态代理）
             proxy_value = str(record.get("proxy") or "").strip()
             if proxy_value:
                 payload["proxy"] = proxy_value
+                bind_stats["no_proxy"] += 1
         payloads.append(payload)
 
     if not payloads:
@@ -237,17 +281,28 @@ def import_registered_to_pool(
             "skipped": 0,
             "missing": missing,
             "items": [],
+            "bind_stats": bind_stats,
         }
 
     result = import_to_pool_with_refresh(payloads, refresh=refresh)
+    imported = int(result.get("imported") or 0)
+    # 导入失败的账号要把名额还回去 —— 否则配额被"幽灵账号"占着
+    if imported < len(payloads) and bound:
+        # import_to_pool_with_refresh 的 items 里有每个账号的结果，
+        # 这里按成功数粗略还：宁可少还也别多占（多占会让代理提前耗尽）
+        release_count = len(bound) - imported
+        for proxy in bound[:max(0, release_count)]:
+            store.release_bind_proxy(proxy)
+
     return {
         "total": len(keys),
-        "imported": int(result.get("imported") or 0),
+        "imported": imported,
         "skipped": int(result.get("skipped") or 0),
         "missing": missing,
         "refreshed": int(result.get("refreshed") or 0),
         "errors": result.get("errors") or [],
         "items": result.get("items") or [],
+        "bind_stats": bind_stats,
     }
 
 

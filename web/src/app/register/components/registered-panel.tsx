@@ -25,11 +25,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  fetchBindableProxies,
   fetchRegistered,
   fetchRegisteredDetail,
   importRegisteredToPool,
   markRegisteredAbnormal,
   type RegisteredItem,
+  type RegisterProxy,
 } from "@/lib/register-api";
 
 import { Pagination } from "./pagination";
@@ -41,6 +43,17 @@ import { Pagination } from "./pagination";
  * 两种导入方式：
  *   1. 勾选下面的账号 → 「导入号池」（按 access_token----proxy 格式写入）
  *   2. 粘贴文本 → 「按文本导入」（格式：access_token----proxy，每行一个）
+ *
+ * ★ 号池绑定静态代理
+ * ------------------
+ * 注册时用的是**动态代理**（出口 IP 每次都变，防注册风控）。但账号导入
+ * 号池后要长期使用，IP 不能每次都变 —— 同一账号在多个出口之间跳变，
+ * 反而更容易触发使用侧风控。
+ *
+ * 所以导入时可以指定静态代理：
+ *   - 「自动分配」→ 从静态代理池里挑（绑得少的优先），每个代理受绑定上限约束
+ *   - 选一个具体代理 → 全部绑到它
+ *   - 都不选 → 沿用注册时的动态代理（保持原行为）
  */
 export function RegisteredPanel() {
   const [items, setItems] = useState<RegisteredItem[]>([]);
@@ -55,6 +68,10 @@ export function RegisteredPanel() {
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof fetchRegisteredDetail>>["item"] | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  // 号池绑定的静态代理
+  const [bindable, setBindable] = useState<RegisterProxy[]>([]);
+  const [bindMode, setBindMode] = useState<"none" | "auto" | "manual">("none");
+  const [bindProxy, setBindProxy] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -72,6 +89,21 @@ export function RegisteredPanel() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 号池绑定的静态代理列表（导入面板要显示各代理剩余名额）
+  const loadBindable = useCallback(async () => {
+    try {
+      const data = await fetchBindableProxies();
+      setBindable(data.items || []);
+    } catch {
+      // 拉不到就不显示绑定选项，不影响原有导入流程
+      setBindable([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadBindable();
+  }, [loadBindable]);
 
   const allSelected = items.length > 0 && items.every((i) => selected.has(i.email));
   const selectedCount = selected.size;
@@ -104,13 +136,24 @@ export function RegisteredPanel() {
     }
     setImporting(true);
     try {
-      const result = await importRegisteredToPool([...selected], withProxy);
+      const result = await importRegisteredToPool([...selected], withProxy, {
+        bindProxy: bindMode === "manual" ? bindProxy : undefined,
+        autoBind: bindMode === "auto",
+      });
+      const bs = result.bind_stats;
+      const bindHint = bs && bs.bound > 0
+        ? `，绑定静态代理 ${bs.bound} 个`
+        : bs && bs.skipped_no_quota > 0
+          ? `，${bs.skipped_no_quota} 个因代理名额不足未绑定`
+          : "";
       toast.success(
         `导入完成：新增 ${result.imported} 个，跳过 ${result.skipped} 个` +
+          bindHint +
           (result.missing.length ? `，${result.missing.length} 个无凭证` : ""),
       );
       setSelected(new Set());
       await load();
+      await loadBindable();
     } catch (error) {
       toast.error(`导入失败：${(error as Error).message ?? error}`);
     } finally {
@@ -172,6 +215,29 @@ export function RegisteredPanel() {
               />
               携带代理
             </label>
+            {/* 号池绑定静态代理：注册用动态代理，入池改绑固定 IP */}
+            <select
+              className="h-8 rounded-lg border border-stone-200 bg-white px-2 text-xs text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
+              value={bindMode === "manual" ? `manual:${bindProxy}` : bindMode}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (value.startsWith("manual:")) {
+                  setBindMode("manual");
+                  setBindProxy(value.slice("manual:".length));
+                } else {
+                  setBindMode(value as "none" | "auto");
+                }
+              }}
+              title="注册用动态代理防风控；导入号池时改绑静态代理，账号出口 IP 固定"
+            >
+              <option value="none">入池不绑定（沿用注册代理）</option>
+              <option value="auto">自动分配静态代理</option>
+              {bindable.map((p) => (
+                <option key={p.proxy} value={`manual:${p.proxy}`}>
+                  {p.proxy} （可绑 {p.bind_remaining === -1 ? "∞" : p.bind_remaining}）
+                </option>
+              ))}
+            </select>
             <Button variant="secondary" size="sm" onClick={() => void load()}>
               <RefreshCw className="size-4" />
               刷新

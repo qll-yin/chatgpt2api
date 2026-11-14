@@ -39,6 +39,10 @@ class ImportToPoolRequest(BaseModel):
     emails: list[str]
     # True → 按 access_token----proxy 带代理入池；False → 只入 access_token
     with_proxy: bool = True
+    # 指定一个静态代理，导入时全部绑到它（受该代理的绑定上限约束）
+    bind_proxy: str | None = None
+    # 自动从静态代理池里挑（绑得少的优先），每个代理受 bind_max_uses 限制
+    auto_bind: bool = False
 
 
 class ImportTextRequest(BaseModel):
@@ -61,6 +65,9 @@ class ProxyUpdateRequest(BaseModel):
     proxy: str
     enabled: bool | None = None
     max_uses: int | None = None
+    # 号池绑定配额：能绑多少个账号到号池（0 = 不限）
+    # 与 max_uses（成功注册多少次）互相独立
+    bind_max_uses: int | None = None
     note: str | None = None
     # static=固定出口 IP / dynamic=每次连接换 IP
     # ⚠️ 被 Cloudflare 403 拦时两者处置不同：
@@ -319,7 +326,10 @@ def create_router() -> APIRouter:
         if not body.emails:
             raise HTTPException(status_code=400, detail={"error": "请至少选择一个账号"})
         return register_service.import_registered_to_pool(
-            body.emails, with_proxy=body.with_proxy
+            body.emails,
+            with_proxy=body.with_proxy,
+            bind_proxy=body.bind_proxy,
+            auto_bind=body.auto_bind,
         )
 
     @router.post("/api/register/import-text")
@@ -338,7 +348,21 @@ def create_router() -> APIRouter:
     @router.get("/api/register/proxies")
     async def proxies(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": store.list_proxies(), "stats": store.proxy_pool_stats()}
+        return {
+            "items": store.list_proxies(),
+            "stats": store.proxy_pool_stats(),
+            # 号池绑定配额概览（静态代理专用）
+            "bind_stats": store.bind_proxy_stats(),
+        }
+
+    @router.get("/api/register/proxies/bindable")
+    async def bindable_proxies(authorization: str | None = Header(default=None)):
+        """可绑账号的静态代理列表（含剩余名额），供导入号池时选择。"""
+        require_admin(authorization)
+        return {
+            "items": store.list_bind_proxies(),
+            "stats": store.bind_proxy_stats(),
+        }
 
     @router.post("/api/register/proxies")
     async def import_proxies(
@@ -360,12 +384,13 @@ def create_router() -> APIRouter:
         body: ProxyUpdateRequest,
         authorization: str | None = Header(default=None),
     ):
-        """改单个代理：启用开关 / 成功注册上限 / 备注 / 类型（静态 or 动态）。"""
+        """改单个代理：启用开关 / 成功注册上限 / 号池绑定上限 / 备注 / 类型（静态 or 动态）。"""
         require_admin(authorization)
         ok = store.update_proxy(
             body.proxy,
             enabled=body.enabled,
             max_uses=body.max_uses,
+            bind_max_uses=body.bind_max_uses,
             note=body.note,
             proxy_type=body.proxy_type,
         )

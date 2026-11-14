@@ -226,6 +226,15 @@ export function ProxyPoolPanel() {
     );
   };
 
+  const changeBindLimit = (row: RegisterProxy, value: string) => {
+    const n = Math.max(0, Number.parseInt(value, 10) || 0);
+    void patch(
+      row.proxy,
+      { bind_max_uses: n },
+      `${row.proxy} 号池绑定上限改为 ${n === 0 ? "不限" : n}`,
+    );
+  };
+
   const resetOne = async (row: RegisterProxy) => {
     try {
       const data = await resetRegisterProxyUsage(row.proxy);
@@ -394,6 +403,8 @@ export function ProxyPoolPanel() {
                 <TableHead className="w-16">启用</TableHead>
                 <TableHead className="w-28">已用/上限</TableHead>
                 <TableHead className="w-28">上限</TableHead>
+                <TableHead className="w-28">已绑/绑定上限</TableHead>
+                <TableHead className="w-24">绑定上限</TableHead>
                 <TableHead className="w-28">连通性</TableHead>
                 <TableHead className="w-64">操作</TableHead>
               </TableRow>
@@ -478,6 +489,41 @@ export function ProxyPoolPanel() {
                             if (!Number.isNaN(n) && n !== p.max_uses) changeLimit(p, e.target.value);
                           }}
                         />
+                      </TableCell>
+                      {/* 号池绑定用量：动态代理不给账号绑定，显示「不适用」 */}
+                      <TableCell className="text-xs tabular-nums">
+                        {p.proxy_type === "dynamic" ? (
+                          <span className="text-muted-foreground">不适用</span>
+                        ) : (
+                          <span
+                            className={
+                              p.bind_status === "exhausted"
+                                ? "text-amber-600 dark:text-amber-400"
+                                : undefined
+                            }
+                          >
+                            {p.bind_used_count ?? 0} / {p.bind_max_uses || "∞"}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {p.proxy_type === "dynamic" ? (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        ) : (
+                          <Input
+                            type="number"
+                            min={0}
+                            defaultValue={p.bind_max_uses}
+                            className="h-8 px-2 text-xs"
+                            title="这个静态代理最多能绑多少个账号到号池（0 = 不限）"
+                            onBlur={(e) => {
+                              const n = Number.parseInt(e.target.value, 10);
+                              if (!Number.isNaN(n) && n !== p.bind_max_uses) {
+                                changeBindLimit(p, e.target.value);
+                              }
+                            }}
+                          />
+                        )}
                       </TableCell>
                       <TableCell className="text-xs">
                         {!result ? (

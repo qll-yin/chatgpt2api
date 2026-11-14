@@ -130,6 +130,16 @@ class ProxyPoolModel(RegisterBase):
     proxy_type 区分静态 / 动态出口，处置策略不同：
     - static：出口 IP 固定，被 CF 拉黑后换多少次都一样 → 连续被拦自动停用
     - dynamic：每次连接可换 IP → 只计数不停用
+
+    ★ 两类代理的**用途不同**，配额也分开算：
+    - dynamic（动态）→ 只用于**注册**过程。出口 IP 随机，注册完就换，
+      正是我们想要的「注册时 IP 分散」。
+    - static（静态）→ 注册完**导入号池**时绑给账号使用。账号要在号池里
+      长期使用，IP 不能每次都变，否则同一账号在多个出口间跳变会触发风控。
+
+    所以 max_uses / used_count 管「注册成功次数」，bind_max_uses /
+    bind_used_count 管「能绑多少个账号」—— 两个配额互不干扰。
+    动态代理的绑定配额永远为 0（不给动态代理绑账号）。
     """
 
     __tablename__ = "reg_proxy_pool"
@@ -141,6 +151,17 @@ class ProxyPoolModel(RegisterBase):
     used_count = Column(Integer, nullable=False, default=0)
     failed_count = Column(Integer, nullable=False, default=0)
     proxy_type = Column(String(16), nullable=False, default="static")
+    # ── 号池绑定配额（静态代理专用）────────────────────────────
+    # 能绑多少个账号到号池，0 = 不限
+    #
+    # ⚠️ 这里用 default=（应用层）而不是 server_default=：
+    #    补列逻辑（migrations.ensure_columns）只读 col.default，
+    #    server_default 会被忽略 → 补出来的列没有 SQL 级 DEFAULT，
+    #    而列又是 NOT NULL → Postgres 补列直接失败（SQLite 允许但值是 NULL）。
+    #    default= 会被 _default_literal 编译成 DEFAULT 10 / DEFAULT 0。
+    bind_max_uses = Column(Integer, nullable=False, default=10)
+    # 已绑定的账号数
+    bind_used_count = Column(Integer, nullable=False, default=0)
     # 连续被 CF 403 的次数（达阈值 → 自动停用 static 代理）
     cf_blocked = Column(Integer, nullable=False, default=0)
     # untested / ok / fail
@@ -153,7 +174,11 @@ class ProxyPoolModel(RegisterBase):
     #    后者绝大多数也是出口 IP 的问题（同一个 IP 注册多了 / 被风控），
     #    但成因不同、恢复路径也不同，混在一起就看不出到底是哪一层坏了。
     # 达阈值 → 自动停用 static 代理（换 IP 可能就通，dynamic 不停用）。
-    invalid_state = Column(Integer, nullable=False, default=0, server_default="0")
+    #
+    # ⚠️ 用 default=（应用层）而不是 server_default=：补列逻辑只读 col.default，
+    #    server_default 会被忽略 → 补出来的列没有 SQL 级 DEFAULT，
+    #    而列又是 NOT NULL → Postgres 补列直接失败。
+    invalid_state = Column(Integer, nullable=False, default=0)
     last_used_at = Column(Float, nullable=True)
     note = Column(Text, nullable=True)
     created_at = Column(Float, nullable=True)

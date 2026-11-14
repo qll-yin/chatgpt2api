@@ -16,6 +16,14 @@ export type RegisterProxy = {
   used_count: number;
   failed_count: number;
   proxy_type: string;
+  /** 号池绑定配额：能绑多少个账号到号池（0 = 不限） */
+  bind_max_uses: number;
+  /** 已绑定的账号数 */
+  bind_used_count: number;
+  /** 剩余可绑定名额（-1 = 不限） */
+  bind_remaining: number;
+  /** 号池绑定状态：动态代理不适用 */
+  bind_status: "available" | "disabled" | "exhausted" | "not_applicable";
   cf_blocked: number;
   /** 连续 409 invalid_state 的次数（达阈值静态代理自动停用） */
   invalid_state: number;
@@ -32,6 +40,15 @@ export type RegisterProxyStats = {
   used: number;
   failed: number;
   enabled: number;
+};
+
+/** 号池绑定配额概览（静态代理专用）。 */
+export type BindProxyStats = {
+  static_total: number;
+  bindable: number;
+  bind_exhausted: number;
+  bind_used: number;
+  bind_capacity: number;
 };
 
 export type RegisterStatus = {
@@ -145,6 +162,12 @@ export type ImportToPoolResult = {
   imported: number;
   skipped: number;
   missing: string[];
+  /** 号池绑定统计（绑了几个 / 因超额跳过几个 / 回落用注册代理几个） */
+  bind_stats?: {
+    bound: number;
+    skipped_no_quota: number;
+    no_proxy: number;
+  };
 };
 
 export type MailPoolItem = {
@@ -295,10 +318,16 @@ export async function fetchRegisteredDetail(email: string): Promise<{
 export async function importRegisteredToPool(
   emails: string[],
   withProxy: boolean,
+  options?: { bindProxy?: string; autoBind?: boolean },
 ): Promise<ImportToPoolResult> {
   return httpRequest<ImportToPoolResult>("/api/register/import-to-pool", {
     method: "POST",
-    body: { emails, with_proxy: withProxy },
+    body: {
+      emails,
+      with_proxy: withProxy,
+      bind_proxy: options?.bindProxy || null,
+      auto_bind: Boolean(options?.autoBind),
+    },
   });
 }
 
@@ -314,9 +343,22 @@ export async function importTokenTextToPool(
 export async function fetchRegisterProxies(): Promise<{
   items: RegisterProxy[];
   stats: RegisterProxyStats;
+  bind_stats: BindProxyStats;
 }> {
-  return httpRequest<{ items: RegisterProxy[]; stats: RegisterProxyStats }>(
-    "/api/register/proxies",
+  return httpRequest<{
+    items: RegisterProxy[];
+    stats: RegisterProxyStats;
+    bind_stats: BindProxyStats;
+  }>("/api/register/proxies");
+}
+
+/** 可绑账号的静态代理列表（含剩余名额）。 */
+export async function fetchBindableProxies(): Promise<{
+  items: RegisterProxy[];
+  stats: BindProxyStats;
+}> {
+  return httpRequest<{ items: RegisterProxy[]; stats: BindProxyStats }>(
+    "/api/register/proxies/bindable",
   );
 }
 
@@ -336,6 +378,7 @@ export async function updateRegisterProxy(
   patch: {
     enabled?: boolean;
     max_uses?: number;
+    bind_max_uses?: number;
     note?: string;
     proxy_type?: "static" | "dynamic";
   },

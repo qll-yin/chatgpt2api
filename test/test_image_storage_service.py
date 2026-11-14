@@ -253,6 +253,44 @@ class ImageStorageServiceTests(unittest.TestCase):
             f"https://cdn.example.test/chatgpt2api/images/{stored.rel}",
         )
 
+    def test_local_mode_ignores_public_base_url(self):
+        """关掉远端存储后，公开前缀必须失效。
+
+        ⚠️ 这是原作者项目就有的坑：用户在设置页关掉远端存储，却忘了清掉
+        「公开访问前缀」那行 → 图片只存本地，URL 却仍指向 R2 → 直接 404。
+        """
+        self.settings.update({
+            "enabled": False,
+            "mode": "local",
+            "public_base_url": "https://pub.example.test",
+        })
+        stored = self.service().save(png_bytes(), "http://app.test")
+
+        self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+        self.assertNotIn("pub.example.test", stored.url)
+
+    def test_local_mode_ignores_public_base_url_in_listing(self):
+        """列表接口返回的 URL 同样要回落到本地地址。"""
+        self.settings.update({
+            "enabled": False,
+            "mode": "local",
+            "public_base_url": "https://pub.example.test",
+        })
+        service = self.service()
+        stored = service.save(png_bytes(), "http://app.test")
+
+        items = service.list_items("http://app.test")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["url"], f"http://app.test/images/{stored.rel}")
+
+    def test_both_mode_still_uses_public_base_url(self):
+        """both 模式（本地 + 远端）仍走远端直链。"""
+        self._s3_settings(mode="both", public_base_url="https://pub.example.test")
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            stored = self.service().save(png_bytes(), "http://app.test")
+
+        self.assertIn("pub.example.test", stored.url)
+
     def test_test_webdav_writes_and_deletes_probe_file(self):
         self._webdav_settings()
         with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):

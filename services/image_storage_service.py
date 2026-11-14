@@ -500,22 +500,36 @@ class ImageStorageService:
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         """对外图片地址。
 
-        填了「公开访问前缀」就直接返回远端直链（Cloudflare R2 的 r2.dev
-        或自定义域），没填才走本应用的 /images 代理。
+        填了「公开访问前缀」且**远端存储实际生效**时，返回远端直链
+        （Cloudflare R2 的 r2.dev 或自定义域）；否则走本应用的 /images 代理。
 
         远端目录由程序自动拼接 —— 用户只填域名就行，不用把目录再写一遍。
         老配置里 public_base_url 已经含了远端目录的，这里不重复拼。
+
+        ⚠️ 「公开访问前缀」只在远端生效时才用。
+        关闭远端存储（mode=local）后图片只存在本地，此时若还返回 R2 直链
+        会直接 404 —— 图在本地、链接指向云端。这是原作者项目就有的问题：
+        用户在设置页关掉远端存储，却忘了清掉公开前缀，历史配置里那行
+        还留着，于是每张新图的 URL 都指向一个根本没写入过的 R2 桶。
         """
         settings = self.settings()
-        public_base_url = _clean(settings.get("public_base_url")).rstrip("/")
         safe_rel = _safe_relative_path(rel)
-        if public_base_url:
-            root = _clean(settings.get("remote_root_path")).strip("/")
-            prefix = public_base_url
-            if root and prefix != root and not prefix.endswith(f"/{root}"):
-                prefix = f"{prefix}/{root}"
-            return f"{prefix}/{safe_rel}"
-        return f"{(base_url or config.base_url).rstrip('/')}/images/{safe_rel}"
+        local_fallback = f"{(base_url or config.base_url).rstrip('/')}/images/{safe_rel}"
+
+        # 远端没生效 → 一律走本地地址（public_base_url 此时是无意义的残留配置）
+        mode = _clean(settings.get("mode")) or "local"
+        if mode not in {"remote", "both"}:
+            return local_fallback
+
+        public_base_url = _clean(settings.get("public_base_url")).rstrip("/")
+        if not public_base_url:
+            return local_fallback
+
+        root = _clean(settings.get("remote_root_path")).strip("/")
+        prefix = public_base_url
+        if root and prefix != root and not prefix.endswith(f"/{root}"):
+            prefix = f"{prefix}/{root}"
+        return f"{prefix}/{safe_rel}"
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
