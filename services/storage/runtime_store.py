@@ -24,7 +24,7 @@ import threading
 from typing import Any, Iterable
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select, update as sa_update
+from sqlalchemy import func, or_ as sa_or, select, update as sa_update
 
 from services.storage.db import get_engine, runtime_session_scope
 from services.storage.runtime_models import (
@@ -53,7 +53,47 @@ def ensure_tables() -> None:
         if _tables_ready:
             return
         create_runtime_tables(get_engine())
+        # ⚠️ 必须在迁移**之前**置位。
+        # 迁移走 runtime_session_scope()，它内部会再调 ensure_tables()；
+        # threading.Lock 不可重入，同线程二次 acquire 直接死锁（进程会卡死到被杀）。
         _tables_ready = True
+        migrate_image_records_remote()
+
+
+def migrate_image_records_remote() -> int:
+    """把老索引里的 ``webdav=1`` 刷成通用的 ``remote=1 + remote_provider='webdav'``。
+
+    改造前「在远端」只有一个 webdav 布尔列；现在远端协议可能是 webdav 或 s3，
+    所以拆成 ``remote``（在不在远端）+ ``remote_provider``（哪种协议）。
+
+    老列 ``webdav`` 保留不删 —— 回退旧版本时数据还在。
+    幂等：已经迁移过的行不会重复改（``remote`` 已是 1）。
+
+    ⚠️ 先 SELECT 再 UPDATE：已经迁移过的库（绝大多数）直接返回 0，
+    一次写事务都不产生。启动时的 UPDATE 会拿 SQLite 文件写锁，
+    可能和并发的注册 worker 抢锁 —— 只读检查就没有这个副作用。
+    """
+    try:
+        with runtime_session_scope() as session:
+            pending = session.execute(
+                select(func.count())
+                .select_from(ImageRecordModel)
+                .where(
+                    ImageRecordModel.webdav.is_(True),
+                    ImageRecordModel.remote.is_(False),
+                )
+            ).scalar()
+            if not pending:
+                return 0
+            result = session.execute(
+                sa_update(ImageRecordModel)
+                .where(ImageRecordModel.webdav.is_(True), ImageRecordModel.remote.is_(False))
+                .values(remote=True, remote_provider="webdav", storage="both")
+            )
+            return int(result.rowcount or 0)
+    except Exception:  # noqa: BLE001 - 迁移失败不应阻断启动
+        logger.warning("image_records 远端字段迁移失败", exc_info=True)
+        return 0
 
 
 def reset_table_guard() -> None:
@@ -297,7 +337,9 @@ def count_image_tasks() -> int:
 
 _RECORD_FIELDS = (
     "name", "date", "size", "created_at", "created_ts",
-    "storage", "local", "webdav", "remote_url", "width", "height",
+    "storage", "local", "remote", "remote_provider", "webdav",
+    "remote_url", "remote_error", "remote_uploaded_at", "remote_uploaded_ts",
+    "width", "height",
 )
 
 
@@ -305,6 +347,11 @@ _RECORD_STR_DEFAULTS = {
     "name": "",
     "date": "",
     "storage": "local",
+    "remote_provider": "",
+    "remote_uploaded_at": "",
+    # created_at 是 NOT NULL 列，但之前没有默认值兜底 ——
+    # 任何调用方漏传就会撞 "NOT NULL constraint failed" 直接 500。
+    "created_at": "",
 }
 
 
@@ -314,9 +361,9 @@ def _record_values(item: dict[str, Any]) -> dict[str, Any]:
         value = item.get(name)
         if value is None and name in _RECORD_STR_DEFAULTS:
             value = _RECORD_STR_DEFAULTS[name]
-        elif value is None and name in {"size", "created_ts", "width", "height"}:
+        elif value is None and name in {"size", "created_ts", "width", "height", "remote_uploaded_ts"}:
             value = 0
-        elif value is None and name in {"local", "webdav"}:
+        elif value is None and name in {"local", "webdav", "remote"}:
             value = False
         values[name] = value
     return values
@@ -328,6 +375,10 @@ def _record_from_row(row) -> dict[str, Any]:
         value = getattr(row, name, None)
         if value is not None:
             item[name] = value
+    # 老数据兜底：webdav=1 的历史行在迁移前也要能当"在远端"用
+    if not item.get("remote") and item.get("webdav"):
+        item["remote"] = True
+        item.setdefault("remote_provider", "webdav")
     return item
 
 
@@ -378,6 +429,21 @@ def list_all_image_records() -> list[dict[str, Any]]:
 def delete_image_record(rel_path: str) -> None:
     with runtime_session_scope() as session:
         session.execute(sa_delete(ImageRecordModel).where(ImageRecordModel.rel_path == rel_path))
+
+
+def count_image_records(remote_only: bool = False) -> int:
+    """统计图片索引条数。
+
+    ``remote_only=True`` 时只数「在远端」的 —— 老数据（webdav=1）也算，
+    迁移没跑或跑失败时不会漏数。
+    """
+    with runtime_session_scope() as session:
+        stmt = select(func.count()).select_from(ImageRecordModel)
+        if remote_only:
+            stmt = stmt.where(
+                sa_or(ImageRecordModel.remote.is_(True), ImageRecordModel.webdav.is_(True))
+            )
+        return int(session.execute(stmt).scalar() or 0)
 
 
 # ── 图片标签 ───────────────────────────────────────────────────────────────

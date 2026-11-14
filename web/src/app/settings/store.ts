@@ -15,6 +15,7 @@ import {
   syncImageStorage,
   startCPAImport,
   testBackupConnection,
+  cleanupRemoteImages,
   testImageStorageConnection,
   updateCPAPool,
   updateSettingsConfig,
@@ -24,6 +25,7 @@ import {
   type CPAPool,
   type CPARemoteFile,
   type ImageStorageMode,
+  type ImageStorageProvider,
   type ImageStorageSettings,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
@@ -159,17 +161,29 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     : {
       enabled: false,
       mode: "local",
+      provider: "s3",
+      s3_endpoint: "",
+      s3_region: "auto",
+      s3_bucket: "",
+      s3_access_key_id: "",
+      s3_secret_access_key: "",
+      s3_path_style: true,
       webdav_url: "",
       webdav_username: "",
       webdav_password: "",
-      webdav_root_path: "chatgpt2api/images",
+      remote_root_path: "chatgpt2api/images",
       public_base_url: "",
+      remote_cleanup_enabled: false,
+      remote_retention_hours: 24,
     };
+  // mode 已经被后端归一化过（local|remote|both），这里只做兜底。
+  // 老配置（mode="webdav"）后端已经映射成 remote+provider，这里不再重复处理。
   const imageStorageMode: ImageStorageMode = imageStorage.enabled && imageStorage.mode === "both"
     ? "both"
-    : imageStorage.enabled && imageStorage.mode === "webdav"
-      ? "webdav"
+    : imageStorage.enabled && imageStorage.mode === "remote"
+      ? "remote"
       : "local";
+  const imageStorageProvider: ImageStorageProvider = imageStorage.provider === "webdav" ? "webdav" : "s3";
   const backup = typeof config.backup === "object" && config.backup
     ? config.backup as BackupSettings
     : {
@@ -229,11 +243,20 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_storage: {
       enabled: Boolean(imageStorage.enabled),
       mode: imageStorageMode,
+      provider: imageStorageProvider,
+      s3_endpoint: String(imageStorage.s3_endpoint || ""),
+      s3_region: String(imageStorage.s3_region || "auto") || "auto",
+      s3_bucket: String(imageStorage.s3_bucket || ""),
+      s3_access_key_id: String(imageStorage.s3_access_key_id || ""),
+      s3_secret_access_key: String(imageStorage.s3_secret_access_key || ""),
+      s3_path_style: imageStorage.s3_path_style !== false,
       webdav_url: String(imageStorage.webdav_url || ""),
       webdav_username: String(imageStorage.webdav_username || ""),
       webdav_password: String(imageStorage.webdav_password || ""),
-      webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
+      remote_root_path: String(imageStorage.remote_root_path || "chatgpt2api/images"),
       public_base_url: String(imageStorage.public_base_url || ""),
+      remote_cleanup_enabled: Boolean(imageStorage.remote_cleanup_enabled),
+      remote_retention_hours: Math.max(1, Number(imageStorage.remote_retention_hours) || 24),
     },
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
@@ -292,6 +315,7 @@ type SettingsStore = {
   isTestingBackup: boolean;
   isTestingImageStorage: boolean;
   isSyncingImageStorage: boolean;
+  isCleaningRemoteImages: boolean;
 
   pools: CPAPool[];
   isLoadingPools: boolean;
@@ -341,13 +365,14 @@ type SettingsStore = {
   setGlobalSystemPrompt: (value: string) => void;
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
-  setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
+  setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean | number) => void;
   setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
   setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
   setProxyRuntimeStatusCodesText: (value: string) => void;
   setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
   testImageStorage: () => Promise<void>;
   syncImagesToWebDAV: () => Promise<void>;
+  cleanupRemoteImages: () => Promise<void>;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
@@ -384,6 +409,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isTestingBackup: false,
   isTestingImageStorage: false,
   isSyncingImageStorage: false,
+  isCleaningRemoteImages: false,
 
   pools: [],
   isLoadingPools: true,
@@ -474,12 +500,21 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
         image_storage: {
           enabled: Boolean(config.image_storage?.enabled),
-          mode: config.image_storage?.enabled && ["webdav", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
+          mode: config.image_storage?.enabled && ["remote", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
+          provider: config.image_storage?.provider === "webdav" ? "webdav" : "s3",
+          s3_endpoint: String(config.image_storage?.s3_endpoint || "").trim(),
+          s3_region: String(config.image_storage?.s3_region || "auto").trim() || "auto",
+          s3_bucket: String(config.image_storage?.s3_bucket || "").trim(),
+          s3_access_key_id: String(config.image_storage?.s3_access_key_id || "").trim(),
+          s3_secret_access_key: String(config.image_storage?.s3_secret_access_key || "").trim(),
+          s3_path_style: config.image_storage?.s3_path_style !== false,
           webdav_url: String(config.image_storage?.webdav_url || "").trim(),
           webdav_username: String(config.image_storage?.webdav_username || "").trim(),
           webdav_password: String(config.image_storage?.webdav_password || "").trim(),
-          webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
+          remote_root_path: String(config.image_storage?.remote_root_path || "chatgpt2api/images").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
+          remote_cleanup_enabled: Boolean(config.image_storage?.remote_cleanup_enabled),
+          remote_retention_hours: Math.max(1, Number(config.image_storage?.remote_retention_hours) || 24),
         },
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),
@@ -658,7 +693,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         next.mode = "local";
       }
       if (key === "enabled" && value && next.mode === "local") {
-        next.mode = "webdav";
+        next.mode = "remote";
       }
       return {
         config: {
@@ -760,16 +795,37 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!saved) {
         return;
       }
+      const provider = get().config?.image_storage?.provider === "webdav" ? "WebDAV" : "S3";
       const data = await testImageStorageConnection();
       if (data.result.ok) {
-        toast.success(`WebDAV 连接可用：HTTP ${data.result.status}`);
+        const extra = data.result.bucket ? `（桶 ${data.result.bucket}）` : "";
+        toast.success(`${provider} 连接可用${extra}`);
       } else {
-        toast.error(`WebDAV 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
+        toast.error(`${provider} 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
+      toast.error(error instanceof Error ? error.message : "测试远端存储连接失败");
     } finally {
       set({ isTestingImageStorage: false });
+    }
+  },
+
+  cleanupRemoteImages: async () => {
+    set({ isCleaningRemoteImages: true });
+    try {
+      const data = await cleanupRemoteImages();
+      const result = data.result;
+      if (!result.enabled) {
+        toast.warning(result.reason || "远端清理未开启");
+      } else if (result.error) {
+        toast.error(`远端清理失败：${result.error}`);
+      } else {
+        toast.success(`远端清理完成：扫描 ${result.scanned} 个对象，删除 ${result.deleted} 个`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "远端清理失败");
+    } finally {
+      set({ isCleaningRemoteImages: false });
     }
   },
 

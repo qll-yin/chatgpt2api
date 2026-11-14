@@ -257,6 +257,8 @@ def storage_stats() -> dict:
         "image_count": image_count,
         "image_size_mb": image_size // (1024 * 1024),
         "image_size_bytes": image_size,
+        # 远端存储概况（provider / 保留时长 / 远端图片数）
+        "remote": image_storage_service.stats(),
     }
 
 
@@ -375,6 +377,15 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
                 logger.info({"event": "image_auto_cleanup", "free_mb": free_mb, "min_free_mb": min_free_mb})
                 result = delete_to_target(min_free_mb)
                 logger.info({"event": "image_auto_cleanup_done", **result})
+        except Exception:
+            pass
+
+        # 远端对象过期清理（默认关闭，配置项 remote_cleanup_enabled）。
+        # 单独 try —— 远端不可达不应该影响本地清理那一轮。
+        try:
+            remote_result = image_storage_service.cleanup_remote()
+            if remote_result.get("deleted"):
+                logger.info({"event": "image_remote_cleanup", **remote_result})
         except Exception:
             pass
 

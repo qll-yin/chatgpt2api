@@ -106,8 +106,21 @@ class ImageRecordModel(RuntimeBase):
 
     storage = Column(String(16), nullable=False, default="local")
     local = Column(Boolean, nullable=False, default=True)
+
+    # ── 远端存储 ──
+    # remote / remote_provider 是通用写法（webdav 或 s3 都算远端）。
+    # webdav 是老字段，保留是为了读老数据；新逻辑统一看 remote，
+    # 迁移把 webdav=1 的老行刷成 remote=1 + remote_provider='webdav'。
+    remote = Column(Boolean, nullable=False, default=False)
+    remote_provider = Column(String(16), nullable=False, default="")
+    # webdav 字段已废弃：仅用于迁移期的老数据识别，不再写入
     webdav = Column(Boolean, nullable=False, default=False)
     remote_url = Column(Text, nullable=True)
+    # 远端上传失败时的原因（降级存本地时记下来，图片管理页能看到）
+    remote_error = Column(Text, nullable=True)
+    # 远端上传时间（本地索引侧记录；清理策略另以对象自身 LastModified 为准）
+    remote_uploaded_at = Column(String(32), nullable=False, default="")
+    remote_uploaded_ts = Column(Float, nullable=True)
 
     width = Column(Integer, nullable=True)
     height = Column(Integer, nullable=True)

@@ -76,8 +76,10 @@ class GifStorageTests(unittest.TestCase):
         raw = animated_gif_bytes()
         # ⚠️ 本项目把图片索引从 JSON 文件搬到了数据库（services/storage/runtime_store.py），
         #    原来的 _load_index / _save_index 已被删除 —— 这里改成 mock DB 写入。
-        with mock.patch.object(service, "settings", return_value={}), mock.patch.object(
-            service, "mode", return_value="webdav"
+        #    另外存储模式已改成「mode(本地开关) × provider(远端协议)」正交结构：
+        #    mode="remote" + provider="webdav" 才表示「仅远端 + WebDAV」。
+        with mock.patch.object(service, "settings", return_value={"provider": "webdav"}), mock.patch.object(
+            service, "mode", return_value="remote"
         ), mock.patch.object(
             image_storage_service.store, "upsert_image_record"
         ), mock.patch.object(service, "_public_url", return_value="https://example.test/a.gif"), mock.patch.object(

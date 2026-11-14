@@ -16,6 +16,10 @@ CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
+# 密钥脱敏占位符：返回给前端时用它替掉真实密钥；
+# 保存时如果传回来的还是它，说明用户没改这一项 → 沿用库里已有的真值。
+SECRET_MASK = "***"
+
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
     "cpa": True,
@@ -29,12 +33,27 @@ DEFAULT_BACKUP_INCLUDE = {
 
 DEFAULT_IMAGE_STORAGE = {
     "enabled": False,
+    # 本地开关：local=只存本机 / remote=只存远端 / both=两边都存
     "mode": "local",
+    # 远端协议：webdav / s3（Cloudflare R2 等 S3 兼容服务）
+    "provider": "s3",
+    # ── S3 / Cloudflare R2 ──
+    "s3_endpoint": "",          # R2: https://<AccountID>.r2.cloudflarestorage.com
+    "s3_region": "auto",        # R2 固定 auto
+    "s3_bucket": "",
+    "s3_access_key_id": "",
+    "s3_secret_access_key": "",
+    "s3_path_style": True,      # R2 必须 path-style
+    # ── WebDAV（兼容保留）──
     "webdav_url": "",
     "webdav_username": "",
     "webdav_password": "",
-    "webdav_root_path": "chatgpt2api/images",
-    "public_base_url": "",
+    # ── 通用 ──
+    "remote_root_path": "chatgpt2api/images",  # 远端目录（对象 key 前缀），两个协议共用
+    "public_base_url": "",                     # 公开访问前缀，留空则走本应用 /images 代理
+    # ── 远端过期清理 ──
+    "remote_cleanup_enabled": False,           # 默认关闭；开启后按保留时长清理远端对象
+    "remote_retention_hours": 24,              # 远端对象保留时长（小时）
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -219,24 +238,132 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
     }
 
 
-def _normalize_image_storage_settings(value: object) -> dict[str, object]:
+_IMAGE_STORAGE_MODES = {"local", "remote", "both"}
+_IMAGE_STORAGE_PROVIDERS = {"webdav", "s3"}
+# 远端对象保留时长上限（1 年）—— 防止手滑填个 999999 把桶当成永久存储。
+_IMAGE_STORAGE_MAX_RETENTION_HOURS = 8760
+
+
+def _looks_like_legacy_webdav(source: dict, prior: dict) -> bool:
+    """判断一份配置是不是「老格式的 WebDAV 配置」。
+
+    判据是任意一个 WebDAV 字段有值 —— 老配置必然带着 webdav_url 或
+    webdav_root_path，即使当时只填了远端目录。
+    """
+    for key in ("webdav_url", "webdav_username", "webdav_password", "webdav_root_path"):
+        if str(source.get(key) or "").strip():
+            return True
+        if str(prior.get(key) or "").strip():
+            return True
+    return False
+
+
+def _normalize_image_storage_settings(
+    value: object,
+    existing: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """归一化图片存储配置。
+
+    这里同时承担两件事：
+
+    1. **旧配置兼容** —— 老的 ``mode`` 把「本地开关」和「远端协议」混成了一个枚举
+       （local / webdav / both）。现在拆成两个正交字段：
+       ``mode``（local|remote|both）× ``provider``（webdav|s3）。
+       老配置 ``mode="webdav"`` → ``mode="remote" + provider="webdav"``，
+       ``mode="both"`` → ``mode="both" + provider="webdav"``。
+       用户不用改任何文件。
+
+    2. **密钥占位还原** —— 前端拿到的是脱敏值 ``***``。保存时如果传回来的还是
+       ``***`` 或空串，说明用户没改这一项，要沿用库里已有的真值，
+       否则一次无关的保存就会把密钥冲成 ``***``（见 ``existing`` 参数）。
+    """
     source = value if isinstance(value, dict) else {}
-    mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
-        mode = "local"
+    prior = existing if isinstance(existing, dict) else {}
+
+    raw_mode = str(source.get("mode") or "local").strip().lower()
+    provider = str(source.get("provider") or "").strip().lower()
+
+    if raw_mode in {"webdav", "s3"}:
+        # 老格式：mode 本身就是协议名
+        provider = provider or raw_mode
+        mode = "remote"
+    elif raw_mode == "both" and not provider:
+        # 老配置的 "both" = 本机 + WebDAV。provider 缺失时靠 WebDAV 字段推断，
+        # 否则会把老用户的远端协议误判成 S3（配置里还留着 webdav_* 却用不上）。
+        provider = "webdav" if _looks_like_legacy_webdav(source, prior) else "s3"
+        mode = "both"
+    else:
+        mode = raw_mode if raw_mode in _IMAGE_STORAGE_MODES else "local"
+        provider = provider if provider in _IMAGE_STORAGE_PROVIDERS else "s3"
+
+    if provider not in _IMAGE_STORAGE_PROVIDERS:
+        provider = "s3"
+
     enabled = _normalize_bool(source.get("enabled"), False)
     if not enabled:
         mode = "local"
-    root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
+
+    def _secret(key: str) -> str:
+        """密钥类字段：``***``/空 → 沿用库里的真值。
+
+        只对**真正的密钥**生效。``s3_access_key_id`` 是标识符（Cloudflare 官方
+        也不视为机密），要明文显示，否则用户每次打开设置页都看不到自己的 Key ID。
+        """
+        incoming = str(source.get(key) or "").strip()
+        if incoming in {"", SECRET_MASK}:
+            return str(prior.get(key) or "").strip()
+        return incoming
+
+    def _int(key: str, low: int, high: int, default: int) -> int:
+        try:
+            raw = int(source.get(key, default))
+        except (TypeError, ValueError):
+            raw = default
+        return max(low, min(high, raw))
+
+    # 远端目录：老配置存在 webdav_root_path，新字段是 remote_root_path（两协议共用）。
+    # ⚠️ incoming 的两个字段都要排在 prior 前面 —— 否则配置一旦被归一化保存过，
+    #    prior.remote_root_path 会把老配置里的 webdav_root_path 顶掉。
+    root_path = str(
+        source.get("remote_root_path")
+        or source.get("webdav_root_path")
+        or prior.get("remote_root_path")
+        or prior.get("webdav_root_path")
+        or DEFAULT_IMAGE_STORAGE["remote_root_path"]
+    ).strip().strip("/")
+
     return {
         "enabled": enabled,
         "mode": mode,
-        "webdav_url": str(source.get("webdav_url") or "").strip().rstrip("/"),
-        "webdav_username": str(source.get("webdav_username") or "").strip(),
-        "webdav_password": str(source.get("webdav_password") or "").strip(),
-        "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        "provider": provider,
+        "s3_endpoint": str(source.get("s3_endpoint") or prior.get("s3_endpoint") or "").strip().rstrip("/"),
+        "s3_region": str(source.get("s3_region") or prior.get("s3_region") or DEFAULT_IMAGE_STORAGE["s3_region"]).strip() or "auto",
+        "s3_bucket": str(source.get("s3_bucket") or prior.get("s3_bucket") or "").strip(),
+        "s3_access_key_id": str(source.get("s3_access_key_id") or prior.get("s3_access_key_id") or "").strip(),
+        "s3_secret_access_key": _secret("s3_secret_access_key"),
+        "s3_path_style": _normalize_bool(source.get("s3_path_style"), True),
+        "webdav_url": str(source.get("webdav_url") or prior.get("webdav_url") or "").strip().rstrip("/"),
+        "webdav_username": str(source.get("webdav_username") or prior.get("webdav_username") or "").strip(),
+        "webdav_password": _secret("webdav_password"),
+        "remote_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["remote_root_path"]),
+        "public_base_url": str(source.get("public_base_url") or prior.get("public_base_url") or "").strip().rstrip("/"),
+        "remote_cleanup_enabled": _normalize_bool(source.get("remote_cleanup_enabled"), False),
+        "remote_retention_hours": _int(
+            "remote_retention_hours", 1, _IMAGE_STORAGE_MAX_RETENTION_HOURS, int(DEFAULT_IMAGE_STORAGE["remote_retention_hours"])
+        ),
     }
+
+
+def _mask_image_storage_secrets(settings: dict[str, object]) -> dict[str, object]:
+    """把密钥字段替换成 ``***``，用于返回给前端。
+
+    只做展示层脱敏 —— 内部读取（``get_image_storage_settings``）拿到的仍是真值。
+    """
+    masked = dict(settings)
+    for key in ("s3_secret_access_key", "webdav_password"):
+        if masked.get(key):
+            masked[key] = SECRET_MASK
+    return masked
 
 
 def _normalize_auto_register_settings(value: object) -> dict[str, object]:
@@ -395,12 +522,37 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
 
 
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
+    """按远端协议分别校验。
+
+    只有真正要用远端（enabled 且 mode != local）时才要求填凭据 ——
+    关掉远端存储后残留的半截配置不该阻止用户保存别的设置。
+    """
     if not _normalize_bool(settings.get("enabled"), False):
         return
-    if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-    if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    mode = str(settings.get("mode") or "local").strip().lower()
+    if mode == "local":
+        return
+
+    provider = str(settings.get("provider") or "s3").strip().lower()
+    if provider == "webdav":
+        if not str(settings.get("webdav_url") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
+        if not str(settings.get("webdav_password") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+        return
+
+    # provider == "s3"
+    endpoint = str(settings.get("s3_endpoint") or "").strip()
+    if not endpoint:
+        raise ValueError("启用 S3 图片存储后必须填写 Endpoint")
+    if not endpoint.startswith(("http://", "https://")):
+        raise ValueError("S3 Endpoint 必须以 http:// 或 https:// 开头")
+    if not str(settings.get("s3_bucket") or "").strip():
+        raise ValueError("启用 S3 图片存储后必须填写 Bucket 名称")
+    if not str(settings.get("s3_access_key_id") or "").strip():
+        raise ValueError("启用 S3 图片存储后必须填写 Access Key ID")
+    if not str(settings.get("s3_secret_access_key") or "").strip():
+        raise ValueError("启用 S3 图片存储后必须填写 Secret Access Key")
 
 
 @dataclass(frozen=True)
@@ -742,7 +894,7 @@ class ConfigStore:
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
         data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
+        data["image_storage"] = _mask_image_storage_secrets(self.get_image_storage_settings())
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
@@ -790,7 +942,12 @@ class ConfigStore:
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
+            # existing 传当前已存的真值：前端回传 *** 时要沿用真密钥，
+            # 不能让一次无关的保存把密钥冲成 ***。
+            next_data["image_storage"] = _normalize_image_storage_settings(
+                next_data.get("image_storage"),
+                existing=self.get_image_storage_settings(),
+            )
             _validate_image_storage_settings(next_data["image_storage"])
         if "chat_completion_cache" in next_data:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(

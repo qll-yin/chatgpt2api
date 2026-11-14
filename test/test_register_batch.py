@@ -94,7 +94,11 @@ class BatchControllerTests(unittest.TestCase):
         self.controller.stop()
 
     def test_pause_and_resume(self):
-        self.controller.start({"concurrency": 1})
+        # ⚠️ 显式置成 RUNNING 再测 —— 不能依赖 start() 之后 worker 还没
+        #    进入「等待资源」的那个时序窗口（那是竞态，时快时慢）。
+        #    等资源状态下 pause() 返回 ok=False 是**正确**行为
+        #    （「当前在等资源，没在跑，不用暂停」）。
+        self.controller._state = register_batch.AutoLoopState.RUNNING
         paused = self.controller.pause()
         self.assertTrue(paused["ok"])
         self.assertEqual(self.controller.status()["state"], "paused")

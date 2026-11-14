@@ -4,16 +4,26 @@ export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both";
+export type ImageStorageMode = "local" | "remote" | "both";
+export type ImageStorageProvider = "webdav" | "s3";
 
 export type ImageStorageSettings = {
   enabled: boolean;
   mode: ImageStorageMode;
+  provider: ImageStorageProvider;
+  s3_endpoint: string;
+  s3_region: string;
+  s3_bucket: string;
+  s3_access_key_id: string;
+  s3_secret_access_key: string;
+  s3_path_style: boolean;
   webdav_url: string;
   webdav_username: string;
   webdav_password: string;
-  webdav_root_path: string;
+  remote_root_path: string;
   public_base_url: string;
+  remote_cleanup_enabled: boolean;
+  remote_retention_hours: number;
 };
 
 export type Account = {
@@ -586,7 +596,9 @@ export async function testBackupConnection() {
 }
 
 export async function testImageStorageConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
+  return httpRequest<{
+    result: { ok: boolean; status: number; error?: string | null; bucket?: string; endpoint?: string; region?: string };
+  }>("/api/image-storage/test", {
     method: "POST",
     body: {},
   });
@@ -594,6 +606,15 @@ export async function testImageStorageConnection() {
 
 export async function syncImageStorage() {
   return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function cleanupRemoteImages() {
+  return httpRequest<{
+    result: { enabled: boolean; scanned: number; deleted: number; reason?: string; error?: string; retention_hours?: number };
+  }>("/api/image-storage/cleanup-remote", {
     method: "POST",
     body: {},
   });
@@ -688,6 +709,17 @@ export async function deleteImageTag(tag: string) {
 export type ImageStorageStats = {
   disk_total_mb: number; disk_used_mb: number; disk_free_mb: number;
   image_count: number; image_size_mb: number; image_size_bytes: number;
+  remote?: {
+    enabled: boolean;
+    mode: ImageStorageMode;
+    provider: ImageStorageProvider;
+    remote_enabled: boolean;
+    remote_count: number;
+    remote_cleanup_enabled: boolean;
+    remote_retention_hours: number;
+    public_base_url: string;
+    remote_root_path: string;
+  };
 };
 
 export async function fetchImageStorage() {

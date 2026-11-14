@@ -198,7 +198,8 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/image-storage/test")
     async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"result": await run_in_threadpool(image_storage_service.test_webdav)}
+        # 按 provider 分发：WebDAV 或 S3(R2)，连通性探测逻辑在各自客户端里
+        return {"result": await run_in_threadpool(image_storage_service.test_remote)}
 
     @router.post("/api/image-storage/sync")
     async def sync_image_storage_endpoint(authorization: str | None = Header(default=None)):
@@ -207,6 +208,16 @@ def create_router(app_version: str) -> APIRouter:
             return {"result": await run_in_threadpool(image_storage_service.sync_all)}
         except ImageStorageError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-storage/cleanup-remote")
+    async def cleanup_remote_images_endpoint(authorization: str | None = Header(default=None)):
+        """手动触发一次远端过期清理。
+
+        平时由后台定时器每 30 分钟跑一次；这里给用户一个「立刻清」的入口，
+        改完保留时长后不用等定时器。
+        """
+        require_admin(authorization)
+        return {"result": await run_in_threadpool(image_storage_service.cleanup_remote)}
 
     @router.get("/api/backups")
     async def get_backups(authorization: str | None = Header(default=None)):

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
@@ -14,6 +16,8 @@ from PIL import Image
 
 from services.config import DATA_DIR, config
 from services.storage import runtime_store as store
+
+logger = logging.getLogger(__name__)
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 # .gif 是作者 v1.10.0 加的 GIF 输出支持需要的（按真实字节后缀存盘）。
@@ -32,6 +36,19 @@ class StoredImage:
     url: str
     storage: str
     size: int
+
+
+class RemoteImageClient(Protocol):
+    """远端图片存储的统一接口。
+
+    抽出这层是为了让「远端协议」可插拔：WebDAV 与 S3(R2) 各实现一份，
+    ``ImageStorageService`` 只按 provider 选实现，不关心底下是哪种协议。
+    """
+
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str: ...
+    def get(self, rel: str) -> bytes: ...
+    def delete(self, rel: str) -> bool: ...
+    def test(self) -> dict[str, object]: ...
 
 
 def _clean(value: object) -> str:
@@ -99,11 +116,18 @@ def _local_image_path(relative_path: str) -> Path:
 
 
 class WebDAVClient:
+    """WebDAV 远端存储（兼容保留）。
+
+    实现 ``RemoteImageClient`` 协议，行为与改造前完全一致 ——
+    远端目录统一读 ``remote_root_path``（老配置里的 ``webdav_root_path``
+    在 config 层已经映射过来了）。
+    """
+
     def __init__(self, settings: dict[str, object]):
         self.url = _clean(settings.get("webdav_url")).rstrip("/")
         self.username = _clean(settings.get("webdav_username"))
         self.password = _clean(settings.get("webdav_password"))
-        self.root_path = _clean(settings.get("webdav_root_path")).strip("/")
+        self.root_path = _clean(settings.get("remote_root_path")).strip("/")
         self.session = requests.Session()
 
     def _auth_kwargs(self) -> dict[str, object]:
@@ -167,6 +191,185 @@ class WebDAVClient:
             self.session.close()
 
 
+class S3Client:
+    """S3 兼容远端存储（Cloudflare R2 / MinIO / 阿里云 OSS / AWS S3 …）。
+
+    两个必须写对的点：
+
+    1. **path-style 寻址** —— R2 的 endpoint 是
+       ``https://<AccountID>.r2.cloudflarestorage.com``，对象路径是
+       ``/<bucket>/<key>``。boto3 默认用 virtual-host style
+       （``<bucket>.<account>.r2.cloudflarestorage.com``），R2 对这种解析
+       支持不稳，会报 bucket 找不到。所以强制 ``addressing_style="path"``。
+    2. **region 固定 ``auto``** —— R2 没有真正的区域概念，但签名里必须带，
+       填别的值会直接被拒签（SignatureDoesNotMatch）。
+
+    这两点在 ``_build_client`` 里做成显式配置，用户可以改但默认就是对的。
+    """
+
+    PROBE_KEY = ".chatgpt2api_s3_test.txt"
+
+    def __init__(self, settings: dict[str, object]):
+        self.endpoint = _clean(settings.get("s3_endpoint")).rstrip("/")
+        self.region = _clean(settings.get("s3_region")) or "auto"
+        self.bucket = _clean(settings.get("s3_bucket"))
+        self.root_path = _clean(settings.get("remote_root_path")).strip("/")
+        self.access_key_id = _clean(settings.get("s3_access_key_id"))
+        self.secret_access_key = _clean(settings.get("s3_secret_access_key"))
+        self.path_style = bool(settings.get("s3_path_style", True))
+        self.client = self._build_client()
+
+    def _build_client(self):
+        # boto3 是可选依赖：没装时给出明确报错，而不是让整个服务 import 就崩。
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as exc:  # pragma: no cover - 环境问题
+            raise ImageStorageError(
+                "缺少 boto3 依赖，无法使用 S3 存储。请执行：uv sync"
+            ) from exc
+
+        return boto3.client(
+            "s3",
+            endpoint_url=self.endpoint or None,
+            region_name=self.region,
+            aws_access_key_id=self.access_key_id or None,
+            aws_secret_access_key=self.secret_access_key or None,
+            config=Config(
+                s3={
+                    "addressing_style": "path" if self.path_style else "virtual",
+                    # R2/S3 兼容服务大多不实现分段上传的 checksum 算法，
+                    # 老版本 s3transfer 会算 MD5 导致 SignatureDoesNotMatch。
+                    "request_checksum_calculation": "when_required",
+                    "response_checksum_validation": "when_required",
+                },
+                signature_version="s3v4",
+                retries={"max_attempts": 3, "mode": "standard"},
+                connect_timeout=10,
+                read_timeout=60,
+            ),
+        )
+
+    def key(self, rel: str) -> str:
+        """相对路径 → 对象 key（含远端目录前缀）。"""
+        safe_rel = _safe_relative_path(rel)
+        return f"{self.root_path}/{safe_rel}" if self.root_path else safe_rel
+
+    def public_url(self, rel: str) -> str:
+        """对象的公开地址（仅在桶公开读时有意义）。"""
+        base = _clean(config.get_image_storage_settings().get("public_base_url")).rstrip("/")
+        if not base:
+            return ""
+        root = self.root_path.strip("/")
+        safe_rel = _safe_relative_path(rel)
+        parts = [part for part in (root, safe_rel) if part]
+        return f"{base}/{'/'.join(parts)}"
+
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+        key = self.key(rel)
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=payload,
+                ContentType=content_type,
+            )
+        except Exception as exc:
+            raise ImageStorageError(f"S3 PUT failed: {exc}") from exc
+        return self.public_url(rel) or f"{self.endpoint}/{self.bucket}/{key}"
+
+    def get(self, rel: str) -> bytes:
+        key = self.key(rel)
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+            return bytes(response["Body"].read())
+        except Exception as exc:
+            raise ImageStorageError(f"S3 GET failed: {exc}") from exc
+
+    def delete(self, rel: str) -> bool:
+        key = self.key(rel)
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception as exc:
+            raise ImageStorageError(f"S3 DELETE failed: {exc}") from exc
+
+    def list_objects(self, prefix: str = "") -> list[dict[str, object]]:
+        """列出远端对象。
+
+        返回 ``[{"key":..., "last_modified": epoch 秒, "size":...}]``。
+        过期清理按对象自己的 LastModified 判断 —— 即使本地索引丢了也能正确清理。
+        """
+        base = f"{self.root_path}/" if self.root_path else ""
+        paginator = self.client.get_paginator("list_objects_v2")
+        items: list[dict[str, object]] = []
+        try:
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=base + prefix):
+                for obj in page.get("Contents") or []:
+                    modified = obj.get("LastModified")
+                    items.append({
+                        "key": str(obj.get("Key") or ""),
+                        "last_modified": modified.timestamp() if hasattr(modified, "timestamp") else 0.0,
+                        "size": int(obj.get("Size") or 0),
+                    })
+        except Exception as exc:
+            raise ImageStorageError(f"S3 LIST failed: {exc}") from exc
+        return items
+
+    def delete_keys(self, keys: list[str]) -> int:
+        """批量删除对象。返回成功删除的数量。"""
+        if not keys:
+            return 0
+        deleted = 0
+        for index in range(0, len(keys), 1000):
+            chunk = keys[index:index + 1000]
+            try:
+                self.client.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
+                )
+                deleted += len(chunk)
+            except Exception as exc:
+                raise ImageStorageError(f"S3 batch DELETE failed: {exc}") from exc
+        return deleted
+
+    def test(self) -> dict[str, object]:
+        if not self.endpoint:
+            return {"ok": False, "status": 0, "error": "S3 Endpoint is required"}
+        if not self.bucket:
+            return {"ok": False, "status": 0, "error": "S3 bucket is required"}
+        if urlparse(self.endpoint).scheme not in {"http", "https"}:
+            return {"ok": False, "status": 0, "error": "invalid S3 endpoint"}
+        try:
+            # 1) 桶存在且凭据有权限
+            self.client.head_bucket(Bucket=self.bucket)
+            # 2) 写 → 读 → 删，验证完整的对象读写链路
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=f"{self.root_path}/{self.PROBE_KEY}" if self.root_path else self.PROBE_KEY,
+                Body=b"chatgpt2api s3 test\n",
+                ContentType="text/plain",
+            )
+            self.client.get_object(
+                Bucket=self.bucket,
+                Key=f"{self.root_path}/{self.PROBE_KEY}" if self.root_path else self.PROBE_KEY,
+            )["Body"].read()
+            self.client.delete_object(
+                Bucket=self.bucket,
+                Key=f"{self.root_path}/{self.PROBE_KEY}" if self.root_path else self.PROBE_KEY,
+            )
+            return {
+                "ok": True,
+                "status": 200,
+                "error": None,
+                "bucket": self.bucket,
+                "endpoint": self.endpoint,
+                "region": self.region,
+            }
+        except Exception as exc:
+            return {"ok": False, "status": 0, "error": str(exc) or exc.__class__.__name__}
+
+
 class ImageStorageService:
     """图片存储服务。
 
@@ -190,12 +393,37 @@ class ImageStorageService:
     def mode(self) -> str:
         return _clean(self.settings().get("mode")) or "local"
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
+    def provider(self) -> str:
+        """当前远端协议：webdav / s3。"""
+        provider = _clean(self.settings().get("provider")).lower()
+        return provider if provider in {"webdav", "s3"} else "s3"
+
+    def _remote_client(self) -> RemoteImageClient:
+        """按 provider 造一个远端客户端。"""
         settings = self.settings()
-        public_base_url = _clean(settings.get("public_base_url"))
+        if self.provider() == "webdav":
+            return WebDAVClient(settings)
+        return S3Client(settings)
+
+    def _public_url(self, rel: str, base_url: str | None = None) -> str:
+        """对外图片地址。
+
+        填了「公开访问前缀」就直接返回远端直链（Cloudflare R2 的 r2.dev
+        或自定义域），没填才走本应用的 /images 代理。
+
+        远端目录由程序自动拼接 —— 用户只填域名就行，不用把目录再写一遍。
+        老配置里 public_base_url 已经含了远端目录的，这里不重复拼。
+        """
+        settings = self.settings()
+        public_base_url = _clean(settings.get("public_base_url")).rstrip("/")
+        safe_rel = _safe_relative_path(rel)
         if public_base_url:
-            return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
-        return f"{(base_url or config.base_url).rstrip('/')}/images/{_safe_relative_path(rel)}"
+            root = _clean(settings.get("remote_root_path")).strip("/")
+            prefix = public_base_url
+            if root and prefix != root and not prefix.endswith(f"/{root}"):
+                prefix = f"{prefix}/{root}"
+            return f"{prefix}/{safe_rel}"
+        return f"{(base_url or config.base_url).rstrip('/')}/images/{safe_rel}"
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
@@ -209,23 +437,41 @@ class ImageStorageService:
         # 过期清理已由 image_service 的 30 分钟定时器统一负责，此处不再重复。
         rel = self.make_relative_path(image_data)
         mode = self.mode()
-        if mode not in {"local", "webdav", "both"}:
+        if mode not in {"local", "remote", "both"}:
             mode = "local"
-        stored_local = False
-        stored_webdav = False
-        remote_url = ""
 
-        if mode in {"local", "both"}:
+        stored_local = False
+        stored_remote = False
+        remote_url = ""
+        remote_error = ""
+        remote_uploaded_ts = 0.0
+
+        def _write_local() -> None:
+            nonlocal stored_local
             path = _local_image_path(rel)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(image_data)
             stored_local = True
 
-        if mode in {"webdav", "both"}:
-            remote_url = WebDAVClient(self.settings()).put(
-                rel, image_data, content_type=_image_mime_type(image_data)
-            )
-            stored_webdav = True
+        if mode in {"local", "both"}:
+            _write_local()
+
+        if mode in {"remote", "both"}:
+            try:
+                client = self._remote_client()
+                remote_url = client.put(rel, image_data, content_type=_image_mime_type(image_data))
+                stored_remote = True
+                remote_uploaded_ts = time.time()
+            except Exception as exc:  # noqa: BLE001
+                # 容错：远端（WebDAV / R2）挂了不能把生图一起带崩 ——
+                # 降级存到本地，链接照常返回，只是这条图没进远端桶。
+                remote_error = str(exc) or exc.__class__.__name__
+                logger.warning(
+                    "[image-storage] 远端上传失败(%s)，降级存本地: %s",
+                    self.provider(), remote_error,
+                )
+                if not stored_local:
+                    _write_local()
 
         dimensions = _image_dimensions(image_data)
         item = {
@@ -235,10 +481,14 @@ class ImageStorageService:
             "size": len(image_data),
             "created_at": _now_iso(),
             "created_ts": time.time(),
-            "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
+            "storage": "both" if stored_local and stored_remote else ("remote" if stored_remote else "local"),
             "local": stored_local,
-            "webdav": stored_webdav,
+            "remote": stored_remote,
+            "remote_provider": self.provider() if stored_remote else "",
             "remote_url": remote_url,
+            "remote_error": remote_error,
+            "remote_uploaded_at": _now_iso() if remote_uploaded_ts else "",
+            "remote_uploaded_ts": remote_uploaded_ts,
         }
         if dimensions:
             item["width"], item["height"] = dimensions
@@ -253,8 +503,8 @@ class ImageStorageService:
         if path.is_file():
             return path.read_bytes()
         item = store.get_image_record(safe_rel) or {}
-        if item.get("webdav"):
-            return WebDAVClient(self.settings()).get(safe_rel)
+        if item.get("remote") or item.get("webdav"):
+            return self._remote_client().get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
 
     def exists(self, rel: str) -> bool:
@@ -264,7 +514,7 @@ class ImageStorageService:
         if _local_image_path(safe_rel).is_file():
             return True
         item = store.get_image_record(safe_rel) or {}
-        return bool(item.get("webdav"))
+        return bool(item.get("remote") or item.get("webdav"))
 
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
@@ -289,12 +539,14 @@ class ImageStorageService:
             pending.append({
                 "rel_path": rel,
                 "name": path.name,
-                "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+                "date": "/".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
                 "size": stat.st_size,
                 "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 "created_ts": stat.st_mtime,
                 "storage": "local",
                 "local": True,
+                "remote": False,
+                "remote_provider": "",
                 "webdav": False,
                 **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
             })
@@ -308,8 +560,8 @@ class ImageStorageService:
             if not rel or not _is_image_rel(rel):
                 continue
             local = _local_image_path(rel).is_file()
-            webdav = bool(item.get("webdav"))
-            if not local and not webdav:
+            remote = bool(item.get("remote") or item.get("webdav"))
+            if not local and not remote:
                 # 文件已被外部删除（手工清理 / 磁盘故障）→ 索引记录失效，顺手清掉
                 stale.append(rel)
                 continue
@@ -332,9 +584,9 @@ class ImageStorageService:
             path.unlink()
             removed = True
         item = store.get_image_record(safe_rel) or {}
-        if item.get("webdav"):
+        if item.get("remote") or item.get("webdav"):
             try:
-                removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
+                removed = self._remote_client().delete(safe_rel) or removed
             except ImageStorageError:
                 if not removed:
                     raise
@@ -342,38 +594,45 @@ class ImageStorageService:
         return removed
 
     def sync_all(self) -> dict[str, int]:
+        """把本地已有图片补传到远端。"""
         settings = self.settings()
-        if self.mode() not in {"webdav", "both"}:
-            raise ImageStorageError("WebDAV 图片存储未启用")
+        mode = _clean(settings.get("mode"))
+        if mode not in {"remote", "both"}:
+            raise ImageStorageError("远端图片存储未启用")
         uploaded = 0
         skipped = 0
         failed = 0
-        client = WebDAVClient(settings)
+        client = self._remote_client()
+        provider = self.provider()
         for path in sorted(config.images_dir.rglob("*")):
             if not path.is_file() or not _is_image_rel(path.name):
                 continue
             rel = path.relative_to(config.images_dir).as_posix()
             item = store.get_image_record(rel) or {}
-            if item.get("webdav"):
+            if item.get("remote"):
                 skipped += 1
                 continue
             try:
                 payload = path.read_bytes()
-                remote_url = client.put(rel, payload)
+                remote_url = client.put(rel, payload, content_type=_image_mime_type(payload))
                 dimensions = _image_dimensions(payload)
                 stat = path.stat()
                 store.upsert_image_record({
                     **item,
                     "rel_path": rel,
                     "name": path.name,
-                    "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
+                    "date": "/".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d"),
                     "size": len(payload),
                     "created_at": str(item.get("created_at") or datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
                     "created_ts": float(item.get("created_ts") or stat.st_mtime),
                     "storage": "both",
                     "local": True,
-                    "webdav": True,
+                    "remote": True,
+                    "remote_provider": provider,
                     "remote_url": remote_url,
+                    "remote_error": "",
+                    "remote_uploaded_at": _now_iso(),
+                    "remote_uploaded_ts": time.time(),
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 })
                 uploaded += 1
@@ -381,8 +640,77 @@ class ImageStorageService:
                 failed += 1
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
+    def cleanup_remote(self) -> dict[str, object]:
+        """按保留时长清理远端对象。
+
+        默认关闭（配置项 ``remote_cleanup_enabled``）。
+
+        判据用的是**对象自己的 LastModified**（R2/S3 返回的上传时间），
+        不是本地索引里的创建时间 —— 索引可能丢、也可能和实际对不上，
+        用对象自身的时间戳才准。
+
+        ⚠️ 更好的做法是在 R2 控制台配一条 Lifecycle Rule（服务端执行，
+        不消耗应用资源、也没有扫描延迟）。这里的应用侧清理只作兜底。
+        """
+        settings = self.settings()
+        if not bool(settings.get("remote_cleanup_enabled")):
+            return {"enabled": False, "scanned": 0, "deleted": 0, "reason": "远端清理未开启"}
+        mode = _clean(settings.get("mode"))
+        if mode not in {"remote", "both"}:
+            return {"enabled": True, "scanned": 0, "deleted": 0, "reason": "远端存储未启用"}
+        if self.provider() != "s3":
+            return {"enabled": True, "scanned": 0, "deleted": 0, "reason": "当前远端协议不支持列举清理"}
+        try:
+            hours = max(1, int(settings.get("remote_retention_hours") or 24))
+        except (TypeError, ValueError):
+            hours = 24
+        cutoff = time.time() - hours * 3600
+        try:
+            client = self._remote_client()
+            objects = client.list_objects()
+            expired = [
+                str(item.get("key") or "")
+                for item in objects
+                if str(item.get("key") or "") and float(item.get("last_modified") or 0) < cutoff
+            ]
+            deleted = client.delete_keys(expired)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[image-storage] 远端清理失败: %s", exc)
+            return {"enabled": True, "scanned": 0, "deleted": 0, "error": str(exc)}
+        if deleted:
+            logger.info("[image-storage] 远端清理：删除 %s 个过期对象（保留 %s 小时）", deleted, hours)
+        return {"enabled": True, "scanned": len(objects), "deleted": deleted, "retention_hours": hours}
+
+    def test_remote(self) -> dict[str, object]:
+        """连通性测试（按 provider 分发）。"""
+        provider = self.provider()
+        if provider == "webdav":
+            return WebDAVClient(self.settings()).test()
+        return S3Client(self.settings()).test()
+
+    def stats(self) -> dict[str, object]:
+        """远端存储概况（给图片管理页展示）。"""
+        settings = self.settings()
+        mode = _clean(settings.get("mode")) or "local"
+        try:
+            remote_count = store.count_image_records(remote_only=True)
+        except Exception:  # noqa: BLE001
+            remote_count = 0
+        return {
+            "enabled": bool(settings.get("enabled")),
+            "mode": mode,
+            "provider": self.provider(),
+            "remote_enabled": mode in {"remote", "both"},
+            "remote_count": remote_count,
+            "remote_cleanup_enabled": bool(settings.get("remote_cleanup_enabled")),
+            "remote_retention_hours": int(settings.get("remote_retention_hours") or 0),
+            "public_base_url": _clean(settings.get("public_base_url")),
+            "remote_root_path": _clean(settings.get("remote_root_path")),
+        }
+
+    # 旧接口名保留 —— 外部（api/system.py、前端）还在用
     def test_webdav(self) -> dict[str, object]:
-        return WebDAVClient(self.settings()).test()
+        return self.test_remote()
 
 
 image_storage_service = ImageStorageService()
