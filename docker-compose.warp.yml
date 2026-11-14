@@ -104,10 +104,12 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
-      # 默认 postgres（见下方 db 服务）。想换 SQLite / JSON：
-      # 在 .env 里改 STORAGE_BACKEND 与 DATABASE_URL，并删掉 app.depends_on 里的 db。
+      # 默认 postgres（见下方 db 服务）。想换 SQLite / JSON / 外部数据库：
+      # 建 docker-compose.override.yml 覆盖这两个变量。
+      # ⚠️ 数据库密码与 db 服务的 POSTGRES_PASSWORD 引用的是同一个变量，
+      #    改 .env 一处即可，两边不会不一致。
       STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatgpt2api}:${POSTGRES_PASSWORD:-chatgpt2api}@db:5432/${POSTGRES_DB:-chatgpt2api}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
 

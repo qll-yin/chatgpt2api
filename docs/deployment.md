@@ -50,9 +50,32 @@ cd chatgpt2api
 # 仓库里只提交脱敏的 config.example.json，先复制一份真实配置
 cp config.example.json config.json
 vi config.json          # 至少改掉 auth-key
+
+# 环境变量：端口、数据库密码、存储后端都在这里配
+cp .env.example .env
+vi .env                 # 至少改掉 CHATGPT2API_AUTH_KEY 和 POSTGRES_PASSWORD
 ```
 
-设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
+> ⚠️ **`docker-compose.yml` 不需要改** —— 所有可调项都走 `${VAR:-默认值}`，
+> 只改 `.env`。`git pull` 升级不会覆盖 `.env`。
+>
+> `DATABASE_URL` 里的密码与 db 服务的 `POSTGRES_PASSWORD` 引用的是**同一个变量**，
+> 所以改一处两边自动一致 —— 不会出现「连接串改了、容器密码没改」的认证失败。
+>
+> `.env` 里没有的值用 compose 的默认值兜底，所以不填也能跑（但密码是弱密码，
+> 上线前务必改）。
+
+需要个性化更多（比如连外部数据库）时，建一个 `docker-compose.override.yml`
+（不进版本库，compose 会自动合并）：
+
+```yaml
+services:
+  app:
+    environment:
+      DATABASE_URL: postgresql://user:password@external-host:5432/dbname
+```
+
+设置 `config.json` 中的 `auth-key`，或在 `.env` 中配置：
 
 ```yaml
 environment:
@@ -260,6 +283,10 @@ tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 git pull
 docker compose up -d --build
 ```
+
+> `git pull` **不会覆盖** `.env` 和 `config.json`（都在 `.gitignore` 里），
+> 也不会覆盖 `docker-compose.override.yml`（同样在 `.gitignore` 里）。
+> 升级后配置依然生效。
 
 查看状态：
 

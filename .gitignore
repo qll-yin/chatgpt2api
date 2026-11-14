@@ -21,6 +21,10 @@ docker-compose.local.yml
 .env
 .env.local
 
+# 本地 compose 覆盖（端口/密码/外部数据库等个人化配置，不进版本库）
+docker-compose.override.yml
+docker-compose.override.yaml
+
 # Database files
 *.db
 *.sqlite

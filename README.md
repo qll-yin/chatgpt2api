@@ -29,9 +29,25 @@ cd chatgpt2api
 cp config.example.json config.json
 vi config.json          # 至少改掉 auth-key
 
-# 2. 构建并启动
+# 2. 准备环境变量（compose 里所有可调项都走这里，改 .env 就行，compose 永远不用动）
+cp .env.example .env
+vi .env                 # 至少改掉 CHATGPT2API_AUTH_KEY 和 POSTGRES_PASSWORD
+
+# 3. 构建并启动
 docker compose up -d --build
 ```
+
+> **配置只改 `.env`，不用改 `docker-compose.yml`** ——
+> 端口、数据库密码、数据库名、存储后端全是 `${VAR:-默认值}`，
+> `.env` 里改完 `docker compose up -d` 就生效。
+> 而且 `DATABASE_URL` 里的密码和 db 服务的 `POSTGRES_PASSWORD`
+> 引用的是**同一个变量**，改一处两边自动一致（不会像手改 compose 那样出现
+> 「连接串改了、容器密码没改」导致认证失败）。
+>
+> `.env` 已在 `.gitignore` 里，`git pull` 升级不会覆盖它。
+>
+> 要连外部数据库或换端口？建一个 `docker-compose.override.yml`（同样不进版本库），
+> compose 会自动合并。
 
 > 默认会**同时起一个 Postgres 容器**（`chatgpt2api-db`）——
 > 生图任务状态、图片索引、标签这些写入非常频繁的数据走 Postgres，

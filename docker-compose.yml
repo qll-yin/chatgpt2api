@@ -14,7 +14,7 @@ services:
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
@@ -23,14 +23,24 @@ services:
       # 默认 postgres（见下方 db 服务，开箱即用）。
       # json    ：账号/密钥存 data/accounts.json（传统方式）
       # sqlite ：账号/密钥 + 运行态数据都进 SQLite（见 docker-compose.local.yml）
-      - STORAGE_BACKEND=postgres
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-postgres}
 
       # ── 数据库连接串 ──
       # 运行态数据（图片任务 / 图片索引 / 标签 / 可编辑文件任务 / 注册数据）
       # 无论 STORAGE_BACKEND 是什么都会走数据库 —— 所以这一项才是关键。
       # 未配置时回退到本地 SQLite：sqlite:////app/data/chatgpt2api.db
       # ⚠️ 注意是**四个**斜杠：sqlite:// + 绝对路径
-      - DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
+      #
+      # ⚠️ 密码直接引用 ${POSTGRES_PASSWORD} —— 和下面 db 服务的
+      #    POSTGRES_PASSWORD 是**同一个变量**，所以只改 .env 一处即可，
+      #    两边永远不会不一致（不一致的话 Postgres 认证会直接失败）。
+      #
+      #    ⚠️ 这里刻意**不写** ${DATABASE_URL:-...} 的外层包装 ——
+      #    嵌套插值（一个变量的默认值里再套变量）在不同 compose 版本上
+      #    行为不一致，解析失败时会原样留下 ${...} 字面量，导致连不上库。
+      #    平铺写死结构、每个变量独立，行为是确定的。
+      #    要连外部数据库 → 建 docker-compose.override.yml 覆盖这一行。
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-chatgpt2api}:${POSTGRES_PASSWORD:-chatgpt2api}@db:5432/${POSTGRES_DB:-chatgpt2api}
       # - DATABASE_URL=sqlite:////app/data/chatgpt2api.db
 
       # ── 注册功能的 sentinel ──
@@ -61,24 +71,33 @@ services:
   #   日均几万张图的量级下，Postgres 的并发写表现明显更稳。
   #
   # 换成 SQLite / JSON（不想多起一个容器）：
-  #   1. 把上面 STORAGE_BACKEND 改成 sqlite 或 json
-  #   2. 把 DATABASE_URL 换成 sqlite:////app/data/chatgpt2api.db 或删掉
-  #   3. 删掉 app.depends_on 和下面整个 db 服务
-  #   （或直接用 docker-compose.local.yml）
+  #   建 docker-compose.override.yml（不进版本库），写：
+  #     services:
+  #       app:
+  #         environment:
+  #           STORAGE_BACKEND: sqlite
+  #           DATABASE_URL: sqlite:////app/data/chatgpt2api.db
+  #     dependencies:
+  #       db:
+  #         condition: service_healthy
+  #   （或直接用 docker-compose.local.yml —— 那是现成的 SQLite 版）
   #
-  # ⚠️ 上线前记得改掉 POSTGRES_PASSWORD —— 它同时出现在 DATABASE_URL 里。
+  # 要连**外部** PostgreSQL：同样用 override 覆盖 app 的 DATABASE_URL 即可。
+  #
+  # ⚠️ 上线前务必在 .env 里改掉 POSTGRES_PASSWORD —— 默认值是弱密码。
+  #    改 .env 一处，DATABASE_URL 里引用的同一个变量会同步生效。
   db:
     image: postgres:16-alpine
     container_name: chatgpt2api-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: chatgpt2api
-      POSTGRES_PASSWORD: chatgpt2api
-      POSTGRES_DB: chatgpt2api
+      POSTGRES_USER: ${POSTGRES_USER:-chatgpt2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatgpt2api}
+      POSTGRES_DB: ${POSTGRES_DB:-chatgpt2api}
     volumes:
       - ./pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U chatgpt2api -d chatgpt2api"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatgpt2api} -d ${POSTGRES_DB:-chatgpt2api}"]
       interval: 5s
       timeout: 5s
       retries: 10
