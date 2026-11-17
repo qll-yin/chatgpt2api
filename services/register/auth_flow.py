@@ -73,6 +73,12 @@ class AuthResult:
         #   · user.groups / idp / picture 等 —— 排查账号状态时用得上。
         # 之前只提取了两个字段就丢弃了完整响应，这里补上。
         self.session_json: str = ""
+        # 这枚 refresh_token 是不是 Codex CLI 的 OAuth client 铸的。
+        #
+        # ⚠️ 必须记下来 —— OAuth grant 绑定 client_id，刷新时要用同一个：
+        #    codex 的 RT 用 platform 的 client_id 去刷 → invalid_grant。
+        #    判据是「哪个 client 换出来的」，不能靠猜。
+        self.codex_refresh_token: bool = False
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -90,6 +96,7 @@ class AuthResult:
             "cookie_header": self.cookie_header,
             "totp_secret": self.totp_secret,
             "session_json": self.session_json,
+            "codex_refresh_token": self.codex_refresh_token,
         }
 
 
@@ -854,6 +861,8 @@ class AuthFlow:
         self.result.id_token = data.get("id_token", self.result.id_token)
         self.result.access_token = data.get("access_token", self.result.access_token)
         self.result.refresh_token = data.get("refresh_token", self.result.refresh_token)
+        # 标记这枚 RT 是 codex client 铸的 —— 刷新时必须用同一个 client_id。
+        self.result.codex_refresh_token = True
         logger.info(
             "Codex OAuth 交换成功: access=%s refresh=%s",
             "有" if self.result.access_token else "无",

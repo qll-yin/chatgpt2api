@@ -29,9 +29,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from api.support import require_admin
-from services import register_service
+from services import register_service, reauth_service
 from services.storage import register_store as store
 
 
@@ -43,6 +44,16 @@ class ImportToPoolRequest(BaseModel):
     bind_proxy: str | None = None
     # 自动从静态代理池里挑（绑得少的优先），每个代理受 bind_max_uses 限制
     auto_bind: bool = False
+
+
+class ReauthorizeRequest(BaseModel):
+    """重新授权（刷新 401）。"""
+
+    email: str
+    # 本次授权走的出口代理。留空 = 沿用账号原来记的代理。
+    proxy: str = ""
+    # 单次尝试的上限（秒）
+    timeout: int = 300
 
 
 class ImportTextRequest(BaseModel):
@@ -347,6 +358,37 @@ def create_router() -> APIRouter:
         return register_service.import_token_text_to_pool(
             body.text, source_type=body.source_type
         )
+
+    @router.post("/api/register/reauthorize")
+    async def reauthorize_account(
+        body: ReauthorizeRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """重新授权一个账号（刷新 401 / 凭证失效）。
+
+        用账号库里已有的密码 + 2FA 重新走一次登录与 Codex 授权，
+        拿到新的 access_token / refresh_token / session 并写回注册结果表。
+
+        ⚠️ Codex 的 refresh_token 是单次使用 + 轮换制 —— 同一份凭证不能
+        同时给两个池用。谁先刷新谁活，另一个立刻 401。所以刷新完要把
+        新凭证重新导出给目标池。
+        """
+        require_admin(authorization)
+        try:
+            result = await run_in_threadpool(
+                reauth_service.reauthorize_registered_account,
+                body.email,
+                proxy=body.proxy,
+                timeout=body.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": result.get("error") or "重新授权失败", "result": result},
+            )
+        return {"result": result}
 
     @router.get("/api/register/proxies")
     async def proxies(authorization: str | None = Header(default=None)):

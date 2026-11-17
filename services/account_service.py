@@ -33,6 +33,13 @@ class AccountService:
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
+    # Codex CLI 的公开 OAuth client（无 client_secret，PKCE 保护）。
+    #
+    # ⚠️ codex 来源的账号必须用这个 client_id 刷新 —— OAuth grant 是绑定
+    #    client 的：用 platform 的 client_id 去刷 codex 的 refresh_token，
+    #    auth.openai.com 会直接返回 invalid_grant，那个号就永远刷不出来。
+    #    跟 services/register/auth_flow.py 的 _build_codex_authorize 保持一致。
+    _CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
     _OAUTH_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -353,10 +360,36 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
+    @classmethod
+    def _oauth_client_id_for(cls, account: dict | None) -> str:
+        """按账号来源选 OAuth client_id。
+
+        codex 来源（source_type / export_type = codex）用 Codex CLI 的公开
+        client，其余用 platform 的 client。用错了 refresh_token 一定
+        invalid_grant —— OAuth grant 绑定 client，不跨 client 通用。
+
+        兜底：source_type 没标对时，解 id_token / access_token 的 aud claim
+        反推是哪个 client 铸的（aud 就是 client_id）。
+        """
+        if account:
+            if cls._is_codex_account(account):
+                import os
+
+                return (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or cls._CODEX_OAUTH_CLIENT_ID
+            for key in ("id_token", "access_token"):
+                claims = cls._decode_jwt_payload(str(account.get(key) or ""))
+                aud = str(
+                    claims.get("aud") or claims.get("azp") or claims.get("client_id") or ""
+                ).strip()
+                if aud and aud == cls._CODEX_OAUTH_CLIENT_ID:
+                    return cls._CODEX_OAUTH_CLIENT_ID
+        return cls._OAUTH_CLIENT_ID
+
     def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
+        client_id = self._oauth_client_id_for(account)
         session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
         try:
             response = session.post(
@@ -369,7 +402,7 @@ class AccountService:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
+                    "client_id": client_id,
                 },
                 timeout=60,
             )
@@ -433,6 +466,9 @@ class AccountService:
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
+
+        # 凭证轮换后回写注册结果表（导出给别的池时别给出作废的 RT）
+        self._sync_registered_credentials(account, token_data)
 
         log_service.add(
             LOG_TYPE_ACCOUNT,
@@ -855,12 +891,60 @@ class AccountService:
         due_items: list[tuple[datetime, str]] = []
         with self._lock:
             for account in self._accounts.values():
+                # ⚠️ codex 账号不做 keepalive。
+                #    Codex 的 refresh_token 是**单次使用 + 轮换制** —— 每次刷新
+                #    服务端都会把旧的立即作废。keepalive 每 3 天主动刷一次，
+                #    等于定期把这份凭证从别的池（CPA / sub2api）手里抢走，
+                #    那边下一次用就 401。
+                #    codex 账号的 RT 归使用方管，本池只在 access_token 真的
+                #    快过期时才刷（那时不刷本池也活不了）。
+                if self._is_codex_account(account):
+                    continue
                 due_at = self._refresh_token_keepalive_due_at(account, now)
                 token = str(account.get("access_token") or "").strip()
                 if due_at is not None and token:
                     due_items.append((due_at, token))
         due_items.sort(key=lambda item: item[0])
         return [token for _, token in due_items[: self._REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE]]
+
+    @staticmethod
+    def _is_codex_account(account: dict | None) -> bool:
+        """账号是不是 codex 来源（RT 由 Codex CLI 的 client 铸造）。"""
+        if not account:
+            return False
+        source = str(account.get("source_type") or "").strip().lower()
+        export = str(account.get("export_type") or "").strip().lower()
+        return source == "codex" or export == "codex"
+
+    def _sync_registered_credentials(self, account: dict, token_data: dict) -> None:
+        """刷新成功后把新凭证回写到注册结果表。
+
+        为什么需要：注册结果表（reg_registered）是我们导出配置给 CPA /
+        sub2api 的数据源。refresh_token 轮换之后如果不同步，库里留的是
+        **已经作废的旧 RT** —— 用户再导出一次，拿到的还是死凭证。
+
+        只更新已存在的记录，不给外部导入的账号凭空造行。
+        """
+        email = str(account.get("email") or "").strip().lower()
+        if not email:
+            return
+        try:
+            from services.storage import register_store as reg_store
+
+            if not reg_store.get_registered(email):
+                return
+            reg_store.save_registered(
+                email=email,
+                access_token=str(token_data.get("access_token") or "").strip(),
+                refresh_token=str(token_data.get("refresh_token") or "").strip(),
+                id_token=str(token_data.get("id_token") or "").strip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "刷新后回写注册结果凭证失败",
+                {"email": email, "error": str(exc)},
+            )
 
     def keepalive_refresh_tokens(self, access_tokens: list[str]) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
@@ -1057,6 +1141,21 @@ class AccountService:
             access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token)
             return dict(account) if account else None
+
+    def get_account_by_email(self, email: str) -> dict | None:
+        """按邮箱找号池里的账号。
+
+        重新授权后 access_token 会变（号池以 token 为主键），需要靠邮箱
+        找到「原来那个号」才能把新凭证换上去。
+        """
+        key = str(email or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            for account in self._accounts.values():
+                if str(account.get("email") or "").strip().lower() == key:
+                    return dict(account)
+        return None
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。

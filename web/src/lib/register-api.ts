@@ -327,6 +327,37 @@ export async function fetchRegisteredDetail(email: string): Promise<{
   return httpRequest(`/api/register/registered/${encodeURIComponent(email)}`);
 }
 
+export type ReauthorizeResult = {
+  ok: boolean;
+  email: string;
+  error?: string;
+  /** 这次是否换到了 codex 的 refresh_token */
+  codex_refresh_token: boolean;
+  has_access_token: boolean;
+  has_refresh_token: boolean;
+  has_session: boolean;
+  proxy: string;
+  /** 是否已同步到号池 */
+  pool_updated: boolean;
+  elapsed?: number;
+};
+
+/**
+ * 重新授权（刷新 401）。
+ *
+ * ⚠️ Codex 的 refresh_token 是单次使用 + 轮换制 —— 同一份凭证不能同时
+ * 给两个池用。刷新完要把新凭证重新导出给目标池，否则那边还是 401。
+ */
+export async function reauthorizeRegisteredAccount(
+  email: string,
+  proxy = "",
+): Promise<{ result: ReauthorizeResult }> {
+  return httpRequest<{ result: ReauthorizeResult }>("/api/register/reauthorize", {
+    method: "POST",
+    body: { email, proxy },
+  });
+}
+
 export async function importRegisteredToPool(
   emails: string[],
   withProxy: boolean,

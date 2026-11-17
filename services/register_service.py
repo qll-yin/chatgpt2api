@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -105,6 +106,25 @@ def _build_env_overrides(options: dict[str, Any]) -> dict[str, str]:
 # ──────────────────────── 号码导入号池 ────────────────────────
 
 
+def _is_codex_record(record: dict | None) -> bool:
+    """这条注册记录的 refresh_token 是不是 Codex CLI 的 client 铸的。
+
+    ⚠️ 判断依据只能是「哪个 client 换出来的」（注册时记在 extra 里），
+    不能靠猜 —— OAuth grant 绑定 client_id，用错了刷新一定 invalid_grant。
+    """
+    if not record:
+        return False
+    extra = record.get("extra")
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    if isinstance(extra, dict) and extra.get("codex_refresh_token"):
+        return True
+    return str(record.get("source_type") or "").strip().lower() == "codex"
+
+
 def build_pool_payload(email: str, access_token: str, proxy: str = "") -> dict[str, Any]:
     """构造写入号池的账号载荷。
 
@@ -117,7 +137,9 @@ def build_pool_payload(email: str, access_token: str, proxy: str = "") -> dict[s
     payload: dict[str, Any] = {
         "access_token": str(access_token or "").strip(),
         "email": str(email or "").strip(),
-        "source_type": "register",
+        # codex 来源要标出来 —— 号池刷新时按它选 OAuth client_id，
+        # 标错会导致 refresh_token 一刷就 invalid_grant。
+        "source_type": "codex" if _is_codex_record(record) else "register",
     }
     refresh_token = str(record.get("refresh_token") or "").strip()
     if refresh_token:
@@ -240,7 +262,9 @@ def import_registered_to_pool(
         payload = {
             "access_token": access_token,
             "email": email,
-            "source_type": source_type,
+            # codex 来源自动纠正 —— 号池刷新时按 source_type 选 OAuth
+            # client_id，标错会导致 refresh_token 一刷就 invalid_grant。
+            "source_type": "codex" if _is_codex_record(record) else source_type,
         }
         refresh_token = str(record.get("refresh_token") or "").strip()
         if refresh_token:

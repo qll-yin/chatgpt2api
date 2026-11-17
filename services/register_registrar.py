@@ -567,6 +567,11 @@ def _do_register(
         run_proxy = str(options.get("proxy") or "").strip()
         if run_proxy:
             d["proxy"] = run_proxy
+        # 标记这枚 refresh_token 是 Codex CLI 的 client 铸出来的。
+        # 存进 extra（save_registered 会把未知键归到 extra_json）——
+        # 导入号池时要按它决定 source_type，刷新时也要按它选 client_id。
+        if bool(full.get("codex_refresh_token")):
+            d["codex_refresh_token"] = True
         # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
         db.save_registered(d)
         # ⚠️ 这里**不再**给 used_count +1：自动跑号时 pick_proxy() 选中代理

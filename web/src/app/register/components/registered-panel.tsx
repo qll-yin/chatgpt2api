@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Copy, Download, Eye, LoaderCircle, RefreshCw } from "lucide-react";
+import { AlertTriangle, Copy, Download, Eye, KeyRound, LoaderCircle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +16,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -28,8 +37,10 @@ import {
   fetchBindableProxies,
   fetchRegistered,
   fetchRegisteredDetail,
+  fetchRegisterProxies,
   importRegisteredToPool,
   markRegisteredAbnormal,
+  reauthorizeRegisteredAccount,
   type RegisteredItem,
   type RegisterProxy,
 } from "@/lib/register-api";
@@ -73,6 +84,17 @@ export function RegisteredPanel() {
   const [bindMode, setBindMode] = useState<"none" | "auto" | "manual">("none");
   const [bindProxy, setBindProxy] = useState("");
 
+  // ── 刷新 401（重新授权）──
+  const [reauthOpen, setReauthOpen] = useState(false);
+  const [reauthEmail, setReauthEmail] = useState("");
+  const [reauthing, setReauthing] = useState(false);
+  // 代理来源：沿用原代理 / 代理池里的静态代理 / 手填
+  const [reauthProxyMode, setReauthProxyMode] = useState<"keep" | "pool" | "manual">("keep");
+  const [reauthPoolProxy, setReauthPoolProxy] = useState("");
+  const [reauthManualProxy, setReauthManualProxy] = useState("");
+  // 代理池里所有启用的静态代理（刷新不占绑定名额，所以不能用 bindable 列表）
+  const [staticProxies, setStaticProxies] = useState<RegisterProxy[]>([]);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -104,6 +126,71 @@ export function RegisteredPanel() {
   useEffect(() => {
     void loadBindable();
   }, [loadBindable]);
+
+  // 刷新 401 时可选的静态代理（不按绑定名额过滤 —— 刷新不占名额）
+  const loadStaticProxies = useCallback(async () => {
+    try {
+      const data = await fetchRegisterProxies();
+      setStaticProxies(
+        (data.items || []).filter(
+          (p) => p.proxy_type === "static" && p.enabled && p.status !== "disabled",
+        ),
+      );
+    } catch {
+      setStaticProxies([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStaticProxies();
+  }, [loadStaticProxies]);
+
+  const openReauth = (email: string) => {
+    setReauthEmail(email);
+    setReauthProxyMode("keep");
+    setReauthPoolProxy("");
+    setReauthManualProxy("");
+    setReauthOpen(true);
+  };
+
+  const handleReauth = async () => {
+    if (!reauthEmail) return;
+    const proxy =
+      reauthProxyMode === "pool"
+        ? reauthPoolProxy
+        : reauthProxyMode === "manual"
+          ? reauthManualProxy.trim()
+          : "";
+    if (reauthProxyMode === "pool" && !proxy) {
+      toast.error("请选择一个静态代理");
+      return;
+    }
+    if (reauthProxyMode === "manual" && !proxy) {
+      toast.error("请填写代理地址");
+      return;
+    }
+    setReauthing(true);
+    try {
+      const { result } = await reauthorizeRegisteredAccount(reauthEmail, proxy);
+      if (result.codex_refresh_token) {
+        toast.success(
+          `已刷新 ${result.email}：拿到新的 codex 凭证` +
+            (result.proxy ? `（代理 ${result.proxy}）` : ""),
+        );
+      } else {
+        toast.warning(
+          `已刷新 ${result.email}，但没换到 codex 的 refresh_token` +
+            (result.error ? `：${result.error}` : ""),
+        );
+      }
+      setReauthOpen(false);
+      await load();
+    } catch (error) {
+      toast.error(`刷新失败：${(error as Error).message ?? error}`);
+    } finally {
+      setReauthing(false);
+    }
+  };
 
   const allSelected = items.length > 0 && items.every((i) => selected.has(i.email));
   const selectedCount = selected.size;
@@ -278,7 +365,7 @@ export function RegisteredPanel() {
                 <TableHead className="w-24">access_token</TableHead>
                 <TableHead className="w-24">refresh_token</TableHead>
                 <TableHead>代理</TableHead>
-                <TableHead className="w-20">详情</TableHead>
+                <TableHead className="w-40">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -323,15 +410,27 @@ export function RegisteredPanel() {
                       {item.proxy || "—"}
                     </TableCell>
                     <TableCell>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 whitespace-nowrap px-1.5 text-xs"
-                        onClick={() => void handleShowDetail(item.email)}
-                      >
-                        <Eye className="size-3.5" />
-                        查看
-                      </Button>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 whitespace-nowrap px-1.5 text-xs"
+                          onClick={() => void handleShowDetail(item.email)}
+                        >
+                          <Eye className="size-3.5" />
+                          查看
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 whitespace-nowrap px-1.5 text-xs text-amber-700 hover:text-amber-800"
+                          onClick={() => openReauth(item.email)}
+                          title="凭证失效（401）时重新授权，换一份新的 access_token / refresh_token"
+                        >
+                          <KeyRound className="size-3.5" />
+                          刷新401
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))
@@ -414,6 +513,105 @@ export function RegisteredPanel() {
           <DialogFooter>
             <Button variant="secondary" onClick={() => setDetailOpen(false)}>
               关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 刷新 401：重新授权 */}
+      <Dialog open={reauthOpen} onOpenChange={(v) => !reauthing && setReauthOpen(v)}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>刷新 401（重新授权）</DialogTitle>
+            <DialogDescription>
+              用账号库里已有的密码 + 2FA 重新走一次登录与 Codex 授权，
+              换一份新的 access_token / refresh_token / session。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <Label>账号</Label>
+              <Input value={reauthEmail} readOnly className="bg-muted/40" />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label>本次授权使用的代理</Label>
+              <Select
+                value={reauthProxyMode}
+                onValueChange={(v) =>
+                  setReauthProxyMode(v as "keep" | "pool" | "manual")
+                }
+              >
+                <SelectTrigger className="h-9 rounded-xl border-stone-200 bg-white dark:border-stone-700 dark:bg-transparent">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="keep">沿用账号原来的代理</SelectItem>
+                  <SelectItem value="pool">从代理池选一个静态代理</SelectItem>
+                  <SelectItem value="manual">手动输入代理</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {reauthProxyMode === "pool" ? (
+              <div className="space-y-1.5">
+                <Label>静态代理</Label>
+                {staticProxies.length === 0 ? (
+                  <p className="text-xs text-amber-600">
+                    代理池里没有启用的静态代理，先到「代理池」添加。
+                  </p>
+                ) : (
+                  <Select value={reauthPoolProxy} onValueChange={setReauthPoolProxy}>
+                    <SelectTrigger className="h-9 rounded-xl border-stone-200 bg-white dark:border-stone-700 dark:bg-transparent">
+                      <SelectValue placeholder="选择一个静态代理" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {staticProxies.map((p) => (
+                        <SelectItem key={p.proxy} value={p.proxy}>
+                          {p.proxy}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+            ) : null}
+
+            {reauthProxyMode === "manual" ? (
+              <div className="space-y-1.5">
+                <Label>代理地址</Label>
+                <Input
+                  value={reauthManualProxy}
+                  onChange={(e) => setReauthManualProxy(e.target.value)}
+                  placeholder="http://user:pass@host:port 或 socks5://host:port"
+                  className="h-9 rounded-xl border-stone-200 bg-white dark:border-stone-700 dark:bg-transparent"
+                />
+              </div>
+            ) : null}
+
+            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-6 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              ⚠️ Codex 的 refresh_token 是单次使用 + 轮换制 —— 同一份凭证不能同时给
+              两个号池用。刷新完请把新配置重新导出给目标池，否则那边还是 401。
+              刷新需要该账号在注册时设置过密码（密码 + 2FA 可自动通过）。
+            </p>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              onClick={() => setReauthOpen(false)}
+              disabled={reauthing}
+            >
+              取消
+            </Button>
+            <Button onClick={() => void handleReauth()} disabled={reauthing}>
+              {reauthing ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <RefreshCw className="size-4" />
+              )}
+              {reauthing ? "重新授权中…" : "开始刷新"}
             </Button>
           </DialogFooter>
         </DialogContent>

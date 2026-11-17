@@ -7,8 +7,11 @@
 + [新增] 远端上传失败自动降级存到本机并返回本机链接（不再抛异常打断出图），失败原因记录在图片索引的 `remote_error`。
 + [新增] 注册管理页：内置批量注册（邮箱来源、代理池、并发/目标/冷却/验证码超时、实时日志）、Remail 订单管理、注册成功自动写入「号池管理」并携带注册时使用的代理、号池自动补充守护进程。
 + [新增] 批量注册新增「失败重试次数」（默认 3）：一个完整注册流程算 1 次（流程内部撞 409 重建会话那种重试不额外计数），失败后同一个 worker 换个条件再跑 N 遍，都不行才停掉这个 worker —— 出口 IP 被拦时不再一次失败就收工。
++ [新增] 注册结果列表新增「刷新401」操作项：点开弹窗可选择**沿用原代理 / 从代理池选一个静态代理 / 手动填代理**，用账号库里已有的密码 + 2FA 重新走一次登录与 Codex 授权，换一份新的 access_token / refresh_token / session 写回注册结果表并同步号池。
 + [优化] 图片存储配置正交化为「mode（本地开关）× provider（远端协议）」，老配置（`mode=webdav` / `mode=both`）自动映射，**已有 WebDAV 配置无需修改**；`webdav_root_path` 更名为 `remote_root_path`（两协议共用），公开访问前缀与远端目录解耦 —— 目录由程序自动拼接，不再需要两处维护。
 + [优化] 图片索引表补齐远端相关字段（`remote` / `remote_provider` / `remote_error` / `remote_uploaded_at` / `remote_uploaded_ts`），老数据自动迁移；修复 `created_at` 非空列缺默认值导致调用方漏传即 500 的问题。
++ [修复] Codex 账号的 refresh_token 刷新一律 invalid_grant —— OAuth grant 绑定 client_id，codex 的 RT 之前被用 platform 的 client（`app_2SKx67...`）去刷，改为按账号来源分流（codex 用 `app_EMoamEEZ...`）；同时 keepalive 不再刷 codex 账号（codex 的 RT 是单次使用 + 轮换制，keepalive 会把凭证从别的池手里抢走）。
++ [修复] 刷新凭证后把新凭证回写注册结果表 —— RT 轮换后不同步的话，导出的还是已作废的旧凭证。
 + [优化] 修复 SQLite 连接池并发缺陷：文件库从全进程共用单连接改为真正的连接池，避免多 worker 批量注册时随机出现 `IndexError` / 状态错乱。
 + [优化] Docker 镜像：补 `ca-certificates`；启动命令加 `--frozen --no-dev`，避免容器每次启动都联网同步 dev 依赖（无外网时会导致启动失败）。
 + [优化] 前端：注册管理页 UI 重做（粘性标签栏、加宽布局）、移除「无限画布」入口、全站容器与弹窗加宽。
