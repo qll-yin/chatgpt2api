@@ -35,6 +35,7 @@ import {
   stopBatchRegister,
   type BatchStatus,
   type MailProvider,
+  type PoolProxyMode,
 } from "@/lib/register-api";
 
 type LogLine = {
@@ -67,6 +68,10 @@ export function BatchRegisterPanel() {
   const [want2fa, setWant2fa] = useState(false);
   const [autoImport, setAutoImport] = useState(true);
   const [withProxy, setWithProxy] = useState(true);
+  // 入池代理模式：none / register / static
+  // ⚠️ 动态代理永远不会进号池 —— 出口 IP 每次变，账号用起来更容易触发
+  //    风控，还会把代理服务商的流量包耗光。
+  const [poolProxyMode, setPoolProxyMode] = useState<PoolProxyMode>("static");
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logIdRef = useRef(0);
@@ -234,6 +239,7 @@ export function BatchRegisterPanel() {
         otp_timeout: Number(otpTimeout) || 180,
         auto_import: autoImport,
         with_proxy: withProxy,
+        pool_proxy_mode: poolProxyMode,
         // ⚠️ 不能用 `|| 3` —— 那会把「0 = 不重试」覆盖掉。
         max_retries: Math.max(0, Math.min(20, Number(maxRetries) || 0)),
       });
@@ -397,11 +403,17 @@ export function BatchRegisterPanel() {
                 注册成功后自动导入号池管理
               </label>
               <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={withProxy}
-                  onCheckedChange={(v) => setWithProxy(Boolean(v))}
-                />
-                入池时携带注册所用代理
+                <span className="text-muted-foreground">入池代理</span>
+                <select
+                  className="h-9 rounded-lg border border-stone-200 bg-white px-2 text-sm text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
+                  value={poolProxyMode}
+                  onChange={(e) => setPoolProxyMode(e.target.value as PoolProxyMode)}
+                  title="注册用动态代理防风控；入池改绑静态代理，账号出口 IP 固定。动态代理不会进号池。"
+                >
+                  <option value="static">入池时携带静态代理</option>
+                  <option value="register">入池时携带注册所用代理</option>
+                  <option value="none">入池不带代理</option>
+                </select>
               </label>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox

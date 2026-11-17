@@ -227,5 +227,64 @@ class WorkerRetryLoopTests(unittest.TestCase):
         self.assertEqual(len(runs), 6)
 
 
+class ProxyWaitTests(unittest.TestCase):
+    """代理池暂时拿不到代理时，要等，而不是立刻收工。
+
+    ⚠️ 用户实测现象：「成功 1 / 失败 0，然后就停了」。
+       根因就是 pick_proxy() 选中即预占（used_count+1），并发 worker 数超过
+       代理数时，后面的 worker 暂时拿不到代理 —— 之前直接 return，
+       整个批次被停掉且**失败数不记账**。
+    """
+
+    def _controller(self):
+        ctrl = register_batch.AutoLoopController()
+        ctrl._proxy_wait_secs = 5
+        ctrl._stop_event = __import__("threading").Event()
+        ctrl._pause_event = __import__("threading").Event()
+        ctrl._lock = __import__("threading").RLock()
+        ctrl._options = {"batch_id": "b1"}
+        ctrl._state = register_batch.AutoLoopState.RUNNING
+        ctrl._last_message = ""
+        ctrl._subscribers = []
+        return ctrl
+
+    def test_returns_proxy_once_it_becomes_available(self):
+        ctrl = self._controller()
+        calls = {"n": 0}
+
+        def fake_pick(worker_id):
+            calls["n"] += 1
+            return "http://p:1" if calls["n"] >= 2 else ""
+
+        with mock.patch.object(ctrl, "_proxy_for_worker", side_effect=fake_pick):
+            proxy = ctrl._wait_for_proxy(0)
+        self.assertEqual(proxy, "http://p:1")
+
+    def test_returns_empty_after_waiting(self):
+        ctrl = self._controller()
+        with mock.patch.object(ctrl, "_proxy_for_worker", return_value=""):
+            proxy = ctrl._wait_for_proxy(0)
+        self.assertEqual(proxy, "")
+
+    def test_stops_immediately_when_stop_event_set(self):
+        ctrl = self._controller()
+        ctrl._stop_event.set()
+        with mock.patch.object(ctrl, "_proxy_for_worker", return_value=""):
+            proxy = ctrl._wait_for_proxy(0)
+        self.assertEqual(proxy, "")
+
+
+class StoppedCategoryTests(unittest.TestCase):
+    """被停止的 run 不该算失败、更不该触发重试。"""
+
+    def test_wait_run_finish_returns_stopped_sentinel(self):
+        ctrl = register_batch.AutoLoopController()
+        ctrl._stop_event = __import__("threading").Event()
+        ctrl._stop_event.set()
+        ok, category = ctrl._wait_run_finish("run-x", timeout=1)
+        self.assertFalse(ok)
+        self.assertEqual(category, register_batch.STOPPED_CATEGORY)
+
+
 if __name__ == "__main__":
     unittest.main()

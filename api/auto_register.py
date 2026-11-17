@@ -26,6 +26,10 @@ class AutoRegisterSettingsRequest(BaseModel):
     register_options: dict | None = None
     cooldown_minute: int | None = None
     max_retries: int | None = None
+    # 剩余额度阈值（0 = 不启用这个维度）。判定是「或」关系。
+    quota_threshold: int | None = None
+    # 入池绑什么代理：none / register / static
+    pool_proxy_mode: str | None = None
 
 
 def create_router() -> APIRouter:

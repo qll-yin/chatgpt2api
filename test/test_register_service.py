@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from test.db_fixture import use_temp_database
 
@@ -39,9 +40,11 @@ class RegisterPoolImportTests(unittest.TestCase):
             proxy=proxy,
         )
 
-    def test_import_with_proxy(self):
-        self._make_registered("a@x.com", "AT_A", proxy="socks5://u:p@h:1")
-        result = rs.import_registered_to_pool(["a@x.com"], with_proxy=True)
+    def test_import_with_static_proxy(self):
+        """静态代理可以入池（代理池里登记过的静态代理）。"""
+        self._make_registered("a@x.com", "AT_A", proxy="http://static:1")
+        with mock.patch.object(store, "is_static_proxy", return_value=True):
+            result = rs.import_registered_to_pool(["a@x.com"], with_proxy=True)
         self.assertEqual(result["imported"], 1)
         self.assertEqual(result["missing"], [])
 
@@ -49,7 +52,24 @@ class RegisterPoolImportTests(unittest.TestCase):
 
         items = {i["email"]: i for i in account_service.list_accounts()}
         self.assertIn("a@x.com", items)
-        self.assertEqual(items["a@x.com"].get("proxy"), "socks5://u:p@h:1")
+        self.assertEqual(items["a@x.com"].get("proxy"), "http://static:1")
+
+    def test_import_drops_dynamic_proxy(self):
+        """⚠️ 动态代理不能进号池。
+
+        出口 IP 每次变 → 账号用起来更容易触发使用侧风控，
+        还会把代理服务商的流量包耗光（用户实测：自动补充沿用注册用的
+        动态代理，流量直接被吃光）。所以这里按空代理入池。
+        """
+        self._make_registered("dyn@x.com", "AT_DYN", proxy="socks5://u:p@h:1")
+        with mock.patch.object(store, "is_static_proxy", return_value=False):
+            result = rs.import_registered_to_pool(["dyn@x.com"], with_proxy=True)
+        self.assertEqual(result["imported"], 1)
+
+        from services.account_service import account_service
+
+        items = {i["email"]: i for i in account_service.list_accounts()}
+        self.assertEqual(items["dyn@x.com"].get("proxy"), "")
 
     def test_import_without_proxy(self):
         self._make_registered("b@x.com", "AT_B", proxy="socks5://u:p@h:2")
@@ -94,18 +114,31 @@ class RegisterPoolImportTests(unittest.TestCase):
         items = {i["email"]: i for i in account_service.list_accounts()}
         self.assertEqual(items["d@x.com"].get("refresh_token"), "RT_D")
 
-    def test_text_import_with_proxy_format(self):
-        result = rs.import_token_text_to_pool(
-            "AT_TEXT_1----socks5://a:b@c:2\nAT_TEXT_2"
-        )
+    def test_text_import_with_static_proxy_format(self):
+        """静态代理按原格式带入池。"""
+        with mock.patch.object(store, "is_static_proxy", return_value=True):
+            result = rs.import_token_text_to_pool(
+                "AT_TEXT_1----http://static:2\nAT_TEXT_2"
+            )
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["imported"], 2)
 
         from services.account_service import account_service
 
         items = {i["access_token"]: i for i in account_service.list_accounts()}
-        self.assertEqual(items["AT_TEXT_1"].get("proxy"), "socks5://a:b@c:2")
+        self.assertEqual(items["AT_TEXT_1"].get("proxy"), "http://static:2")
         self.assertEqual(items["AT_TEXT_2"].get("proxy"), "")
+
+    def test_text_import_drops_dynamic_proxy(self):
+        """⚠️ 文本导入里的动态代理也要拦 —— 一律按空代理入池并计数。"""
+        with mock.patch.object(store, "is_static_proxy", return_value=False):
+            result = rs.import_token_text_to_pool("AT_TEXT_1----socks5://a:b@c:2")
+        self.assertEqual(result["dropped_dynamic"], 1)
+
+        from services.account_service import account_service
+
+        items = {i["access_token"]: i for i in account_service.list_accounts()}
+        self.assertEqual(items["AT_TEXT_1"].get("proxy"), "")
 
     def test_text_import_skips_comments_and_blanks(self):
         result = rs.import_token_text_to_pool(

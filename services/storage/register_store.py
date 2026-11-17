@@ -970,6 +970,29 @@ def find_proxy(proxy: str) -> Optional[dict[str, Any]]:
         return _proxy_to_dict(row) if row is not None else None
 
 
+def is_static_proxy(proxy: str) -> bool:
+    """判断一个代理是不是「允许入池」的静态代理。
+
+    ⚠️ 入池铁律：**动态代理一律不能进号池**
+    ------------------------------------------
+    动态代理的出口 IP 每次连接都变。把它绑到号池账号上，等于没绑 ——
+    账号每次生图都换出口 IP，反而更容易触发使用侧风控；而且代理服务商的
+    流量包会被账号的日常生图消耗掉（用户实测：自动补充时沿用了注册用的
+    动态代理，流量直接被吃光）。
+
+    判定规则：
+      · 在代理池里登记过，且 proxy_type != "dynamic" → 静态代理 ✓
+      · 在代理池里登记过，但 proxy_type == "dynamic" → 动态代理 ✗
+      · **没登记过** → 保守视为动态 ✗
+        （宁可不绑也不能把来路不明的动态代理放进号池；
+          想要代理入池，先在代理池里登记并标记为「静态」）
+    """
+    row = find_proxy(proxy)
+    if row is None:
+        return False
+    return str(row.get("proxy_type") or "static").strip().lower() != "dynamic"
+
+
 def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
     """批量导入代理。
 

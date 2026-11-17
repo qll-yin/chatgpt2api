@@ -36,6 +36,12 @@ from services import register_service, reauth_service
 from services.storage import register_store as store
 
 
+class AccessTokensRequest(BaseModel):
+    """批量取 access_token 的请求体（批量复制用）。"""
+
+    emails: list[str]
+
+
 class ImportToPoolRequest(BaseModel):
     emails: list[str]
     # True → 按 access_token----proxy 带代理入池；False → 只入 access_token
@@ -44,6 +50,13 @@ class ImportToPoolRequest(BaseModel):
     bind_proxy: str | None = None
     # 自动从静态代理池里挑（绑得少的优先），每个代理受 bind_max_uses 限制
     auto_bind: bool = False
+    # 入池代理模式（明确优先于 with_proxy）：
+    #   none    → 不带代理入池
+    #   register→ 沿用注册时的代理（**必须是登记过的静态代理**）
+    #   static  → 从静态代理池分配
+    # ⚠️ 动态代理永远不能进号池 —— 出口 IP 每次变，账号用起来更容易触发
+    #    风控，还会把代理服务商的流量包耗光。
+    proxy_mode: str | None = None
 
 
 class ReauthorizeRequest(BaseModel):
@@ -186,7 +199,10 @@ class BatchStartRequest(BaseModel):
     want_2fa: bool = False
     otp_timeout: int = 180
     auto_import: bool = True          # 注册成功自动导入号池
-    with_proxy: bool = True           # 入池时是否带代理
+    with_proxy: bool = True           # 入池时是否带代理（老参数，proxy_mode 优先）
+    # 入池代理模式：none / register / static（默认沿用注册代理）
+    # ⚠️ 动态代理不会进号池 —— 沿用注册代理时若那是动态代理，按空代理入池。
+    pool_proxy_mode: str = ""
     # worker 级重试：整个流程失败后，同一个 worker 再跑几遍（0-20，默认 3）。
     # ⚠️ 这是**按整个流程**算的 —— 流程内部撞 409 重建会话那种重试不额外计数。
     max_retries: int = 3
@@ -330,6 +346,39 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "账号不存在"})
         return {"item": record}
 
+    @router.post("/api/register/registered/access-tokens")
+    async def registered_access_tokens(
+        body: AccessTokensRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        """批量取选中账号的 access_token（用于「批量复制」）。
+
+        列表接口只返回 `has_access_token` 布尔值（不泄露凭证），
+        所以复制要单独走这个接口一次拿全 —— 比前端循环 N 次详情请求快得多。
+
+        同时返回 proxy，方便直接复制成 `access_token----proxy` 的
+        导入格式（导入其它号池时用）。
+        """
+        require_admin(authorization)
+        emails = [str(e or "").strip().lower() for e in (body.emails or [])]
+        emails = [e for e in emails if e]
+        if not emails:
+            raise HTTPException(status_code=400, detail={"error": "请至少选择一个账号"})
+        items: list[dict[str, object]] = []
+        for email in emails[:500]:
+            record = store.get_registered(email)
+            if not record:
+                continue
+            token = str(record.get("access_token") or "").strip()
+            if not token:
+                continue
+            items.append({
+                "email": email,
+                "access_token": token,
+                "proxy": str(record.get("proxy") or "").strip(),
+            })
+        return {"items": items, "missing": [e for e in emails if e not in {i["email"] for i in items}]}
+
     @router.post("/api/register/import-to-pool")
     async def import_to_pool(
         body: ImportToPoolRequest,
@@ -344,6 +393,7 @@ def create_router() -> APIRouter:
             with_proxy=body.with_proxy,
             bind_proxy=body.bind_proxy,
             auto_bind=body.auto_bind,
+            proxy_mode=body.proxy_mode or "",
         )
 
     @router.post("/api/register/import-text")

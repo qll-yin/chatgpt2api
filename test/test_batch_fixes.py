@@ -90,7 +90,9 @@ class WorkerPoolImportTests(unittest.TestCase):
             register_service,
             "import_to_pool_with_refresh",
             return_value={"imported": 1, "skipped": 0},
-        ) as patched:
+        ) as patched, mock.patch.object(
+            store, "is_static_proxy", return_value=True
+        ):
             ok = self.controller._import_to_pool({"email": "w@x.com"}, "http://p:1")
 
         self.assertTrue(ok)

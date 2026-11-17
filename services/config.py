@@ -75,6 +75,9 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
 DEFAULT_AUTO_REGISTER = {
     "enabled": False,
     "threshold": 10,            # 可用账号数低于此值触发注册
+    # 剩余额度阈值（0 = 不启用这个维度）。与号池管理页「剩余额度」同口径。
+    # 判定是「或」关系：账号数达标但额度不达标 → 同样触发。
+    "quota_threshold": 0,
     "target_batch": 20,         # 每次注册的目标成功数
     "check_interval_minute": 30,  # 检查间隔（分钟）
     "concurrency": 3,           # 触发的批量注册并发数
@@ -85,6 +88,10 @@ DEFAULT_AUTO_REGISTER = {
     # 批量控制器，出口 IP 不通时同样需要重试 —— 否则一次 CF 拦截就
     # 白烧一批付费邮箱然后收工。
     "max_retries": 3,
+    # 入池绑什么代理：none / register / static。
+    # ⚠️ 默认 static —— 补进来的号要长期用，绝不能带注册用的动态代理
+    #    （出口 IP 每次变 → 账号更容易触发风控 + 代理流量被耗光）。
+    "pool_proxy_mode": "static",
 }
 
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
@@ -423,7 +430,26 @@ def _normalize_auto_register_settings(value: object) -> dict[str, object]:
         "register_options": options if isinstance(options, dict) else {},
         "cooldown_minute": _int("cooldown_minute", 0, 10080),
         "max_retries": _int("max_retries", 0, 20),
+        # 剩余额度阈值（0 = 不启用这个维度）
+        "quota_threshold": _int("quota_threshold", 0, 100000000),
+        # 入池代理模式：none / register / static（其它值退回默认）
+        "pool_proxy_mode": _normalize_pool_proxy_mode(
+            source.get("pool_proxy_mode"), str(default["pool_proxy_mode"])
+        ),
     }
+
+
+def _normalize_pool_proxy_mode(value: object, fallback: str = "static") -> str:
+    """归一化「入池代理模式」。
+
+    none    → 不带代理入池
+    register→ 沿用注册时的代理（必须是登记过的静态代理）
+    static  → 从静态代理池分配
+    """
+    text = str(value or "").strip().lower()
+    if text in {"none", "register", "static"}:
+        return text
+    return fallback
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:

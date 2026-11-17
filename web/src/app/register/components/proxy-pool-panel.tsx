@@ -55,6 +55,7 @@ import {
   type RegisterProxy,
   type RegisterProxyStats,
 } from "@/lib/register-api";
+import { copyTextWithToast } from "@/lib/clipboard";
 
 const statusMeta: Record<
   string,
@@ -87,6 +88,8 @@ export function ProxyPoolPanel() {
   const [clearOpen, setClearOpen] = useState(false);
   // proxy -> 测试结果
   const [testResults, setTestResults] = useState<Record<string, ProxyTestResult>>({});
+  // 正在测试中的代理（显示转圈动画，不覆盖已有结果）
+  const [testingProxies, setTestingProxies] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -132,28 +135,41 @@ export function ProxyPoolPanel() {
 
   const copyAll = async () => {
     const content = items.map((p) => p.proxy).join("\n");
-    try {
-      await navigator.clipboard.writeText(content);
-      toast.success(`已复制 ${items.length} 个代理`);
-    } catch {
-      toast.error("复制失败，请手动选中文本框内容");
-    }
+    await copyTextWithToast(content, "代理列表", `已复制 ${items.length} 个代理`);
   };
 
   const runTest = async (targets: string[]) => {
     if (targets.length === 0) return;
-    setTestResults((prev) => {
-      const next = { ...prev };
-      for (const p of targets) next[p] = { ok: false };
+    // ⚠️ 这里**不能**乐观更新成 {ok:false}。
+    //    之前就是这么写的 → 点一下「测试」，连通性列**瞬间全变「失败」**，
+    //    要等请求回来才显示真实结果。用户看到的不是「正在测」，
+    //    而是「刚点就坏了」。改成独立的「测试中」状态 + 转圈动画。
+    setTestingProxies((prev) => {
+      const next = new Set(prev);
+      targets.forEach((t) => next.add(t));
       return next;
     });
     try {
       const data = await testRegisterProxies(targets);
       setTestResults((prev) => ({ ...prev, ...(data.results || {}) }));
       const okCount = Object.values(data.results || {}).filter((r) => r.ok).length;
-      toast.success(`连通测试完成：${okCount} / ${targets.length} 个正常`);
+      const failed = targets.length - okCount;
+      if (okCount > 0) {
+        toast.success(`连通测试完成：${okCount} / ${targets.length} 个正常`);
+      } else {
+        toast.error(`连通测试完成：${targets.length} 个全部失败`);
+      }
+      if (failed > 0 && okCount > 0) {
+        toast.warning(`${failed} 个代理不通`);
+      }
     } catch (error) {
       toast.error(`测试失败：${(error as Error).message ?? error}`);
+    } finally {
+      setTestingProxies((prev) => {
+        const next = new Set(prev);
+        targets.forEach((t) => next.delete(t));
+        return next;
+      });
     }
   };
 
@@ -526,7 +542,12 @@ export function ProxyPoolPanel() {
                         )}
                       </TableCell>
                       <TableCell className="text-xs">
-                        {!result ? (
+                        {testingProxies.has(p.proxy) ? (
+                          <span className="inline-flex items-center gap-1 text-muted-foreground">
+                            <LoaderCircle className="size-3 animate-spin" />
+                            测试中
+                          </span>
+                        ) : !result ? (
                           <span className="text-muted-foreground">未测</span>
                         ) : result.ok ? (
                           <span className="text-green-700 dark:text-green-400">
@@ -549,7 +570,11 @@ export function ProxyPoolPanel() {
                             size="sm"
                             className="h-7 whitespace-nowrap px-1.5 text-xs"
                             onClick={() => void runTest([p.proxy])}
+                            disabled={testingProxies.has(p.proxy)}
                           >
+                            {testingProxies.has(p.proxy) ? (
+                              <LoaderCircle className="size-3 animate-spin" />
+                            ) : null}
                             测试
                           </Button>
                           <Button

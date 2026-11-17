@@ -154,6 +154,12 @@ export type BatchStartOptions = {
   auto_import: boolean;
   with_proxy: boolean;
   /**
+   * 入池代理模式：none / register / static（默认 static）。
+   * ⚠️ 动态代理永远不会进号池 —— 选「register」时若注册代理是动态的，
+   *    会按空代理入池。
+   */
+  pool_proxy_mode: PoolProxyMode;
+  /**
    * worker 级重试次数（不含首次尝试）。
    * 一个完整注册流程算 1 次；失败后同一个 worker 再跑 N 遍，
    * 都不行才停掉这个 worker。0 = 不重试（失败一次就换号继续）。
@@ -164,7 +170,7 @@ export type BatchStartOptions = {
 // 单次注册没有「重试次数」这个概念 —— 重试是 worker 级的。
 export type RegisterOnceOptions = Omit<
   BatchStartOptions,
-  "concurrency" | "target_count" | "cool_down_seconds" | "max_retries"
+  "concurrency" | "target_count" | "cool_down_seconds" | "max_retries" | "pool_proxy_mode"
 >;
 
 export type ImportToPoolResult = {
@@ -261,6 +267,14 @@ export type AutoRegisterSettings = {
   cooldown_minute: number;
   /** worker 级重试次数（不含首次尝试）—— 出口 IP 不通时同一 worker 再跑几遍 */
   max_retries: number;
+  /**
+   * 剩余额度阈值（0 = 不启用这个维度）。
+   * 与号池管理页「剩余额度」指标同口径（status=正常 的账号 quota 之和）。
+   * 判定是「或」关系：账号数达标但额度不达标 → 同样触发。
+   */
+  quota_threshold: number;
+  /** 入池绑什么代理：none / register / static。动态代理不会进号池。 */
+  pool_proxy_mode: PoolProxyMode;
 };
 
 export type AutoRegisterState = {
@@ -306,6 +320,16 @@ export async function fetchRegistered(
   return httpRequest<{ items: RegisteredItem[]; total: number }>(
     `/api/register/registered?limit=${limit}&offset=${offset}`,
   );
+}
+
+export async function fetchRegisteredAccessTokens(emails: string[]): Promise<{
+  items: { email: string; access_token: string; proxy: string }[];
+  missing: string[];
+}> {
+  return httpRequest("/api/register/registered/access-tokens", {
+    method: "POST",
+    body: { emails },
+  });
 }
 
 export async function fetchRegisteredDetail(email: string): Promise<{
@@ -358,10 +382,19 @@ export async function reauthorizeRegisteredAccount(
   });
 }
 
+/**
+ * 入池代理模式。
+ *
+ * ⚠️ 铁律：**动态代理永远不会进号池**（出口 IP 每次变 → 账号更容易触发
+ *    使用侧风控，还会把代理服务商的流量包耗光）。
+ *    选「沿用注册代理」时，若那个注册代理是动态的，会自动按空代理入池。
+ */
+export type PoolProxyMode = "none" | "register" | "static";
+
 export async function importRegisteredToPool(
   emails: string[],
   withProxy: boolean,
-  options?: { bindProxy?: string; autoBind?: boolean },
+  options?: { bindProxy?: string; autoBind?: boolean; proxyMode?: PoolProxyMode },
 ): Promise<ImportToPoolResult> {
   return httpRequest<ImportToPoolResult>("/api/register/import-to-pool", {
     method: "POST",
@@ -370,6 +403,7 @@ export async function importRegisteredToPool(
       with_proxy: withProxy,
       bind_proxy: options?.bindProxy || null,
       auto_bind: Boolean(options?.autoBind),
+      proxy_mode: options?.proxyMode || null,
     },
   });
 }

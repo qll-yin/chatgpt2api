@@ -62,6 +62,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
+import { copyTextWithToast } from "@/lib/clipboard";
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
   { label: "全部状态", value: "all" },
@@ -881,8 +882,7 @@ function AccountsPageContent() {
                     type="button"
                     className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
                     onClick={() => {
-                      void navigator.clipboard.writeText(model.id);
-                      toast.success("模型名已复制");
+                      void copyTextWithToast(model.id, "模型名");
                     }}
                     title={`点击复制 ${model.id}`}
                   >
@@ -1089,8 +1089,7 @@ function AccountsPageContent() {
                               type="button"
                               className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => {
-                                void navigator.clipboard.writeText(account.access_token);
-                                toast.success("token 已复制");
+                                void copyTextWithToast(account.access_token, "token");
                               }}
                             >
                               <Copy className="size-4" />

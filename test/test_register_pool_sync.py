@@ -162,11 +162,12 @@ class BatchPoolImportTests(unittest.TestCase):
             "run-import-1", "done", email="real@remail.local"
         )
 
-        ok = self.controller._import_to_pool(
-            {"email": "remail_placeholder_123@placeholder.local"},
-            "http://proxy-1:8080",
-            "run-import-1",
-        )
+        with mock.patch.object(store, "is_static_proxy", return_value=True):
+            ok = self.controller._import_to_pool(
+                {"email": "remail_placeholder_123@placeholder.local"},
+                "http://proxy-1:8080",
+                "run-import-1",
+            )
         self.assertTrue(ok)
 
         from services.account_service import account_service
@@ -177,14 +178,30 @@ class BatchPoolImportTests(unittest.TestCase):
         # 入池要携带注册时用的代理 —— 注册和使用同一个出口 IP
         self.assertEqual(items["real@remail.local"].get("proxy"), "http://proxy-1:8080")
 
-    def test_import_carries_proxy(self):
+    def test_import_carries_static_proxy(self):
+        """静态代理随账号一起入池。"""
         store.save_registered(email="p@x.com", access_token="AT-P")
-        self.controller._import_to_pool({"email": "p@x.com"}, "socks5://u:p@h:9", "run-x")
+        with mock.patch.object(store, "is_static_proxy", return_value=True):
+            self.controller._import_to_pool({"email": "p@x.com"}, "http://static:9", "run-x")
 
         from services.account_service import account_service
 
         items = {i["email"]: i for i in account_service.list_accounts()}
-        self.assertEqual(items["p@x.com"].get("proxy"), "socks5://u:p@h:9")
+        self.assertEqual(items["p@x.com"].get("proxy"), "http://static:9")
+
+    def test_import_drops_dynamic_proxy(self):
+        """⚠️ 动态代理不进号池 —— 按空代理入池。
+
+        用户实测：自动补充沿用注册用的动态代理，把代理服务商的流量包耗光。
+        """
+        store.save_registered(email="pd@x.com", access_token="AT-PD")
+        with mock.patch.object(store, "is_static_proxy", return_value=False):
+            self.controller._import_to_pool({"email": "pd@x.com"}, "socks5://u:p@h:9", "run-pd")
+
+        from services.account_service import account_service
+
+        items = {i["email"]: i for i in account_service.list_accounts()}
+        self.assertEqual(items["pd@x.com"].get("proxy"), "")
 
     def test_import_without_proxy_when_option_off(self):
         store.save_registered(email="q@x.com", access_token="AT-Q", proxy="http://old:1")
@@ -222,8 +239,9 @@ class BatchPoolImportTests(unittest.TestCase):
     def test_existing_account_is_updated_not_duplicated(self):
         """重跑同一个号：号池里那条要更新代理，不能重复添加，也不能当失败。"""
         store.save_registered(email="u@x.com", access_token="AT-U")
-        self.controller._import_to_pool({"email": "u@x.com"}, "http://p-old:1", "run-u1")
-        ok = self.controller._import_to_pool({"email": "u@x.com"}, "http://p-new:2", "run-u2")
+        with mock.patch.object(store, "is_static_proxy", return_value=True):
+            self.controller._import_to_pool({"email": "u@x.com"}, "http://p-old:1", "run-u1")
+            ok = self.controller._import_to_pool({"email": "u@x.com"}, "http://p-new:2", "run-u2")
         self.assertTrue(ok)
 
         from services.account_service import account_service

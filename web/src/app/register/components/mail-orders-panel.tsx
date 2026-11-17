@@ -53,6 +53,7 @@ import {
 } from "@/lib/register-api";
 
 import { Pagination } from "./pagination";
+import { copyTextWithToast } from "@/lib/clipboard";
 
 
 /** Remail 服务端返回的订单状态。 */
@@ -220,12 +221,7 @@ export function MailOrdersPanel() {
   };
 
   const copyEmail = async (email: string) => {
-    try {
-      await navigator.clipboard.writeText(email);
-      toast.success("已复制邮箱");
-    } catch {
-      toast.error("复制失败");
-    }
+    await copyTextWithToast(email, "邮箱", "已复制邮箱");
   };
 
   const allSelected = items.length > 0 && items.every((o) => selected.has(o.order_no));

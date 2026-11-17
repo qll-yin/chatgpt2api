@@ -36,6 +36,7 @@ import {
 import {
   fetchBindableProxies,
   fetchRegistered,
+  fetchRegisteredAccessTokens,
   fetchRegisteredDetail,
   fetchRegisterProxies,
   importRegisteredToPool,
@@ -44,6 +45,7 @@ import {
   type RegisteredItem,
   type RegisterProxy,
 } from "@/lib/register-api";
+import { copyTextWithToast } from "@/lib/clipboard";
 
 import { Pagination } from "./pagination";
 
@@ -76,12 +78,13 @@ export function RegisteredPanel() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [marking, setMarking] = useState(false);
+  const [copyingTokens, setCopyingTokens] = useState(false);
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof fetchRegisteredDetail>>["item"] | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   // 号池绑定的静态代理
   const [bindable, setBindable] = useState<RegisterProxy[]>([]);
-  const [bindMode, setBindMode] = useState<"none" | "auto" | "manual">("none");
+  const [bindMode, setBindMode] = useState<"none" | "register" | "static" | "manual">("static");
   const [bindProxy, setBindProxy] = useState("");
 
   // ── 刷新 401（重新授权）──
@@ -225,7 +228,13 @@ export function RegisteredPanel() {
     try {
       const result = await importRegisteredToPool([...selected], withProxy, {
         bindProxy: bindMode === "manual" ? bindProxy : undefined,
-        autoBind: bindMode === "auto",
+        autoBind: bindMode === "static",
+        proxyMode:
+          bindMode === "none"
+            ? "none"
+            : bindMode === "register"
+              ? "register"
+              : "static",
       });
       const bs = result.bind_stats;
       const bindHint = bs && bs.bound > 0
@@ -269,6 +278,37 @@ export function RegisteredPanel() {
     }
   };
 
+  const handleCopyTokens = async (withProxy: boolean) => {
+    if (selectedCount === 0) {
+      toast.error("请先勾选要复制的账号");
+      return;
+    }
+    setCopyingTokens(true);
+    try {
+      // 列表接口只给 has_access_token（不泄露凭证），所以走单独的批量接口
+      const data = await fetchRegisteredAccessTokens([...selected]);
+      const rows = data.items.map((it) =>
+        withProxy ? `${it.access_token}----${it.proxy || ""}` : it.access_token,
+      );
+      if (rows.length === 0) {
+        toast.error("选中的账号都没有 access_token");
+        return;
+      }
+      const ok = await copyTextWithToast(
+        rows.join("\n"),
+        withProxy ? "Token+代理" : "Token",
+        `已复制 ${rows.length} 个账号的${withProxy ? " access_token----代理" : " access_token"}`,
+      );
+      if (ok && data.missing.length) {
+        toast.warning(`${data.missing.length} 个账号没有 access_token，已跳过`);
+      }
+    } catch (error) {
+      toast.error(`复制失败：${(error as Error).message ?? error}`);
+    } finally {
+      setCopyingTokens(false);
+    }
+  };
+
   const handleShowDetail = async (email: string) => {
     setDetailOpen(true);
     setDetailLoading(true);
@@ -295,14 +335,9 @@ export function RegisteredPanel() {
             </span>
           </CardTitle>
           <div className="flex items-center gap-2">
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Checkbox
-                checked={withProxy}
-                onCheckedChange={(v) => setWithProxy(Boolean(v))}
-              />
-              携带代理
-            </label>
-            {/* 号池绑定静态代理：注册用动态代理，入池改绑固定 IP */}
+            {/* 入池代理：2 选 1（沿用注册代理 / 静态代理）+ 不带代理
+                ⚠️ 动态代理永远不会进号池 —— 出口 IP 每次变，账号用起来
+                   更容易触发风控，还会把代理流量包耗光。 */}
             <select
               className="h-8 rounded-lg border border-stone-200 bg-white px-2 text-xs text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
               value={bindMode === "manual" ? `manual:${bindProxy}` : bindMode}
@@ -312,16 +347,17 @@ export function RegisteredPanel() {
                   setBindMode("manual");
                   setBindProxy(value.slice("manual:".length));
                 } else {
-                  setBindMode(value as "none" | "auto");
+                  setBindMode(value as "none" | "register" | "static");
                 }
               }}
-              title="注册用动态代理防风控；导入号池时改绑静态代理，账号出口 IP 固定"
+              title="注册用动态代理防风控；入池改绑静态代理，账号出口 IP 固定。动态代理不会进号池。"
             >
-              <option value="none">入池不绑定（沿用注册代理）</option>
-              <option value="auto">自动分配静态代理</option>
+              <option value="static">入池时携带静态代理</option>
+              <option value="register">入池时携带注册所用代理</option>
+              <option value="none">入池不带代理</option>
               {bindable.map((p) => (
                 <option key={p.proxy} value={`manual:${p.proxy}`}>
-                  {p.proxy} （可绑 {p.bind_remaining === -1 ? "∞" : p.bind_remaining}）
+                  指定：{p.proxy} （可绑 {p.bind_remaining === -1 ? "∞" : p.bind_remaining}）
                 </option>
               ))}
             </select>
@@ -350,6 +386,30 @@ export function RegisteredPanel() {
                 <Download className="size-4" />
               )}
               导入号池（{selectedCount}）
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void handleCopyTokens(false)}
+              disabled={copyingTokens || selectedCount === 0}
+              title="复制选中账号的 access_token，每行一个"
+            >
+              {copyingTokens ? (
+                <LoaderCircle className="size-4 animate-spin" />
+              ) : (
+                <Copy className="size-4" />
+              )}
+              复制 Token（{selectedCount}）
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void handleCopyTokens(true)}
+              disabled={copyingTokens || selectedCount === 0}
+              title="复制成 access_token----代理 的导入格式（可直接粘到其它号池）"
+            >
+              <Copy className="size-4" />
+              复制 Token+代理
             </Button>
           </div>
         </CardHeader>
@@ -488,10 +548,10 @@ export function RegisteredPanel() {
                       size="sm"
                       className="mt-1 h-6 px-1.5 text-xs"
                       onClick={() => {
-                        void navigator.clipboard
-                          .writeText(text)
-                          .then(() => toast.success(`${label} 已复制`))
-                          .catch(() => toast.error("复制失败"));
+                        // ⚠️ 不能直接用 navigator.clipboard —— HTTP 下它是
+                        //    undefined，会同步抛异常（Promise 链都建不起来），
+                        //    表现就是「点了没反应、也没有提示」。
+                        void copyTextWithToast(text, label);
                       }}
                     >
                       <Copy className="size-3" />

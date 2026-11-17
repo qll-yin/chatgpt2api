@@ -26,6 +26,7 @@ import {
   type AutoRegisterSettings,
   type AutoRegisterState,
   type MailProvider,
+  type PoolProxyMode,
 } from "@/lib/register-api";
 
 const DEFAULTS: AutoRegisterSettings = {
@@ -38,6 +39,8 @@ const DEFAULTS: AutoRegisterSettings = {
   register_options: {},
   cooldown_minute: 30,
   max_retries: 3,
+  quota_threshold: 0,
+  pool_proxy_mode: "static" as PoolProxyMode,
 };
 
 export function AutoRegisterPanel() {
@@ -158,6 +161,37 @@ export function AutoRegisterPanel() {
                 value={settings.threshold}
                 onChange={(e) => update("threshold", Number(e.target.value))}
               />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-quota-threshold">剩余额度低于此值触发（0 = 不启用）</Label>
+              <Input
+                id="auto-quota-threshold"
+                type="number"
+                min={0}
+                value={settings.quota_threshold}
+                onChange={(e) => update("quota_threshold", Number(e.target.value))}
+              />
+              <p className="text-xs text-muted-foreground">
+                与号池管理页的「剩余额度」同口径。账号数达标但额度不达标时，同样会触发。
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-pool-proxy">入池绑什么代理</Label>
+              <select
+                id="auto-pool-proxy"
+                className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
+                value={settings.pool_proxy_mode}
+                onChange={(e) =>
+                  update("pool_proxy_mode", e.target.value as PoolProxyMode)
+                }
+              >
+                <option value="static">入池时携带静态代理</option>
+                <option value="register">入池时携带注册所用代理</option>
+                <option value="none">入池不带代理</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                静态代理池里没有可用代理时以空代理入池。动态代理不会进号池。
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="auto-batch">每次注册成功数</Label>

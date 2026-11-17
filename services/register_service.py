@@ -125,11 +125,26 @@ def _is_codex_record(record: dict | None) -> bool:
     return str(record.get("source_type") or "").strip().lower() == "codex"
 
 
-def build_pool_payload(email: str, access_token: str, proxy: str = "") -> dict[str, Any]:
+def build_pool_payload(
+    email: str,
+    access_token: str,
+    proxy: str = "",
+    *,
+    allow_record_proxy: bool = True,
+) -> dict[str, Any]:
     """构造写入号池的账号载荷。
 
     与 chatgpt2api 的 `access_token----proxy` 导入格式一致：
     access_token 是主键，proxy 是该号专属代理（可为空）。
+
+    ⚠️ allow_record_proxy=False 时**不回落**到注册记录里的代理
+    -----------------------------------------------------------
+    注册记录里的 proxy 通常是**动态代理**（注册阶段用的，出口 IP 每次变）。
+    之前 proxy 传空就自动回落到它 → 动态代理直接进了号池，账号每次生图
+    都换 IP（更容易触发使用侧风控），还会把代理服务商的流量包耗光。
+
+    调用方如果已经用 resolve_pool_proxy() 做过决策，就必须传 False ——
+    决策结果是空代理时，就该是空代理。
     """
     from services.storage import register_store as store
 
@@ -147,7 +162,9 @@ def build_pool_payload(email: str, access_token: str, proxy: str = "") -> dict[s
     id_token = str(record.get("id_token") or "").strip()
     if id_token:
         payload["id_token"] = id_token
-    proxy_value = str(proxy or record.get("proxy") or "").strip()
+    proxy_value = str(proxy or "").strip()
+    if not proxy_value and allow_record_proxy:
+        proxy_value = str(record.get("proxy") or "").strip()
     if proxy_value:
         payload["proxy"] = proxy_value
     return payload
@@ -204,6 +221,77 @@ def import_to_pool_with_refresh(
     return out
 
 
+POOL_PROXY_MODE_NONE = "none"
+POOL_PROXY_MODE_REGISTER = "register"
+POOL_PROXY_MODE_STATIC = "static"
+POOL_PROXY_MODES = frozenset(
+    {POOL_PROXY_MODE_NONE, POOL_PROXY_MODE_REGISTER, POOL_PROXY_MODE_STATIC}
+)
+
+
+def resolve_pool_proxy(
+    mode: str,
+    *,
+    register_proxy: str = "",
+    bind_proxy: str = "",
+    auto_bind: bool = False,
+) -> tuple[str, str]:
+    """决定账号入池时绑哪个代理。返回 ``(proxy, reason)``。
+
+    ⚠️ 铁律：动态代理永远不能进号池
+    --------------------------------
+    注册用动态代理（出口 IP 每次变，防注册风控），但账号入池后要长期
+    使用 —— IP 每次都变反而更容易触发使用侧风控，还会把代理服务商的流量
+    包耗光（用户实测：自动补充沿用注册用的动态代理，流量直接被吃光）。
+
+    所以入池代理**只允许静态代理**：
+
+    mode="none"     → 不带代理入池
+    mode="register" → 沿用注册时用的代理；**但它必须是登记过的静态代理**，
+                      否则（动态代理 / 未登记）以空代理入池
+    mode="static"   → 从静态代理池里挑（受 bind_max_uses 配额约束），
+                      池里没有可用静态代理时以空代理入池
+
+    绝不「回落到动态代理」—— 宁可空代理（账号直连）也不能用动态代理。
+    """
+    from services.storage import register_store as store
+
+    normalized = str(mode or POOL_PROXY_MODE_NONE).strip().lower()
+    if normalized not in POOL_PROXY_MODES:
+        normalized = POOL_PROXY_MODE_NONE
+
+    if normalized == POOL_PROXY_MODE_NONE:
+        return "", "未选择入池代理"
+
+    if normalized == POOL_PROXY_MODE_REGISTER:
+        proxy = str(register_proxy or "").strip()
+        if not proxy:
+            return "", "注册时未使用代理"
+        if not store.is_static_proxy(proxy):
+            return "", "注册代理不是登记过的静态代理，按空代理入池"
+        return proxy, "沿用注册时的静态代理"
+
+    # mode == "static"
+    explicit = str(bind_proxy or "").strip()
+    if explicit:
+        if not store.is_static_proxy(explicit):
+            return "", "指定的代理不是静态代理，按空代理入池"
+        if not store.bind_proxy(explicit):
+            return "", "指定代理绑定名额已满，按空代理入池"
+        return explicit, "使用指定的静态代理"
+
+    if auto_bind:
+        picked = store.pick_bind_proxy()
+        if picked:
+            return picked, "自动分配静态代理"
+        return "", "静态代理池无可用代理，按空代理入池"
+
+    picked = store.pick_bind_proxy()
+    if picked:
+        return picked, "自动分配静态代理"
+    return "", "静态代理池无可用代理，按空代理入池"
+
+
 def import_registered_to_pool(
     emails: list[str],
     *,
@@ -212,6 +300,7 @@ def import_registered_to_pool(
     refresh: bool = True,
     bind_proxy: str | None = None,
     auto_bind: bool = False,
+    proxy_mode: str = "",
 ) -> dict[str, Any]:
     """把已注册的账号批量导入号池。
 
@@ -273,29 +362,29 @@ def import_registered_to_pool(
         if id_token:
             payload["id_token"] = id_token
 
-        # ── 绑定静态代理（优先于注册时的动态代理）────────────────
-        assigned_proxy = ""
-        if bind_proxy:
-            assigned_proxy = str(bind_proxy).strip()
-            # 指定代理也要占配额 —— 超额就跳过这个账号
-            if not store.bind_proxy(assigned_proxy):
-                bind_stats["skipped_no_quota"] += 1
-                assigned_proxy = ""
-        elif auto_bind:
-            assigned_proxy = store.pick_bind_proxy()
-            if not assigned_proxy:
-                bind_stats["skipped_no_quota"] += 1
-
+        # ── 入池代理决策（动态代理永远不进号池）────────────────
+        #
+        # mode 由 proxy_mode 显式指定；没给时按老的 with_proxy 折算
+        # （True → 沿用注册代理，False → 不带代理）。
+        mode = str(proxy_mode or "").strip().lower()
+        if mode not in POOL_PROXY_MODES:
+            mode = POOL_PROXY_MODE_REGISTER if with_proxy else POOL_PROXY_MODE_NONE
+        assigned_proxy, reason = resolve_pool_proxy(
+            mode,
+            register_proxy=str(record.get("proxy") or "").strip(),
+            bind_proxy=str(bind_proxy or "").strip(),
+            auto_bind=auto_bind,
+        )
         if assigned_proxy:
             payload["proxy"] = assigned_proxy
-            bound.append(assigned_proxy)
+            # 只有「从静态池分配」才占绑定配额（沿用注册代理不占）
+            if mode == POOL_PROXY_MODE_STATIC:
+                bound.append(assigned_proxy)
             bind_stats["bound"] += 1
-        elif with_proxy:
-            # 没绑到静态代理 → 回落到注册时用的代理（通常是动态代理）
-            proxy_value = str(record.get("proxy") or "").strip()
-            if proxy_value:
-                payload["proxy"] = proxy_value
-                bind_stats["no_proxy"] += 1
+        else:
+            bind_stats["no_proxy"] += 1
+            if "名额" in reason:
+                bind_stats["skipped_no_quota"] += 1
         payloads.append(payload)
 
     if not payloads:
@@ -339,9 +428,16 @@ def import_token_text_to_pool(
 
     这是 chatgpt2api 原生的导入格式（注册机导出格式也用它），
     在这里复用，保证「注册机导出 → chatgpt2api 导入」的格式永远一致。
+
+    ⚠️ 代理会被过滤：**动态代理不能进号池**（出口 IP 每次变 → 账号更容易
+    触发风控 + 代理流量被耗光）。只有代理池里登记过的静态代理才会被带上，
+    其余的按空代理入池，并在返回值里报告被丢弃的数量。
     """
+    from services.storage import register_store as store
     tokens: list[str] = []
     payloads: list[dict[str, Any]] = []
+    # 被判定为动态代理而丢弃的数量（报给用户，别悄悄吞）
+    dropped_dynamic = 0
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -358,12 +454,20 @@ def import_token_text_to_pool(
         if len(parts) > 1:
             proxy_value = parts[1].strip()
             if proxy_value:
-                payload["proxy"] = proxy_value
+                # ⚠️ 动态代理不能进号池 —— 只接受代理池里登记过的静态代理。
+                #    未登记的代理也按动态处理（来路不明，宁可不绑）。
+                if store.is_static_proxy(proxy_value):
+                    payload["proxy"] = proxy_value
+                else:
+                    dropped_dynamic += 1
         payloads.append(payload)
         tokens.append(access_token)
 
     if not payloads:
-        return {"total": 0, "imported": 0, "skipped": 0, "items": []}
+        return {
+            "total": 0, "imported": 0, "skipped": 0, "items": [],
+            "dropped_dynamic": dropped_dynamic,
+        }
 
     result = import_to_pool_with_refresh(payloads)
     return {
@@ -373,6 +477,7 @@ def import_token_text_to_pool(
         "refreshed": int(result.get("refreshed") or 0),
         "errors": result.get("errors") or [],
         "items": result.get("items") or [],
+        "dropped_dynamic": dropped_dynamic,
     }
 
 
