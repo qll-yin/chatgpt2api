@@ -203,6 +203,11 @@ class BatchStartRequest(BaseModel):
     # 入池代理模式：none / register / static（默认沿用注册代理）
     # ⚠️ 动态代理不会进号池 —— 沿用注册代理时若那是动态代理，按空代理入池。
     pool_proxy_mode: str = ""
+    # 「注册使用代理」：注册时从代理池里挑哪一类代理用。
+    # dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）。
+    # ⚠️ 与「入池代理」是两件独立的事：选了 static 时，注册成功入池时
+    #    会沿用同一条静态代理（注册出口 = 长期使用出口，保持一致）。
+    register_proxy_mode: str = ""
     # worker 级重试：整个流程失败后，同一个 worker 再跑几遍（0-20，默认 3）。
     # ⚠️ 这是**按整个流程**算的 —— 流程内部撞 409 重建会话那种重试不额外计数。
     max_retries: int = 3

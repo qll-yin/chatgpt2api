@@ -84,6 +84,13 @@ DEFAULT_SETTINGS = {
     #    还会把代理服务商的流量包耗光）。
     #    静态代理池里没有可用代理时，以空代理入池（账号直连）。
     "pool_proxy_mode": "static",
+    # 「注册使用代理」：注册时从代理池里挑哪一类代理用。
+    # dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）。
+    #
+    # ⚠️ 与「入池绑什么代理」不冲突：这里选 static 时，补进来的号会
+    #    沿用注册时那条静态代理（注册出口 = 长期使用出口，保持一致）；
+    #    选 dynamic 时，入池仍按 pool_proxy_mode 走（动态代理绝不入池）。
+    "register_proxy_mode": "mixed",
 }
 
 # 守护进程状态（供 API 查询）
@@ -121,6 +128,11 @@ def get_settings() -> dict[str, Any]:
     settings["threshold"] = max(0, int(settings.get("threshold") or 0))
     settings["quota_threshold"] = max(0, int(settings.get("quota_threshold") or 0))
     settings["pool_proxy_mode"] = str(settings.get("pool_proxy_mode") or "static").strip().lower()
+    settings["register_proxy_mode"] = str(
+        settings.get("register_proxy_mode") or "mixed"
+    ).strip().lower()
+    if settings["register_proxy_mode"] not in ("dynamic", "static", "mixed"):
+        settings["register_proxy_mode"] = "mixed"
     settings["target_batch"] = max(1, int(settings.get("target_batch") or 1))
     settings["check_interval_minute"] = max(1, int(settings.get("check_interval_minute") or 1))
     settings["cooldown_minute"] = max(0, int(settings.get("cooldown_minute") or 0))
@@ -209,6 +221,12 @@ def trigger_registration(settings: dict[str, Any] | None = None) -> dict[str, An
     options.setdefault(
         "pool_proxy_mode",
         str(settings.get("pool_proxy_mode") or "static").strip().lower() or "static",
+    )
+    # 「注册使用代理」：注册时只挑某一类代理用。
+    # ⚠️ 用 setdefault：用户在 register_options 里显式写了就以那个为准。
+    options.setdefault(
+        "register_proxy_mode",
+        str(settings.get("register_proxy_mode") or "mixed").strip().lower() or "mixed",
     )
 
     try:

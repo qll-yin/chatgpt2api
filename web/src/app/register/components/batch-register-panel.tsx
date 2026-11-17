@@ -36,6 +36,7 @@ import {
   type BatchStatus,
   type MailProvider,
   type PoolProxyMode,
+  type RegisterProxyMode,
 } from "@/lib/register-api";
 
 type LogLine = {
@@ -124,6 +125,9 @@ export function BatchRegisterPanel() {
   // ⚠️ 动态代理永远不会进号池 —— 出口 IP 每次变，账号用起来更容易触发
   //    风控，还会把代理服务商的流量包耗光。
   const [poolProxyMode, setPoolProxyMode] = useState<PoolProxyMode>("static");
+  // 「注册使用代理」：注册时从代理池里挑哪一类代理用
+  // dynamic（只动态）/ static（只静态）/ mixed（混合随机）
+  const [registerProxyMode, setRegisterProxyMode] = useState<RegisterProxyMode>("mixed");
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logIdRef = useRef(0);
@@ -312,6 +316,7 @@ export function BatchRegisterPanel() {
         auto_import: autoImport,
         with_proxy: withProxy,
         pool_proxy_mode: poolProxyMode,
+        register_proxy_mode: registerProxyMode,
         // ⚠️ 不能用 `|| 3` —— 那会把「0 = 不重试」覆盖掉。
         max_retries: Math.max(0, Math.min(20, Number(maxRetries) || 0)),
       });
@@ -475,6 +480,21 @@ export function BatchRegisterPanel() {
                 注册成功后自动导入号池管理
               </label>
               <label className="flex items-center gap-2 text-sm">
+                <span className="text-muted-foreground">注册使用代理</span>
+                <select
+                  className="h-9 rounded-lg border border-stone-200 bg-white px-2 text-sm text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
+                  value={registerProxyMode}
+                  onChange={(e) =>
+                    setRegisterProxyMode(e.target.value as RegisterProxyMode)
+                  }
+                  title="注册时从代理池里挑哪一类代理用。选静态时，注册成功入池会沿用同一条静态代理。"
+                >
+                  <option value="mixed">混合随机（动态 + 静态）</option>
+                  <option value="dynamic">只用动态代理</option>
+                  <option value="static">只用静态代理</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-sm">
                 <span className="text-muted-foreground">入池代理</span>
                 <select
                   className="h-9 rounded-lg border border-stone-200 bg-white px-2 text-sm text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
@@ -487,6 +507,11 @@ export function BatchRegisterPanel() {
                   <option value="none">入池不带代理</option>
                 </select>
               </label>
+              <p className="text-xs text-muted-foreground">
+                「注册使用代理」决定注册时走哪一类代理；「入池代理」决定账号进号池后绑哪个。
+                两者不冲突：注册用静态代理时，入池会沿用同一条静态代理（出口保持一致）；
+                注册用动态代理时，动态代理永远不进号池。
+              </p>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
                   checked={wantRefreshToken}

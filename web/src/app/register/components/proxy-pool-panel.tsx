@@ -365,6 +365,11 @@ export function ProxyPoolPanel() {
             {stats ? (
               <span className="ml-2 text-xs font-normal text-muted-foreground">
                 可用 {stats.available} / 停用 {stats.disabled} / 已满 {stats.exhausted}
+                {stats.by_type ? (
+                  <span className="ml-1">
+                    · 动态 {stats.by_type.dynamic} / 静态 {stats.by_type.static}
+                  </span>
+                ) : null}
                 {invalidCount > 0 ? (
                   <span className="ml-1 text-red-500">· {invalidCount} 个格式异常</span>
                 ) : null}

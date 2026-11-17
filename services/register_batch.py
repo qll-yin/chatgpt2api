@@ -69,6 +69,25 @@ STOPPED_CATEGORY = "__stopped__"
 #    单独归一类，这样它既不会计入失败数，也不会误触发熔断。
 NO_PROXY_CATEGORY = "no_proxy"
 
+# 「注册使用代理」的模式：注册时从代理池里挑哪一类代理用。
+#
+#   dynamic —— 只用动态代理（每次连接换出口 IP，注册风控最松）
+#   static  —— 只用静态代理（固定出口 IP）
+#   mixed   —— 混合随机（默认，池子里两类都能用）
+#
+# ⚠️ 这是**注册时**用哪条代理，跟「注册成功后入池绑哪个代理」是两件
+#    独立的事（后者见 pool_proxy_mode）—— 两者不冲突：
+#    注册用动态代理时，入池仍按「入池代理」的设置走（动态代理不入池）；
+#    注册用静态代理时，入池会**沿用同一条静态代理**（出口保持一致）。
+REGISTER_PROXY_MODE_DYNAMIC = "dynamic"
+REGISTER_PROXY_MODE_STATIC = "static"
+REGISTER_PROXY_MODE_MIXED = "mixed"
+REGISTER_PROXY_MODES = frozenset({
+    REGISTER_PROXY_MODE_DYNAMIC,
+    REGISTER_PROXY_MODE_STATIC,
+    REGISTER_PROXY_MODE_MIXED,
+})
+
 
 class AutoLoopState:
     STOPPED = "stopped"
@@ -150,6 +169,9 @@ class AutoLoopController:
         # ⚠️ 并发 worker 数 > 代理数时，后面的 worker 会暂时拿不到 ——
         #    失败的 worker 会把配额还回来，等一等就能拿到。
         self._proxy_wait_secs: int = 120
+        # 「注册使用代理」：注册时只挑某一类代理用
+        # （dynamic / static / mixed，mixed = 不限类型）。
+        self._register_proxy_mode: str = REGISTER_PROXY_MODE_MIXED
 
     # ──────────────────────── 公共 API ────────────────────────
 
@@ -218,6 +240,13 @@ class AutoLoopController:
             self._proxy_wait_secs = (
                 120 if _raw_wait is None or _raw_wait == "" else max(0, min(1800, int(_raw_wait)))
             )
+            # ── 注册使用代理：只挑某一类代理 ──
+            # dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）
+            _raw_mode = str(self._options.get("register_proxy_mode") or "").strip().lower()
+            self._register_proxy_mode = (
+                _raw_mode if _raw_mode in REGISTER_PROXY_MODES else REGISTER_PROXY_MODE_MIXED
+            )
+            self._options["register_proxy_mode"] = self._register_proxy_mode
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -387,10 +416,18 @@ class AutoLoopController:
         exclude：本次要避开的代理（刚失败/刚被 CF 拦的那条固定出口代理）。
         流程级重试必须换出口 IP —— 同一个固定 IP 再跑一遍必然还是同样的结果。
 
+        ⚠️ 只挑「注册使用代理」指定的那一类（dynamic / static / mixed）。
+           选了动态就只走动态，选了静态就只走静态 —— 类型不匹配时**不**
+           偷偷换类型（那会让用户以为在用动态代理，实际用的是静态）。
+           池里没有该类型的代理时返回空串，由调用方明确提示。
+
         后端池为空时回落到旧的文本代理池（按 worker_id 取模，保持老行为）。
         """
         if self._backend_proxy_pool:
-            picked = db.pick_proxy(exclude=exclude)
+            picked = db.pick_proxy(
+                exclude=exclude,
+                proxy_type=self._register_proxy_mode_filter(),
+            )
             if picked:
                 return picked
             # 池里没有可用代理了 —— 返回空串，让调用方决定是等待还是停止。
@@ -555,6 +592,18 @@ class AutoLoopController:
                 self._refresh_pool_quota_async()
 
     # ─────────────────── 流程级重试的三个辅助 ───────────────────
+
+    def _register_proxy_mode_filter(self) -> str:
+        """把「注册使用代理」模式翻译成 pick_proxy 的类型过滤值。
+
+        mixed → ""（不限类型）；dynamic / static → 原样传下去。
+        """
+        mode = str(getattr(self, "_register_proxy_mode", "") or "").strip().lower()
+        if mode == REGISTER_PROXY_MODE_MIXED:
+            return ""
+        if mode in (REGISTER_PROXY_MODE_DYNAMIC, REGISTER_PROXY_MODE_STATIC):
+            return mode
+        return ""
 
     def _proxy_type_of(self, proxy: str) -> str:
         """查这条代理的类型（static / dynamic）。查不到返回空串。"""
@@ -802,11 +851,20 @@ class AutoLoopController:
                     proxy = self._wait_for_proxy(worker_id, exclude=failed_proxies)
                     if not proxy:
                         stats = db.proxy_pool_stats()
+                        by_type = stats.get("by_type") or {}
+                        want = {
+                            REGISTER_PROXY_MODE_DYNAMIC: "动态代理",
+                            REGISTER_PROXY_MODE_STATIC: "静态代理",
+                        }.get(self._register_proxy_mode, "代理")
                         msg = (
-                            f"没有别的代理可换了（可用 {stats['available']} / 停用 {stats['disabled']}"
-                            f" / 已满 {stats['exhausted']}），本轮已排除 {len(failed_proxies)} "
-                            f"条失败的固定出口代理 —— 换出口 IP 重试才有意义，"
-                            f"请补充代理后重新开始，已停止 worker-{worker_id}"
+                            f"代理池里没有可用的{want}了"
+                            f"（池内动态 {by_type.get('dynamic', 0)} 条 / "
+                            f"静态 {by_type.get('static', 0)} 条；"
+                            f"可用 {stats['available']} / 停用 {stats['disabled']}"
+                            f" / 已满 {stats['exhausted']}），本轮已排除 "
+                            f"{len(failed_proxies)} 条失败的固定出口代理 —— "
+                            f"换出口 IP 重试才有意义，请补充代理后重新开始，"
+                            f"已停止 worker-{worker_id}"
                         )
                         self._set_message(msg)
                         logger.warning(msg)
@@ -1203,6 +1261,9 @@ class AutoLoopController:
                 register_proxy=str(proxy or "").strip(),
                 bind_proxy=str(self._options.get("bind_proxy") or "").strip(),
                 auto_bind=bool(self._options.get("auto_bind")),
+                # ⚠️ 「注册使用代理」选的是静态代理时，入池**沿用同一条** ——
+                #    注册出口 = 长期使用出口，账号不会注册完就换 IP。
+                prefer_register_static=True,
             )
             if assigned_proxy:
                 logger.info(

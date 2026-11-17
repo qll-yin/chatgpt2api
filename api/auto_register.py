@@ -30,6 +30,9 @@ class AutoRegisterSettingsRequest(BaseModel):
     quota_threshold: int | None = None
     # 入池绑什么代理：none / register / static
     pool_proxy_mode: str | None = None
+    # 「注册使用代理」：注册时只挑某一类代理用
+    # dynamic（只动态）/ static（只静态）/ mixed（混合随机）
+    register_proxy_mode: str | None = None
 
 
 def create_router() -> APIRouter:

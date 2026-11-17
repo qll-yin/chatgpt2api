@@ -40,6 +40,11 @@ export type RegisterProxyStats = {
   used: number;
   failed: number;
   enabled: number;
+  /** 类型维度的计数 —— 「注册使用代理」选某一类时要看这个 */
+  by_type?: {
+    dynamic: number;
+    static: number;
+  };
 };
 
 /** 号池绑定配额概览（静态代理专用）。 */
@@ -162,6 +167,11 @@ export type BatchStartOptions = {
    */
   pool_proxy_mode: PoolProxyMode;
   /**
+   * 「注册使用代理」：注册时从代理池里挑哪一类代理用。
+   * dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）。
+   */
+  register_proxy_mode: RegisterProxyMode;
+  /**
    * worker 级重试次数（不含首次尝试）。
    * 一个完整注册流程算 1 次；失败后同一个 worker 再跑 N 遍，
    * 都不行才停掉这个 worker。0 = 不重试（失败一次就换号继续）。
@@ -172,7 +182,12 @@ export type BatchStartOptions = {
 // 单次注册没有「重试次数」这个概念 —— 重试是 worker 级的。
 export type RegisterOnceOptions = Omit<
   BatchStartOptions,
-  "concurrency" | "target_count" | "cool_down_seconds" | "max_retries" | "pool_proxy_mode"
+  | "concurrency"
+  | "target_count"
+  | "cool_down_seconds"
+  | "max_retries"
+  | "pool_proxy_mode"
+  | "register_proxy_mode"
 >;
 
 export type ImportToPoolResult = {
@@ -277,6 +292,11 @@ export type AutoRegisterSettings = {
   quota_threshold: number;
   /** 入池绑什么代理：none / register / static。动态代理不会进号池。 */
   pool_proxy_mode: PoolProxyMode;
+  /**
+   * 「注册使用代理」：注册时只挑某一类代理用。
+   * dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）。
+   */
+  register_proxy_mode: RegisterProxyMode;
 };
 
 export type AutoRegisterState = {
@@ -392,6 +412,18 @@ export async function reauthorizeRegisteredAccount(
  *    选「沿用注册代理」时，若那个注册代理是动态的，会自动按空代理入池。
  */
 export type PoolProxyMode = "none" | "register" | "static";
+
+/**
+ * 「注册使用代理」：注册时从代理池里挑哪一类代理用。
+ *
+ * - dynamic：只挑动态代理（每次连接换出口 IP，注册风控最松）
+ * - static：只挑静态代理（固定出口 IP）
+ * - mixed：混合随机（默认，池子里两类都能用）
+ *
+ * ⚠️ 与「入池代理」是两件独立的事：这里选 static 时，注册成功入池会
+ *    沿用同一条静态代理（注册出口 = 长期使用出口，保持一致）。
+ */
+export type RegisterProxyMode = "dynamic" | "static" | "mixed";
 
 export async function importRegisteredToPool(
   emails: string[],

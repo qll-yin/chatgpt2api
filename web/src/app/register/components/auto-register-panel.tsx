@@ -27,6 +27,7 @@ import {
   type AutoRegisterState,
   type MailProvider,
   type PoolProxyMode,
+  type RegisterProxyMode,
 } from "@/lib/register-api";
 
 const DEFAULTS: AutoRegisterSettings = {
@@ -41,6 +42,7 @@ const DEFAULTS: AutoRegisterSettings = {
   max_retries: 3,
   quota_threshold: 0,
   pool_proxy_mode: "static" as PoolProxyMode,
+  register_proxy_mode: "mixed" as RegisterProxyMode,
 };
 
 export function AutoRegisterPanel() {
@@ -173,6 +175,26 @@ export function AutoRegisterPanel() {
               />
               <p className="text-xs text-muted-foreground">
                 与号池管理页的「剩余额度」同口径。账号数达标但额度不达标时，同样会触发。
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="auto-register-proxy">注册使用代理</Label>
+              <select
+                id="auto-register-proxy"
+                className="h-10 w-full rounded-xl border border-stone-200 bg-white px-3 text-sm text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-200"
+                value={settings.register_proxy_mode}
+                onChange={(e) =>
+                  update("register_proxy_mode", e.target.value as RegisterProxyMode)
+                }
+              >
+                <option value="mixed">混合随机（动态 + 静态）</option>
+                <option value="dynamic">只用动态代理</option>
+                <option value="static">只用静态代理</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                补号时注册走哪一类代理：只动态、只静态或混合随机。
+                与下面的「入池绑什么代理」不冲突 —— 这里选静态时，
+                补进来的号会沿用注册时那条静态代理（出口保持一致）。
               </p>
             </div>
             <div className="space-y-1.5">

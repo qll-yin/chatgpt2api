@@ -235,6 +235,7 @@ def resolve_pool_proxy(
     register_proxy: str = "",
     bind_proxy: str = "",
     auto_bind: bool = False,
+    prefer_register_static: bool = False,
 ) -> tuple[str, str]:
     """决定账号入池时绑哪个代理。返回 ``(proxy, reason)``。
 
@@ -253,6 +254,13 @@ def resolve_pool_proxy(
                       池里没有可用静态代理时以空代理入池
 
     绝不「回落到动态代理」—— 宁可空代理（账号直连）也不能用动态代理。
+
+    prefer_register_static（注册流程用）
+    ------------------------------------
+    「注册使用代理」选了静态时，账号入池要**沿用同一条静态代理**
+    （注册出口 = 长期使用出口，保持一致）。这个开关只在 mode="static"
+    时生效：优先沿用注册时那条静态代理（占它的绑定名额），名额满了
+    再回落到自动分配。
     """
     from services.storage import register_store as store
 
@@ -279,6 +287,15 @@ def resolve_pool_proxy(
         if not store.bind_proxy(explicit):
             return "", "指定代理绑定名额已满，按空代理入池"
         return explicit, "使用指定的静态代理"
+
+    # ⚠️ 注册时用的就是静态代理 → 优先沿用它（与注册出口保持一致）
+    if prefer_register_static:
+        reg = str(register_proxy or "").strip()
+        if reg and store.is_static_proxy(reg):
+            if store.bind_proxy(reg):
+                return reg, "沿用注册时的静态代理（与注册出口保持一致）"
+            # 绑定名额已满 → 落到下面的自动分配
+        # 注册用的是动态代理 → 不能入池，继续走自动分配静态代理
 
     if auto_bind:
         picked = store.pick_bind_proxy()

@@ -1165,7 +1165,10 @@ def set_proxy_ipv6_status(proxy: str, status: str) -> bool:
         return bool(result.rowcount)
 
 
-def pick_proxy(exclude: Optional[Iterable[str]] = None) -> str:
+def pick_proxy(
+    exclude: Optional[Iterable[str]] = None,
+    proxy_type: str = "",
+) -> str:
     """挑一个可用代理：启用中 + 未超配额 + 用得少的优先。
 
     ★ 关键：**选中即预占一格**（used_count +1）。
@@ -1182,10 +1185,17 @@ def pick_proxy(exclude: Optional[Iterable[str]] = None) -> str:
        必然还是同样的 409 / CF 403，纯属白转圈。所以重试时把刚失败
        的那条排除掉，让 pick 挑另一条。
 
+    proxy_type：只挑某一类代理（"" / "mixed" = 不限）。
+       "dynamic" → 只挑动态代理（每次连接换出口 IP）
+       "static"  → 只挑静态代理（固定出口 IP）
+    ⚠️ 类型不匹配的代理**不会**被"顺手"拿来用 —— 选了动态就只走动态，
+       选错了类型宁可取不到（调用方会明确提示），也不能偷偷换类型。
+
     池里没有可用代理时返回空串（调用方负责停下并提示）。
     """
     now = time.time()
     ex = {str(p or "").strip() for p in (exclude or []) if str(p or "").strip()}
+    wanted = str(proxy_type or "").strip().lower()
     with register_session_scope() as session:
         stmt = (
             select(ProxyPoolModel)
@@ -1194,9 +1204,13 @@ def pick_proxy(exclude: Optional[Iterable[str]] = None) -> str:
                 (ProxyPoolModel.max_uses == 0)
                 | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses)
             )
+        )
+        if wanted in ("dynamic", "static"):
+            stmt = stmt.where(ProxyPoolModel.proxy_type == wanted)
+        stmt = (
             # 排序：先用得少的优先（负载均衡）→ 失败少的优先 →
             #      被 CF 拦/409 过的排后面（出口 IP 已经被记，别再挑它）
-            .order_by(
+            stmt.order_by(
                 ProxyPoolModel.used_count.asc(),
                 ProxyPoolModel.failed_count.asc(),
                 ProxyPoolModel.cf_blocked.asc(),
@@ -1494,7 +1508,11 @@ def reset_proxy_invalid_state(proxy: str) -> bool:
 
 
 def proxy_pool_stats() -> dict[str, Any]:
-    """代理池概览，供前端展示「可用 N / 停用 M / 已满 K」。"""
+    """代理池概览，供前端展示「可用 N / 停用 M / 已满 K」。
+
+    ⚠️ by_type 是**类型**维度的计数（dynamic / static）——
+       「注册使用代理」选了某一类时，前端要能告诉用户池里到底有没有那类代理。
+    """
     items = list_proxies()
     return {
         "total": len(items),
@@ -1504,6 +1522,10 @@ def proxy_pool_stats() -> dict[str, Any]:
         "used": sum(int(i.get("used_count") or 0) for i in items),
         "failed": sum(int(i.get("failed_count") or 0) for i in items),
         "enabled": sum(1 for i in items if i.get("enabled")),
+        "by_type": {
+            "dynamic": sum(1 for i in items if i.get("proxy_type") == "dynamic"),
+            "static": sum(1 for i in items if i.get("proxy_type") == "static"),
+        },
     }
 
 

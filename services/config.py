@@ -92,6 +92,11 @@ DEFAULT_AUTO_REGISTER = {
     # ⚠️ 默认 static —— 补进来的号要长期用，绝不能带注册用的动态代理
     #    （出口 IP 每次变 → 账号更容易触发风控 + 代理流量被耗光）。
     "pool_proxy_mode": "static",
+    # 「注册使用代理」：注册时从代理池里挑哪一类代理用。
+    # dynamic（只动态）/ static（只静态）/ mixed（混合随机，默认）。
+    # ⚠️ 与「入池绑什么代理」是两件独立的事：这里选 static 时，
+    #    补进来的号会沿用注册时那条静态代理（出口保持一致）。
+    "register_proxy_mode": "mixed",
 }
 
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
@@ -436,7 +441,24 @@ def _normalize_auto_register_settings(value: object) -> dict[str, object]:
         "pool_proxy_mode": _normalize_pool_proxy_mode(
             source.get("pool_proxy_mode"), str(default["pool_proxy_mode"])
         ),
+        # 「注册使用代理」：dynamic / static / mixed（其它值退回默认）
+        "register_proxy_mode": _normalize_register_proxy_mode(
+            source.get("register_proxy_mode"), str(default["register_proxy_mode"])
+        ),
     }
+
+
+def _normalize_register_proxy_mode(value: object, fallback: str = "mixed") -> str:
+    """归一化「注册使用代理」模式。
+
+    dynamic → 注册时只挑动态代理（每次连接换出口 IP）
+    static  → 注册时只挑静态代理（固定出口 IP）
+    mixed   → 混合随机（池子里两类都能用）
+    """
+    text = str(value or "").strip().lower()
+    if text in {"dynamic", "static", "mixed"}:
+        return text
+    return fallback
 
 
 def _normalize_pool_proxy_mode(value: object, fallback: str = "static") -> str:
