@@ -55,6 +55,25 @@ const stateLabel: Record<string, string> = {
   waiting: "等待资源",
 };
 
+/**
+ * 描述一次注册尝试。
+ *
+ * ⚠️ 非池化来源（Remail / CF 临时邮箱）的 email 是**占位地址**
+ *    （remail_placeholder_<时间戳>_<worker>@placeholder.local），
+ *    直接显示毫无信息量、而且多个 worker 看起来一模一样。
+ *    占位时改用「worker 编号 + run 短码」，真实邮箱时显示邮箱。
+ */
+function describeRun(data: Record<string, unknown>): string {
+  const email = String(data.email ?? "");
+  const workerId = data.worker_id;
+  const runTag = String(data.run_id ?? "").slice(0, 4);
+  if (email && !email.includes("@placeholder.local")) {
+    return email;
+  }
+  const tag = workerId !== undefined && workerId !== null ? `w${workerId}` : "?";
+  return runTag ? `${tag}#${runTag}` : tag;
+}
+
 export function BatchRegisterPanel() {
   const [status, setStatus] = useState<BatchStatus | null>(null);
   const [providers, setProviders] = useState<MailProvider[]>([]);
@@ -156,7 +175,7 @@ export function BatchRegisterPanel() {
           return;
         }
         if (kind === "run_started") {
-          pushLog("run", `开始注册 ${String(data.email ?? "")}`);
+          pushLog("run", `开始注册 ${describeRun(data)}`);
           return;
         }
         if (kind === "run_finished") {
@@ -164,8 +183,8 @@ export function BatchRegisterPanel() {
           pushLog(
             "run",
             ok
-              ? `注册成功 ${String(data.email ?? "")}`
-              : `注册失败 ${String(data.email ?? "")}${data.category ? `（${String(data.category)}）` : ""}`,
+              ? `注册成功 ${describeRun(data)}`
+              : `注册失败 ${describeRun(data)}${data.category ? `（${String(data.category)}）` : ""}`,
             ok ? "ok" : "error",
           );
           return;
@@ -207,8 +226,28 @@ export function BatchRegisterPanel() {
         const raw = String(data.message ?? payload.message ?? "");
         const levelMatch = raw.match(/\[(ERROR|WARNING|INFO|DEBUG|CRITICAL)\]/i);
         const level = levelMatch ? levelMatch[1].toLowerCase() : undefined;
-        // 多 worker 并发时，每行都带上是哪个号 —— 不然分不清是谁的
-        const who = data.email ? `[${String(data.email).slice(0, 18)}] ` : "";
+        // 多 worker 并发时，每行都带上是哪个 worker —— 不然分不清是谁的
+        //
+        // ⚠️ 之前这里用 email 做标识，但非池化来源（Remail / CF 临时邮箱）
+        //    的 email 是**占位地址**：
+        //        remail_placeholder_<时间戳>_<worker>@placeholder.local
+        //    截断到 18 字符后全都变成「remail_placeholder」—— 多个 worker
+        //    的日志前缀一模一样，看起来就像「同一个错误反复出现」，
+        //    根本分不出是谁的（用户实测反馈：日志里有重复的错误）。
+        //    现在占位邮箱时改用 worker 编号 + run 短码。
+        const emailText = String(data.email ?? "");
+        const isPlaceholder = emailText.includes("@placeholder.local");
+        const workerTag = data.worker_id !== undefined && data.worker_id !== null
+          ? `w${data.worker_id}`
+          : "?";
+        const runTag = String(data.run_id ?? "").slice(0, 4);
+        const who = isPlaceholder
+          ? `[${workerTag}${runTag ? `#${runTag}` : ""}] `
+          : emailText
+            ? `[${emailText.slice(0, 18)}] `
+            : data.worker_id !== undefined
+              ? `[${workerTag}] `
+              : "";
         pushLog("log", who + raw.replace(/\d{2}:\d{2}:\d{2}\s+/, ""), level);
       },
       (error) => {
@@ -485,6 +524,11 @@ export function BatchRegisterPanel() {
               <span className="text-xs text-muted-foreground">
                 {status?.last_message || "—"}
               </span>
+              {status?.last_fail_reason ? (
+                <span className="text-xs text-amber-700 dark:text-amber-300">
+                  最后失败原因：{status.last_fail_reason}
+                </span>
+              ) : null}
             </div>
             <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
               <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">

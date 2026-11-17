@@ -137,6 +137,8 @@ export type BatchStatus = {
   concurrency: number;
   workers: { id: number; email: string; run_id: string; proxy: string; started_at: number }[];
   last_message: string;
+  /** 最后一次失败的分类（cf_blocked / network / account…）—— 没有则为空 */
+  last_fail_reason?: string;
   pool_stats: RegisterStatus;
 };
 
