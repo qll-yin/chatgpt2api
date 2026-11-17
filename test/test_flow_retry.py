@@ -145,6 +145,98 @@ class FlowRetryLoopTests(unittest.TestCase):
         # 代理是每遍重新取的（不是启动时取一次就一直用）
         self.assertTrue(all(p == "http://p:1" for p in proxies))
 
+    def test_failed_static_proxy_is_excluded_on_next_pick(self):
+        """⚠️ 刚失败的那条固定出口代理，下一遍必须被排除（否则还是同一个 IP）。"""
+        ctrl = register_batch.AutoLoopController()
+        ctrl._options = {
+            "max_retries": 2,
+            "cool_down_seconds": 0.01,
+            "target_count": 0,
+            "batch_id": "exclude-test",
+            "mail_source": "outlook",
+        }
+        ctrl._max_retries = 2
+
+        excludes: list[set] = []
+        attempts = {"n": 0}
+
+        def fake_proxy(worker_id, exclude=None):
+            excludes.append(set(exclude or set()))
+            return "http://static-a:1"
+
+        def fake_start(account, options):
+            attempts["n"] += 1
+            return f"run-{attempts['n']}"
+
+        def fake_wait(run_id, timeout=1800):
+            return False, "cf_blocked"
+
+        provider = _FakeProvider()
+        provider.pooled = False
+
+        with mock.patch.object(register_batch, "get_provider_class", return_value=provider), \
+             mock.patch.object(register_batch.db, "get_setting", return_value="outlook"), \
+             mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
+             mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
+             mock.patch.object(ctrl, "_proxy_for_worker", side_effect=fake_proxy), \
+             mock.patch.object(ctrl, "_forward_run_logs", return_value=None), \
+             mock.patch.object(ctrl, "_import_to_pool", return_value=None), \
+             mock.patch.object(ctrl, "_record_finish", return_value=None), \
+             mock.patch.object(ctrl, "_settle_failed_proxy", return_value=None), \
+             mock.patch.object(ctrl, "_finalize_account", return_value=None), \
+             mock.patch.object(ctrl, "_proxy_type_of", return_value="static"):
+            ctrl._worker_loop_inner(0, "exclude-test")
+
+        # 第 1 遍没有排除项；第 2 遍开始带上刚失败的那条
+        self.assertEqual(excludes[0], set())
+        self.assertEqual(excludes[1], {"http://static-a:1"})
+        self.assertEqual(excludes[2], {"http://static-a:1"})
+
+    def test_dynamic_proxy_is_not_excluded(self):
+        """动态代理每次连接换 IP —— 排除它反而会把池子挑空。"""
+        ctrl = register_batch.AutoLoopController()
+        ctrl._options = {
+            "max_retries": 2,
+            "cool_down_seconds": 0.01,
+            "target_count": 0,
+            "batch_id": "dynamic-test",
+            "mail_source": "outlook",
+        }
+        ctrl._max_retries = 2
+
+        excludes: list[set] = []
+        attempts = {"n": 0}
+
+        def fake_proxy(worker_id, exclude=None):
+            excludes.append(set(exclude or set()))
+            return "http://dyn:1"
+
+        def fake_start(account, options):
+            attempts["n"] += 1
+            return f"run-{attempts['n']}"
+
+        def fake_wait(run_id, timeout=1800):
+            return False, "cf_blocked"
+
+        provider = _FakeProvider()
+        provider.pooled = False
+
+        with mock.patch.object(register_batch, "get_provider_class", return_value=provider), \
+             mock.patch.object(register_batch.db, "get_setting", return_value="outlook"), \
+             mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
+             mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
+             mock.patch.object(ctrl, "_proxy_for_worker", side_effect=fake_proxy), \
+             mock.patch.object(ctrl, "_forward_run_logs", return_value=None), \
+             mock.patch.object(ctrl, "_import_to_pool", return_value=None), \
+             mock.patch.object(ctrl, "_record_finish", return_value=None), \
+             mock.patch.object(ctrl, "_settle_failed_proxy", return_value=None), \
+             mock.patch.object(ctrl, "_finalize_account", return_value=None), \
+             mock.patch.object(ctrl, "_proxy_type_of", return_value="dynamic"):
+            ctrl._worker_loop_inner(0, "dynamic-test")
+
+        # 动态代理始终不排除
+        self.assertTrue(all(not ex for ex in excludes))
+
 
 class ExcludeProxyTests(unittest.TestCase):
     """固定出口的代理失败后，下一遍要避开它。"""
