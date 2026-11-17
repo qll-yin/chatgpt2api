@@ -159,6 +159,7 @@ def classify_error(err: str, mail_source: str = "") -> str:
       'account'     —— 号/邮箱本身有问题（这个号废了，换下一个）
       'mail_limited'—— 邮箱侧限制（如短效邮箱已消耗）
       'cf_blocked'  —— **这个出口 IP** 被 Cloudflare 拒了（换代理即可，不必熔断）
+      'invalid_state'—— 409 会话失效（服务端："Please start over to continue"）
       'unknown'     —— 兜底
 
     mail_source 用来问 provider 要不要豁免某些模式 —— 比如 iCloud 中转号
@@ -180,19 +181,29 @@ def classify_error(err: str, mail_source: str = "") -> str:
     if any(p in s for p in _CF_BLOCKED_PATTERNS):
         return "cf_blocked"
 
+    # ⚠️ invalid_state（409）必须**单独**归类，不能混进 account。
+    #
+    #    服务端原话："Your sign-in session is no longer valid.
+    #    Please start over to continue." —— 它要的是**从头再来**，
+    #    而"从头再来"能不能救回，几乎完全取决于**出口 IP**：
+    #    同一个 IP 再来一遍还是 409（实测 3/3 全废）。
+    #
+    #    以前它被判成 account → 不可重试 → worker 直接换下一个号，
+    #    结果是：每换一个号就白烧一个付费邮箱（Remail 一封 10 块钱），
+    #    流程级重试**根本没触发**，worker 也永远不会因为它停下。
+    #    现在它是可重试分类 → 换代理重跑整个流程 → 才是正解。
+    if "invalid_state" in s:
+        return "invalid_state"
+
     account_patterns = [
         "wrong_email_otp_code", "invalid_grant", "imap xoauth2",
         "outlook imap account unusable", "user is authenticated but not connected",
         "outlook refresh failed", "authentication failed", "authenticate failed",
         "outlook otp timeout", "registration_disallowed",
         "已有账号", "账号被", "refresh_token 失效",
-        # ⚠️ 下面两个是账号/邮箱层面的拒绝，不是环境问题：
-        #   · user_already_exists：这个邮箱地址在 OpenAI 已经有账号了
-        #     （二手邮箱交易池，别人先注册过了）→ 这个号彻底废了，换下一个
-        #   · invalid_state：sign-in session 失效（"Please start over to continue"）
-        #     → 是 session 过期，不是网络断了；不该因此触发熔断
+        # ⚠️ user_already_exists：这个邮箱地址在 OpenAI 已经有账号了
+        #    （二手邮箱交易池，别人先注册过了）→ 这个号彻底废了，换下一个
         "user_already_exists",
-        "invalid_state",
     ]
     if mail_source:
         try:
@@ -349,6 +360,62 @@ def _do_register(
         cfg = Config()
         cfg.proxy = (options.get("proxy") or "").strip() or None
 
+        # ── 换出口代理（供 auth_flow 内部重试用）──
+        #
+        # ⚠️ 为什么必须有它：
+        #    以前 warmup（4 次）和 409 invalid_state（3 次）的重试都只是
+        #    「重建 session」，代理地址原封不动 → **出口 IP 没变** →
+        #    拿同一个 IP 再撞一次墙，重试全是白费（实测 4/4、3/3 全废）。
+        #    现在重试前先换一条别的代理（= 别的出口 IP），重试才有意义。
+        #
+        # 只有**后端代理池里的**代理才能换 —— 文本代理池（options.proxy 里的
+        # 逗号分隔列表）没有"另一条"可挑，换不了就老实告诉调用方换不了。
+        _proxy_row = None
+        if cfg.proxy:
+            try:
+                _proxy_row = db.find_proxy(cfg.proxy)
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("registrar").warning(
+                    f"[register] 查代理类型失败（不影响注册）: {e}"
+                )
+        _can_rotate = _proxy_row is not None
+        _proxy_type = str((_proxy_row or {}).get("proxy_type") or "").strip().lower()
+
+        # 外层（auto_loop worker）用它拿到"这次实际用的那条代理"，
+        # 好按正确的对象结算配额（换过代理时，原代理那条是旧的）。
+        _proxy_state = options.get("proxy_state")
+
+        def _rotate_proxy() -> str:
+            """换一条别的代理（= 换出口 IP）。拿不到就返回空串。"""
+            if not _can_rotate:
+                return ""
+            cur = str(cfg.proxy or "").strip()
+            if not cur:
+                return ""
+            try:
+                new = db.pick_proxy(exclude={cur})
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("registrar").warning(f"[register] 换代理失败: {e}")
+                return ""
+            if not new:
+                return ""
+            # ⚠️ 挑回自己 = 池里没有别的代理了（pick_proxy 有"没有就回退"的兜底）。
+            #    这时候**不能**动配额 —— 这条代理这一轮还在用。
+            if new == cur:
+                return ""
+            # 预占（used_count）从旧代理转移到新代理：
+            # 旧代理那格还回去（它这一轮没真正注册成），新代理占一格。
+            try:
+                db.proxy_release(cur)
+            except Exception:  # noqa: BLE001
+                pass
+            if isinstance(_proxy_state, dict):
+                _proxy_state["proxy"] = new
+            logging.getLogger("registrar").info(
+                f"[register] 流程内换代理（换出口 IP）: {cur[:50]} → {new[:50]}"
+            )
+            return new
+
         # ─ 邮箱来源路由 ─
         # 原来是 if cf_temp / else outlook 的写死分支，加一种邮箱就得回来改。
         # 现在交给注册表工厂：provider 自己从 settings + account 里取需要的字段。
@@ -420,6 +487,8 @@ def _do_register(
             on_password=_save_password_early,
             on_session_ready=_bind_2fa_hook if options.get("want_2fa") else None,
             account_callback=_account_callback_for_flow,
+            proxy_rotator=_rotate_proxy if _can_rotate else None,
+            proxy_type=_proxy_type,
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         # 把关键开关的实际生效值打进日志 —— 主人反馈过"关掉 2FA 好像没反应"，
@@ -643,11 +712,25 @@ def _do_register(
         if category != "account":
             logging.getLogger("registrar").error(traceback.format_exc())
         # 非池化 provider 没有号池记录，不操作
-        if is_pooled:
-            if category == "network":
+        #
+        # ⚠️ hold_account：外层 worker 打算**用同一个号重跑整个流程**时传这个开关。
+        #    这时账号状态由 worker 统一处置（重试成功 → done；
+        #    重试到底还是失败 → mark_failed / release），
+        #    这里**不能**动 —— 否则号会被放回 available，
+        #    而 worker 手里还攥着它 → 并发时另一个 worker 可能领到同一个号，
+        #    同一个邮箱注册两次 → user_already_exists。
+        if is_pooled and not options.get("hold_account"):
+            if category in ("network", "cf_blocked", "invalid_state"):
+                # ⚠️ 这三类都是**出口 IP 的锅**，不是号的锅：
+                #    · network      —— 代理/网络整体不通
+                #    · cf_blocked   —— CF 把这个出口 IP 拒了
+                #    · invalid_state—— 409 会话失效（几乎都是出口 IP 被 OpenAI 记了）
+                #    号完全无辜，必须 release 回 available 复用，
+                #    判死等于白烧一个付费邮箱（Remail 一封 10 块）。
                 db.release_unused(email)
                 logging.getLogger("registrar").warning(
-                    f"[register] {email} 判定为网络/环境错误，号已 release 回 available"
+                    f"[register] {email} 判定为出口/环境问题（{category}），"
+                    f"号无辜，已 release 回 available 复用"
                 )
             elif category == "mail_limited":
                 # ⚠️ 邮箱侧的固有限制（如短效邮箱已消耗），**不能 release**。

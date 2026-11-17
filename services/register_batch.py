@@ -39,7 +39,15 @@ logger = logging.getLogger("auto_loop")
 #
 # 一整个流程（含 auth_flow 内部的重建会话重试）只算**一次**尝试，
 # 这才是旧注册机的语义：「按整个流程重试次数算」。
-RETRYABLE_CATEGORIES = frozenset({"cf_blocked", "network", "unknown"})
+#
+# ⚠️ invalid_state（409 "Please start over to continue"）必须在可重试集合里。
+#    以前它被归到 account（不可重试）→ 流程级重试**根本没触发**，
+#    worker 直接换下一个号 → 每换一个号就白烧一个付费邮箱，
+#    而且重试计数被清零，worker 永远也不会因为它停下来。
+#    实际上 409 几乎总是**出口 IP 被 OpenAI 记了** —— 换个 IP 重跑就能过。
+RETRYABLE_CATEGORIES = frozenset(
+    {"cf_blocked", "network", "unknown", "invalid_state"}
+)
 
 # 不可重试的分类及原因（写清楚是为了以后有人问「为什么不重试」）：
 #   account     —— 号/邮箱本身废了（user_already_exists / 邮箱已注册 /
@@ -360,7 +368,9 @@ class AutoLoopController:
             self._last_message = msg
         self._broadcast("state", self._snapshot())
 
-    def _proxy_for_worker(self, worker_id: int) -> str:
+    def _proxy_for_worker(
+        self, worker_id: int, exclude: set[str] | None = None
+    ) -> str:
         """给这个 worker 取一个代理。
 
         ⚠️ 这里从"按 worker_id 取模"改成了"每次动态挑"，因为取模是**静态绑定**：
@@ -374,10 +384,13 @@ class AutoLoopController:
           - 优先挑用得少的（天然均衡负载）
         某个代理用满配额或被手动停用后，其余 worker 自动绕开它。
 
+        exclude：本次要避开的代理（刚失败/刚被 CF 拦的那条固定出口代理）。
+        流程级重试必须换出口 IP —— 同一个固定 IP 再跑一遍必然还是同样的结果。
+
         后端池为空时回落到旧的文本代理池（按 worker_id 取模，保持老行为）。
         """
         if self._backend_proxy_pool:
-            picked = db.pick_proxy()
+            picked = db.pick_proxy(exclude=exclude)
             if picked:
                 return picked
             # 池里没有可用代理了 —— 返回空串，让调用方决定是等待还是停止。
@@ -388,7 +401,7 @@ class AutoLoopController:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
 
-    def _wait_for_proxy(self, worker_id: int) -> str:
+    def _wait_for_proxy(self, worker_id: int, exclude: set[str] | None = None) -> str:
         """代理池暂时拿不到可用代理时，等一会儿再试。
 
         ⚠️ 为什么不能直接放弃
@@ -407,7 +420,7 @@ class AutoLoopController:
         while time.time() < deadline:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 return ""
-            picked = self._proxy_for_worker(worker_id)
+            picked = self._proxy_for_worker(worker_id, exclude=exclude)
             if picked:
                 return picked
             if not announced:
@@ -422,15 +435,30 @@ class AutoLoopController:
             time.sleep(2)
         return ""
 
-    def _record_finish(self, ok: bool, category: str):
-        """worker 结束一个 run 后调，更新计数 + 熔断。"""
+    def _record_finish(
+        self,
+        ok: bool,
+        category: str,
+        count_fail: bool = True,
+        count_breaker: bool = True,
+    ):
+        """worker 结束一个 run 后调，更新计数 + 熔断。
+
+        ⚠️ count_fail / count_breaker 是为「流程级重试」拆开的：
+           · count_fail    —— 每一遍完整流程都算一次失败
+             （用户能看到"试了 N 遍"，而不是只看到 1 次）
+           · count_breaker —— 熔断只在**整条重试链**最终失败时计一次。
+             否则同一遍流程里的 3 次重试会把熔断计数凑满，
+             批次在重试还没跑完就被暂停掉。
+        """
         with self._lock:
             if ok:
                 self._registered_ok += 1
                 self._consecutive_network_fails = 0
                 self._last_fail_reason = ""
             else:
-                self._registered_fail += 1
+                if count_fail:
+                    self._registered_fail += 1
                 # ⚠️ 记录最后一次失败原因 —— 前端状态栏要能看到「为什么停了」，
                 #    否则用户只看到「成功 1 / 失败 0 然后停止」，完全无从判断。
                 self._last_fail_reason = str(category or "unknown")
@@ -438,10 +466,11 @@ class AutoLoopController:
                 #    cf_blocked 是「这个出口 IP 被 CF 拒了」—— 换一个代理就能继续，
                 #    不该把整个批次停掉（实测日志里 7 次 CF 403 触发了熔断，
                 #    白白暂停了自动注册）。
-                if category == "network":
-                    self._consecutive_network_fails += 1
-                else:
-                    self._consecutive_network_fails = 0
+                if count_breaker:
+                    if category == "network":
+                        self._consecutive_network_fails += 1
+                    else:
+                        self._consecutive_network_fails = 0
             self._last_message = (
                 f"累计 ok={self._registered_ok} fail={self._registered_fail}"
                 + (f"（最后失败原因：{self._last_fail_reason}）" if self._last_fail_reason else "")
@@ -525,6 +554,106 @@ class AutoLoopController:
             if self._options.get("auto_import", True):
                 self._refresh_pool_quota_async()
 
+    # ─────────────────── 流程级重试的三个辅助 ───────────────────
+
+    def _proxy_type_of(self, proxy: str) -> str:
+        """查这条代理的类型（static / dynamic）。查不到返回空串。"""
+        p = str(proxy or "").strip()
+        if not p:
+            return ""
+        try:
+            row = db.find_proxy(p) or {}
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(row.get("proxy_type") or "").strip().lower()
+
+    def _settle_failed_proxy(self, worker_id: int, proxy: str, category: str) -> None:
+        """失败时结算这条代理：还配额 + 记失败次数 + 按分类做代理级处置。
+
+        ⚠️ 用的是「**实际用的那条**」—— 流程内可能换过代理
+        （auth_flow 换出口 IP），原代理那条的预占已经被转移，
+        按旧的结算就会算错对象。
+        """
+        if not proxy or not self._backend_proxy_pool:
+            return
+        # 失败不占配额：把 pick_proxy 的预占还回去，只记失败次数。
+        db.proxy_release(proxy)
+        db.proxy_used(proxy, ok=False)
+        # ⚠️ CF 拦截的处置与普通失败**完全不同**：
+        #    · 静态代理（固定出口 IP）→ 这个 IP 已被 CF 拉黑，
+        #      连续被拦达阈值就自动停用，别再拿它试
+        #    · 动态代理（每次换 IP）→ 不停用，只是这个出口不行，
+        #      换一次 IP 可能就通过了
+        # 具体动作交给 db.mark_proxy_cf_blocked 按类型决定。
+        if category == "cf_blocked":
+            cfres = db.mark_proxy_cf_blocked(proxy)
+            # ⚠️ 键名是 "disabled"，不是 "auto_disabled" —— 以前写错了，
+            #    所以「静态代理已自动停用」这条提示**从来没触发过**。
+            if cfres.get("disabled"):
+                logger.warning(
+                    f"[worker-{worker_id}] 静态代理被 CF 连续拦截 "
+                    f"{cfres.get('cf_blocked')} 次 → 已自动停用: {proxy[:60]}"
+                )
+                self._broadcast("proxy_disabled", {
+                    "proxy": proxy,
+                    "reason": f"被 Cloudflare 连续拦截 {cfres.get('cf_blocked')} 次",
+                    "count": cfres.get("cf_blocked"),
+                })
+            else:
+                logger.info(
+                    f"[worker-{worker_id}] 代理被 CF 拦截"
+                    f"（{cfres.get('proxy_type')} 类型，累计 "
+                    f"{cfres.get('cf_blocked')} 次）→ 换下一个代理: {proxy[:60]}"
+                )
+        elif category == "invalid_state":
+            # ── 409 invalid_state 的代理级处置 ──
+            # ⚠️ 根因往往就是这个出口 IP 被 OpenAI 记了。
+            #    不处置的话，被记死的静态代理会被反复挑中，
+            #    每次都撞 409，每次都白烧一个付费邮箱。
+            isres = db.mark_proxy_invalid_state(proxy)
+            if isres.get("disabled"):
+                logger.warning(
+                    f"[worker-{worker_id}] 静态代理连续 {isres.get('invalid_state')} 次"
+                    f"会话失效(409 invalid_state) → 已自动停用: {proxy[:60]}"
+                )
+                self._broadcast("proxy_disabled", {
+                    "proxy": proxy,
+                    "reason": "连续会话失效(409 invalid_state)",
+                    "count": isres.get("invalid_state"),
+                })
+            else:
+                logger.info(
+                    f"[worker-{worker_id}] 代理会话失效(409 invalid_state)"
+                    f"（{isres.get('proxy_type')} 类型，累计 "
+                    f"{isres.get('invalid_state')} 次）→ 换下一个代理: {proxy[:60]}"
+                )
+
+    def _finalize_account(self, account: dict, category: str, pooled: bool) -> None:
+        """这个号重试到底之后的最终处置（号池型来源才有号池记录）。
+
+        ⚠️ 重试期间号一直挂在 in_use（hold_account=True，registrar 不碰它），
+        所以链条结束时必须由这里收尾，否则号会永远卡在 in_use。
+
+        · network / cf_blocked / invalid_state → 号无辜，放回 available 复用
+        · 其它（account / mail_limited / unknown）→ 这个号废了，标 failed
+        """
+        if not pooled:
+            return
+        email = str((account or {}).get("email") or "").strip()
+        if not email:
+            return
+        try:
+            if category in ("network", "cf_blocked", "invalid_state"):
+                db.release_unused(email)
+                logger.info(
+                    f"[register] {email} 判定为出口/环境问题（{category}），"
+                    f"号无辜，已放回号池复用"
+                )
+            else:
+                db.mark_failed(email, f"[{category}] 流程重试用尽")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"账号 {email} 收尾失败: {e}")
+
     def _worker_loop(self, worker_id: int):
         """单 worker 循环：claim → 跑 → 等结束 → 继续。"""
         # 本轮批次的标识 —— 用来识别「我是上一批残留的 worker」。
@@ -584,37 +713,7 @@ class AutoLoopController:
                     )
                     return
 
-            # 每次注册前动态取代理（后端池有启用/上限/用量状态）。
-            # 代理池非空但取不到可用代理 → 说明全部停用或全部超配额，
-            # 这种情况要停下整个 auto-loop 并说清楚原因，不能静默直连 ——
-            # 直连等于所有 worker 挤同一个真实 IP，正是限流要防的事。
-            #
-            # ⚠️ 但「暂时拿不到」和「真的没有」是两回事：
-            #    pick_proxy() 是**选中即预占**（used_count+1），并发 worker 数 >
-            #    代理数时，后面的 worker 会暂时拿不到 —— 而失败的 worker 会把
-            #    配额还回来（proxy_release）。之前这里直接 return，把整个批次
-            #    停掉、而且**不记账**（失败数显示 0），用户看到的是
-            #    「成功 1 / 失败 0，然后就停了」。
-            #    现在改成：先等一段时间（默认 120 秒），期间不断重试取代理；
-            #    等不到才退出这个 worker，且退出时明确说明原因。
-            proxy = self._proxy_for_worker(worker_id)
-            if self._backend_proxy_pool and not proxy:
-                proxy = self._wait_for_proxy(worker_id)
-                if not proxy:
-                    stats = db.proxy_pool_stats()
-                    msg = (
-                        f"代理池暂时无可用代理（可用 {stats['available']} / 停用 {stats['disabled']}"
-                        f" / 已满 {stats['exhausted']}），等待 {self._proxy_wait_secs} 秒后仍拿不到，"
-                        f"已停止 worker-{worker_id}"
-                    )
-                    self._set_message(msg)
-                    logger.warning(msg)
-                    with self._lock:
-                        self._worker_status.pop(worker_id, None)
-                    self._broadcast("state", self._snapshot())
-                    return
-
-            # claim 下一个号。要不要走号池由 provider 的 pooled 决定，
+            # ── claim 下一个号。要不要走号池由 provider 的 pooled 决定，
             # 非池化的（CF 这类自己造地址的）用虚拟占位。
             #
             # ⚠️ 优先用**本次批量指定的** mail_source（用户在批量注册页选的），
@@ -669,174 +768,235 @@ class AutoLoopController:
                 AutoLoopState.RUNNING, str(self._options.get("batch_id") or "")
             )
 
-            # 给这个 run 注入 worker 自己的代理
-            run_options = dict(self._options)
-            if proxy:
-                run_options["proxy"] = proxy
+            # ══════════════════════════════════════════════════════════
+            # 流程级重试：同一个号，最多跑 1 + max_retries 遍**完整流程**
+            # ══════════════════════════════════════════════════════════
+            #
+            # ⚠️ 语义（用户明确要求）：
+            #    「一遍流程」= 一次完整注册 = 一个「开始注册」事件。
+            #    流程**内部** auth_flow 自己的重建会话重试（warmup 4 次 /
+            #    409 invalid_state 3 次）**不算**流程级重试 —— 它们都发生在
+            #    同一次「开始注册」里面，属于同一遍流程。
+            #    流程级重试 = 换一个出口 IP，**从头再走一遍完整流程**
+            #    （于是你会看到第 2、第 3、第 4 个「开始注册」）。
+            #
+            # ⚠️ 为什么必须换出口 IP：同一个 IP 再走一遍 = 同样的 409 /
+            #    CF 403，重试只是白转圈。所以每遍失败就把这条（静态）代理
+            #    记下来，下一遍避开它 —— 见 pick_proxy(exclude=...)。
+            #
+            # ⚠️ 为什么复用同一个号：这些失败几乎都是**出口 IP 的锅**
+            #    （cf_blocked / invalid_state / network），不是号的锅。
+            #    换号 = 白烧一个付费邮箱（Remail 一封 10 块）。
+            attempt = 0
+            failed_proxies: set[str] = set()
+            chain_ok = False
+            chain_category = ""
+            recorded = False
+            run_id = ""
+            while True:
+                attempt += 1
 
-            # 启一个 run
-            try:
-                run_id = registrar.start_registration(account, run_options)
-            except Exception as e:
-                logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
-                if pooled:
-                    db.release_unused(account["email"])
-                time.sleep(2)
-                continue
+                # ── 取代理（避开本轮已失败的固定出口代理）──
+                proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
+                if self._backend_proxy_pool and not proxy:
+                    proxy = self._wait_for_proxy(worker_id, exclude=failed_proxies)
+                    if not proxy:
+                        stats = db.proxy_pool_stats()
+                        msg = (
+                            f"没有别的代理可换了（可用 {stats['available']} / 停用 {stats['disabled']}"
+                            f" / 已满 {stats['exhausted']}），本轮已排除 {len(failed_proxies)} "
+                            f"条失败的固定出口代理 —— 换出口 IP 重试才有意义，"
+                            f"请补充代理后重新开始，已停止 worker-{worker_id}"
+                        )
+                        self._set_message(msg)
+                        logger.warning(msg)
+                        self._finalize_account(account, "cf_blocked", pooled)
+                        with self._lock:
+                            self._worker_status.pop(worker_id, None)
+                        self._broadcast("state", self._snapshot())
+                        return
 
-            with self._lock:
-                self._worker_status[worker_id] = {
+                # ── 给这个 run 注入 worker 自己的代理 ──
+                run_options = dict(self._options)
+                if proxy:
+                    run_options["proxy"] = proxy
+                # 记录「这次实际用的代理」—— 流程内如果换了代理，
+                # registrar 会把 holder 更新成新的，最终按它结算配额。
+                proxy_holder = {"proxy": proxy}
+                run_options["proxy_state"] = proxy_holder
+                # 账号状态由本 worker 统一处置：重试期间号留在 in_use，
+                # 不能放回池子 —— 否则另一个 worker 会领到同一个号，
+                # 同一个邮箱注册两次 → user_already_exists。
+                run_options["hold_account"] = True
+
+                # 启一个 run
+                try:
+                    run_id = registrar.start_registration(account, run_options)
+                except Exception as e:
+                    logger.exception(f"[worker-{worker_id}] 启动注册失败: {e}")
+                    if proxy and self._backend_proxy_pool:
+                        db.proxy_release(proxy)
+                    chain_ok = False
+                    chain_category = "unknown"
+                    self._finalize_account(account, "network", pooled)
+                    self._record_finish(
+                        False, "unknown", count_fail=True, count_breaker=True
+                    )
+                    recorded = True
+                    break
+
+                with self._lock:
+                    self._worker_status[worker_id] = {
+                        "email": account["email"],
+                        "run_id": run_id,
+                        "proxy": proxy,
+                        "started_at": time.time(),
+                        "attempt": attempt,
+                        "max_attempts": self._max_retries + 1,
+                    }
+                self._broadcast("state", self._snapshot())
+                self._broadcast("run_started", {
+                    "worker_id": worker_id,
                     "email": account["email"],
                     "run_id": run_id,
                     "proxy": proxy,
-                    "started_at": time.time(),
-                }
-            self._broadcast("state", self._snapshot())
-            self._broadcast("run_started", {
-                "worker_id": worker_id,
-                "email": account["email"],
-                "run_id": run_id,
-                "proxy": proxy,
-            })
-            # ── 把这个 run 的详细日志转发到 batch SSE ──
-            # ⚠️ 这一步原来完全缺失：registrar 把日志写进自己的 _run_queues，
-            #    而 batch 的 SSE 只广播 state / run_started / run_finished ——
-            #    两边**没接上**，所以实时日志只有一个「开始注册」就没了，
-            #    详细过程只能去「运行记录」里翻。
-            self._forward_run_logs(run_id, worker_id, account["email"])
+                    "attempt": attempt,
+                    "max_attempts": self._max_retries + 1,
+                })
+                # ── 把这个 run 的详细日志转发到 batch SSE ──
+                # ⚠️ 这一步原来完全缺失：registrar 把日志写进自己的 _run_queues，
+                #    而 batch 的 SSE 只广播 state / run_started / run_finished ——
+                #    两边**没接上**，所以实时日志只有一个「开始注册」就没了，
+                #    详细过程只能去「运行记录」里翻。
+                self._forward_run_logs(run_id, worker_id, account["email"])
 
-            # 等当前 run 跑完
-            ok, category = self._wait_run_finish(run_id)
+                # 等当前 run 跑完
+                ok, category = self._wait_run_finish(run_id)
 
-            # ── 被外部停止（用户点停止 / 目标达成）──
-            # 这不是失败：不该计失败数、不该触发重试、不该退到「换号继续」，
-            # 直接干净退出这个 worker。
-            if category == STOPPED_CATEGORY:
-                with self._lock:
-                    self._worker_status.pop(worker_id, None)
-                self._broadcast("state", self._snapshot())
-                return
+                # ── 被外部停止（用户点停止 / 目标达成）──
+                # 这不是失败：不该计失败数、不该触发重试、不该退到「换号继续」，
+                # 直接干净退出这个 worker。
+                if category == STOPPED_CATEGORY:
+                    with self._lock:
+                        self._worker_status.pop(worker_id, None)
+                    self._broadcast("state", self._snapshot())
+                    return
 
-            # 空分类一律按 unknown 处理（unknown 在可重试集合里）。
-            # ⚠️ 之前空分类既不在 RETRYABLE 也不在 NON_RETRYABLE 里 →
-            #    走「换号继续」分支且重试计数清零 → 失败重试完全不起作用。
-            category = str(category or "").strip() or "unknown"
+                # 空分类一律按 unknown 处理（unknown 在可重试集合里）。
+                # ⚠️ 之前空分类既不在 RETRYABLE 也不在 NON_RETRYABLE 里 →
+                #    走「换号继续」分支且重试计数清零 → 失败重试完全不起作用。
+                category = str(category or "").strip() or "unknown"
+                # 流程内可能换过代理 → 以「实际用的那条」为准
+                used_proxy = str(proxy_holder.get("proxy") or proxy or "")
+                chain_ok = ok
+                chain_category = category
 
-            # 失败计数在这里结算：成功计数由 registrar 在真正拿到凭证时结算
-            #（那里才知道这个号到底注册成功没有），失败则在这里记。
-            # 失败**不占用配额**（只累加 failed_count），符合"失败不计入上限"。
-            # ⚠️ pick_proxy() 选中时已经**预占**了一格，所以失败要先把预占还回去，
-            #    否则失败的号也会白占一个名额。
-            if not ok and proxy and self._backend_proxy_pool:
-                db.proxy_release(proxy)
-                db.proxy_used(proxy, ok=False)
-                # ⚠️ CF 拦截的处置与普通失败**完全不同**：
-                #    · 静态代理（固定出口 IP）→ 这个 IP 已被 CF 拉黑，
-                #      连续被拦达阈值就自动停用，别再拿它试
-                #    · 动态代理（每次换 IP）→ 不停用，只是这个出口不行，
-                #      换一次 IP 可能就通过了
-                # 具体动作交给 db.mark_proxy_cf_blocked 按类型决定。
-                if category == "cf_blocked":
-                    cfres = db.mark_proxy_cf_blocked(proxy)
-                    if cfres.get("auto_disabled"):
-                        logger.warning(
-                            f"[worker-{worker_id}] 静态代理被 CF 连续拦截 "
-                            f"{cfres.get('cf_blocked')} 次 → 已自动停用: {proxy[:60]}"
-                        )
-                    else:
-                        logger.info(
-                            f"[worker-{worker_id}] 代理被 CF 拦截"
-                            f"（{cfres.get('proxy_type')} 类型，累计 "
-                            f"{cfres.get('cf_blocked')} 次）→ 换下一个代理: {proxy[:60]}"
-                        )
-                elif category == "invalid_state":
-                    # ── 409 invalid_state 的代理级处置 ──
-                    # ⚠️ 这个错误被分类成 account（不是 network），所以不会熔断
-                    #    整批 —— 但**根因往往就是这个出口 IP 被 OpenAI 记了**。
-                    #    不处置的话，被记死的静态代理会被反复挑中，
-                    #    每次都撞 409，每次都白烧一个付费邮箱。
-                    isres = db.mark_proxy_invalid_state(proxy)
-                    if isres.get("disabled"):
-                        logger.warning(
-                            f"[worker-{worker_id}] 静态代理连续 {isres.get('invalid_state')} 次"
-                            f"会话失效(409 invalid_state) → 已自动停用: {proxy[:60]}"
-                        )
-                        self._broadcast("proxy_disabled", {
-                            "proxy": proxy,
-                            "reason": "连续会话失效(409 invalid_state)",
-                            "count": isres.get("invalid_state"),
-                        })
-                    else:
-                        logger.info(
-                            f"[worker-{worker_id}] 代理会话失效(409 invalid_state)"
-                            f"（{isres.get('proxy_type')} 类型，累计 "
-                            f"{isres.get('invalid_state')} 次）→ 换下一个代理: {proxy[:60]}"
-                        )
+                # ── 注册成功 → 写入号池 ──
+                # ⚠️ 这一步原来完全缺失：auto_loop 是从旧注册机迁来的，
+                #    旧注册机不管号池，所以「注册成功自动导入号池」这个开关
+                #    形同虚设 —— 号注册出来了，但号池里一个都没有。
+                if ok:
+                    self._import_to_pool(account, used_proxy, run_id)
+                    consecutive_retryable_fails = 0
+                    self._record_finish(True, "", count_fail=False, count_breaker=True)
+                    recorded = True
+                    break
 
-            # ── 注册成功 → 写入号池 ──
-            # ⚠️ 这一步原来完全缺失：auto_loop 是从旧注册机迁来的，
-            #    旧注册机不管号池，所以「注册成功自动导入号池」这个开关
-            #    形同虚设 —— 号注册出来了，但号池里一个都没有。
-            if ok:
-                self._import_to_pool(account, proxy, run_id)
-                consecutive_retryable_fails = 0
+                # ── 失败：结算代理 ──
+                self._settle_failed_proxy(worker_id, used_proxy, category)
 
-            # ── worker 级重试判定 ──
-            #
-            # 一个完整流程（含 auth_flow 内部的重建会话重试）算**一次**尝试。
-            # 失败后：
-            #   · 可重试分类（cf_blocked / network / unknown）→ 换个代理再跑一遍
-            #   · 不可重试分类（account / mail_limited）→ 重试也没意义，换号继续
-            #
-            # 连续可重试失败超过 max_retries → 这个 worker 停下来。
-            # 为什么是「停 worker」而不是「无限换号」：出口 IP 不通时换多少个号
-            # 都是同一个死路，一直空转只会白烧付费邮箱。
-            if not ok:
+                # ── worker 级重试判定 ──
+                #
+                # 一个完整流程（含 auth_flow 内部的重建会话重试）算**一次**尝试。
+                # 失败后：
+                #   · 可重试分类（cf_blocked / invalid_state / network / unknown）
+                #     → **换代理 + 用同一个号从头再走一遍完整流程**
+                #   · 不可重试分类（account / mail_limited）→ 重试也没意义，换号继续
+                #
+                # 连续可重试失败超过 max_retries → 这个 worker 停下来。
+                # 为什么是「停 worker」而不是「无限换号」：出口 IP 不通时换多少个号
+                # 都是同一个死路，一直空转只会白烧付费邮箱。
                 retryable = category in RETRYABLE_CATEGORIES
                 if not retryable:
                     # 换号继续 —— 这次失败不算「连续失败」，重试计数清零。
                     consecutive_retryable_fails = 0
+                    self._finalize_account(account, category, pooled)
+                    self._record_finish(
+                        False, category, count_fail=True, count_breaker=True
+                    )
+                    recorded = True
                     if category in NON_RETRYABLE_CATEGORIES:
                         logger.info(
                             f"[worker-{worker_id}] 失败分类 {category} 不可重试"
                             f"（号/邮箱本身的问题）→ 换下一个号继续"
                         )
-                else:
-                    consecutive_retryable_fails += 1
-                    if consecutive_retryable_fails > self._max_retries:
-                        msg = (
-                            f"worker-{worker_id} 连续 {self._max_retries} 次重试仍失败"
-                            f"（最后原因：{category or '未知'}），已停止该 worker"
-                        )
-                        logger.warning(msg)
-                        self._set_message(msg)
-                        # ⚠️ 必须在 return 前结算 —— 这次失败也要算进批次统计，
-                        #    否则「成功 X / 失败 Y」里的 Y 会少算这一次。
-                        self._record_finish(False, category)
-                        with self._lock:
-                            self._worker_status.pop(worker_id, None)
-                        self._broadcast("state", self._snapshot())
-                        return
-                    logger.info(
-                        f"[worker-{worker_id}] 第 {consecutive_retryable_fails}/{self._max_retries} "
-                        f"次重试（原因：{category or '未知'}）→ 换条件再试一遍"
-                    )
+                    break
 
+                # 可重试 → 这条（静态）代理的出口 IP 已经被记，下一遍避开它。
+                # ⚠️ 只有**静态**代理才排除：它的出口 IP 是固定的，
+                #    再用一次还是撞同一堵墙。动态代理每次连接换 IP，
+                #    排除它反而会把池子挑空（用户常常只有一条动态代理）。
+                if used_proxy and self._proxy_type_of(used_proxy) == "static":
+                    failed_proxies.add(used_proxy)
+
+                consecutive_retryable_fails += 1
+                if consecutive_retryable_fails > self._max_retries:
+                    msg = (
+                        f"worker-{worker_id} 连续 {self._max_retries} 次重试仍失败"
+                        f"（最后原因：{category or '未知'}），已停止该 worker"
+                    )
+                    logger.warning(msg)
+                    self._set_message(msg)
+                    self._finalize_account(account, category, pooled)
+                    self._record_finish(
+                        False, category, count_fail=True, count_breaker=True
+                    )
+                    recorded = True
+                    with self._lock:
+                        self._worker_status.pop(worker_id, None)
+                    self._broadcast("state", self._snapshot())
+                    self._broadcast("run_finished", {
+                        "worker_id": worker_id,
+                        "email": account["email"],
+                        "run_id": run_id,
+                        "ok": False,
+                        "category": category,
+                        "attempt": attempt,
+                        "max_attempts": self._max_retries + 1,
+                    })
+                    return
+
+                # 这一遍失败要记账（失败数 = 试了几遍），但**不**计熔断 ——
+                # 熔断只在整条重试链最终失败时计一次。
+                self._record_finish(
+                    False, category, count_fail=True, count_breaker=False
+                )
+                recorded = True
+                logger.info(
+                    f"[worker-{worker_id}] 第 {attempt} 遍流程失败（{category}）→ "
+                    f"第 {consecutive_retryable_fails}/{self._max_retries} 次重试："
+                    f"换出口 IP，用同一个号从头再走一遍完整流程"
+                )
+                # 继续内层循环 → 同一个号、换代理、再走一遍完整流程
+                # （用户会看到又一个「开始注册」）
+
+            # ── 一遍流程链结束 ──
             with self._lock:
                 self._worker_status.pop(worker_id, None)
-            self._record_finish(ok, category)
-            # ⚠️ 刚跑完一个 run —— 这是「worker 确实停下来了」的时刻。
-            #    如果此刻没有别的 worker 在跑（号池空 / provider 不可用 /
-            #    目标达成），状态要立刻收敛，别让前端一直显示「运行中」。
-            # ⚠️ 这里**不**收敛状态 —— worker 还活着，可能继续领下一个号。
-            #    收敛只在 worker 真正退出时做（见 _worker_loop 的 finally）。
+            if not recorded:
+                self._record_finish(
+                    False, chain_category or "unknown",
+                    count_fail=True, count_breaker=True,
+                )
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
                 "email": account["email"],
                 "run_id": run_id,
-                "ok": ok,
-                "category": category,
+                "ok": chain_ok,
+                "category": chain_category,
+                "attempt": attempt,
+                "max_attempts": self._max_retries + 1,
             })
 
             # 冷却（每个 worker 自己的节奏）

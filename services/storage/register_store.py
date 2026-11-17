@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, update as sa_update
@@ -1165,7 +1165,7 @@ def set_proxy_ipv6_status(proxy: str, status: str) -> bool:
         return bool(result.rowcount)
 
 
-def pick_proxy() -> str:
+def pick_proxy(exclude: Optional[Iterable[str]] = None) -> str:
     """挑一个可用代理：启用中 + 未超配额 + 用得少的优先。
 
     ★ 关键：**选中即预占一格**（used_count +1）。
@@ -1177,9 +1177,15 @@ def pick_proxy() -> str:
       - 注册成功 → 什么都不做（预占的那格就是这次的配额）
       - 注册失败 → 调用 proxy_release 把这格还回去（失败不占配额）
 
+    exclude：本次要**避开**的代理（通常是刚失败/刚被 CF 拦的那条）。
+    ⚠️ 流程级重试必须换出口 IP —— 同一个固定出口 IP 再跑一遍，
+       必然还是同样的 409 / CF 403，纯属白转圈。所以重试时把刚失败
+       的那条排除掉，让 pick 挑另一条。
+
     池里没有可用代理时返回空串（调用方负责停下并提示）。
     """
     now = time.time()
+    ex = {str(p or "").strip() for p in (exclude or []) if str(p or "").strip()}
     with register_session_scope() as session:
         stmt = (
             select(ProxyPoolModel)
@@ -1188,24 +1194,38 @@ def pick_proxy() -> str:
                 (ProxyPoolModel.max_uses == 0)
                 | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses)
             )
-            .order_by(ProxyPoolModel.used_count.asc(), ProxyPoolModel.failed_count.asc())
+            # 排序：先用得少的优先（负载均衡）→ 失败少的优先 →
+            #      被 CF 拦/409 过的排后面（出口 IP 已经被记，别再挑它）
+            .order_by(
+                ProxyPoolModel.used_count.asc(),
+                ProxyPoolModel.failed_count.asc(),
+                ProxyPoolModel.cf_blocked.asc(),
+                ProxyPoolModel.invalid_state.asc(),
+            )
             .limit(50)
         )
         candidates = list(session.execute(stmt).scalars())
-        for candidate in candidates:
-            # 条件 UPDATE 保证并发下只有一个 worker 拿到
-            result = session.execute(
-                sa_update(ProxyPoolModel)
-                .where(
-                    ProxyPoolModel.proxy == candidate.proxy,
-                    ProxyPoolModel.enabled.is_(True),
-                    (ProxyPoolModel.max_uses == 0)
-                    | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses),
+        # ⚠️ 两轮挑选：先只看不带 exclude 的（= 换一条别的代理 = 换出口 IP），
+        #    一条都没有才回头用被排除的。
+        #    否则池里只有一条代理时，重试会直接没得挑 → worker 等 120 秒后
+        #    直接收工（比原来的行为还差）。
+        for phase in (0, 1):
+            for candidate in candidates:
+                if phase == 0 and ex and candidate.proxy in ex:
+                    continue
+                # 条件 UPDATE 保证并发下只有一个 worker 拿到
+                result = session.execute(
+                    sa_update(ProxyPoolModel)
+                    .where(
+                        ProxyPoolModel.proxy == candidate.proxy,
+                        ProxyPoolModel.enabled.is_(True),
+                        (ProxyPoolModel.max_uses == 0)
+                        | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses),
+                    )
+                    .values(used_count=ProxyPoolModel.used_count + 1, last_used_at=now)
                 )
-                .values(used_count=ProxyPoolModel.used_count + 1, last_used_at=now)
-            )
-            if result.rowcount:
-                return candidate.proxy
+                if result.rowcount:
+                    return candidate.proxy
         return ""
 
 

@@ -50,6 +50,16 @@ class RetryCategoryTests(unittest.TestCase):
         self.assertNotIn("account", register_batch.RETRYABLE_CATEGORIES)
         self.assertIn("account", register_batch.NON_RETRYABLE_CATEGORIES)
 
+    def test_invalid_state_is_retryable(self):
+        """409 invalid_state（"Please start over to continue"）。
+
+        ⚠️ 以前它被归到 account（不可重试）→ 流程级重试根本没触发，
+           worker 直接换下一个号 → 每换一个号白烧一个付费邮箱。
+           实际上它几乎总是**出口 IP 被 OpenAI 记了**，换个 IP 重跑就能过。
+        """
+        self.assertIn("invalid_state", register_batch.RETRYABLE_CATEGORIES)
+        self.assertNotIn("invalid_state", register_batch.NON_RETRYABLE_CATEGORIES)
+
     def test_mail_limited_is_not_retryable(self):
         """短效邮箱已消耗 —— 重试只会再撞一次。"""
         self.assertNotIn("mail_limited", register_batch.RETRYABLE_CATEGORIES)
@@ -63,7 +73,10 @@ class RetryCategoryTests(unittest.TestCase):
         )
         self.assertEqual(
             register_batch.RETRYABLE_CATEGORIES | register_batch.NON_RETRYABLE_CATEGORIES,
-            frozenset({"network", "account", "mail_limited", "cf_blocked", "unknown"}),
+            frozenset({
+                "network", "account", "mail_limited", "cf_blocked", "unknown",
+                "invalid_state",
+            }),
         )
 
 
@@ -252,7 +265,7 @@ class ProxyWaitTests(unittest.TestCase):
         ctrl = self._controller()
         calls = {"n": 0}
 
-        def fake_pick(worker_id):
+        def fake_pick(worker_id, exclude=None):
             calls["n"] += 1
             return "http://p:1" if calls["n"] >= 2 else ""
 

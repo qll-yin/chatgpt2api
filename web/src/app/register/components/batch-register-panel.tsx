@@ -74,6 +74,39 @@ function describeRun(data: Record<string, unknown>): string {
   return runTag ? `${tag}#${runTag}` : tag;
 }
 
+/**
+ * 流程级重试的遍数提示。
+ *
+ * ⚠️ 一次「开始注册」= 一遍完整流程。失败后 worker 会换出口 IP、
+ *    用同一个号**从头再走一遍完整流程** —— 于是你会看到第 2、第 3、
+ *    第 4 个「开始注册」。这里把遍数显式写出来，一眼能看出重试在跑、
+ *    以及第几遍被打断的（以前只能从"最后失败原因"里猜）。
+ */
+function describeAttempt(data: Record<string, unknown>): string {
+  const attempt = Number(data.attempt ?? 0);
+  const maxAttempts = Number(data.max_attempts ?? 0);
+  if (!attempt || !maxAttempts || maxAttempts <= 1) {
+    return "";
+  }
+  const retry = Math.max(0, attempt - 1);
+  const maxRetry = Math.max(0, maxAttempts - 1);
+  return `（第 ${attempt}/${maxAttempts} 遍流程${retry > 0 ? ` · 重试 ${retry}/${maxRetry}` : ""}）`;
+}
+
+/** 把后端的失败分类翻译成人话（别让用户盯着英文分类猜）。 */
+function describeCategory(category: string): string {
+  const map: Record<string, string> = {
+    cf_blocked: "出口 IP 被 Cloudflare 拦了（换代理重试）",
+    invalid_state: "409 会话失效（出口 IP 被记，换 IP 重试）",
+    network: "网络/代理不通（换代理重试）",
+    account: "号/邮箱本身的问题（换号继续）",
+    mail_limited: "邮箱侧限制（短效邮箱已消耗）",
+    unknown: "未知原因（会重试）",
+  };
+  const key = String(category ?? "").trim();
+  return map[key] ?? key;
+}
+
 export function BatchRegisterPanel() {
   const [status, setStatus] = useState<BatchStatus | null>(null);
   const [providers, setProviders] = useState<MailProvider[]>([]);
@@ -175,7 +208,7 @@ export function BatchRegisterPanel() {
           return;
         }
         if (kind === "run_started") {
-          pushLog("run", `开始注册 ${describeRun(data)}`);
+          pushLog("run", `开始注册 ${describeRun(data)}${describeAttempt(data)}`);
           return;
         }
         if (kind === "run_finished") {
@@ -183,8 +216,8 @@ export function BatchRegisterPanel() {
           pushLog(
             "run",
             ok
-              ? `注册成功 ${describeRun(data)}`
-              : `注册失败 ${describeRun(data)}${data.category ? `（${String(data.category)}）` : ""}`,
+              ? `注册成功 ${describeRun(data)}${describeAttempt(data)}`
+              : `注册失败 ${describeRun(data)}${describeAttempt(data)}${data.category ? `（${String(data.category)}）` : ""}`,
             ok ? "ok" : "error",
           );
           return;
@@ -526,7 +559,7 @@ export function BatchRegisterPanel() {
               </span>
               {status?.last_fail_reason ? (
                 <span className="text-xs text-amber-700 dark:text-amber-300">
-                  最后失败原因：{status.last_fail_reason}
+                  最后失败原因：{describeCategory(status.last_fail_reason)}
                 </span>
               ) : null}
             </div>

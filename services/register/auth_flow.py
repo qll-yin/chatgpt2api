@@ -19,7 +19,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
 from .config import Config
@@ -111,6 +111,8 @@ class AuthFlow:
         on_password: Optional[Any] = None,
         on_session_ready: Optional[Any] = None,
         account_callback: Optional[Any] = None,
+        proxy_rotator: Optional[Callable[[], str]] = None,
+        proxy_type: str = "",
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -119,6 +121,18 @@ class AuthFlow:
         #    现在覆盖值只挂在实例上，进程全局环境一个字节都不动。
         self._env_overrides = dict(env_overrides or {})
         self.config = config
+        # ── 换出口代理的能力 ──
+        # ⚠️ 为什么需要它（这是「重试没意义」的根本原因）：
+        #    以前 warmup / 409 invalid_state 的重试只是**重建 session**，
+        #    代理地址原封不动 —— 出口 IP 没变，等于拿同一个 IP 再撞一次墙，
+        #    4 次全废只是时间问题。
+        #    proxy_rotator 由 registrar 注入，作用是从代理池里换一条**别的**代理
+        #    （不同出口 IP）。拿不到别的代理时返回空串 → 调用方决定是失败
+        #    还是继续（静态代理必须失败，见 _rotate_proxy 的说明）。
+        self._proxy_rotator = proxy_rotator
+        # static = 固定出口 IP（换 session 也不会换 IP）；
+        # dynamic = 每次连接换 IP（换 session ≈ 换出口）。
+        self._proxy_type = str(proxy_type or "").strip().lower()
         self._country_code = ""  # IP 地理国家码，check_proxy() 时填充
         self._fingerprint = generate_fingerprint()  # 先生成默认指纹
         self._ua = self._fingerprint["user_agent"]
@@ -131,17 +145,9 @@ class AuthFlow:
         #    「Impersonating xxx is not supported」→
         #    warmup 拿不到 oai-did → authorize/continue 必然 409 invalid_state，
         #    而错误信息完全看不出真因。详见 register/fingerprint.py 的说明。
-        try:
-            from services.register.fingerprint import is_supported_impersonate
-
-            _supported = [
-                c for c in self._impersonate_candidates
-                if is_supported_impersonate(c)
-            ]
-            if _supported:
-                self._impersonate_candidates = _supported
-        except Exception:  # noqa: BLE001
-            pass
+        self._impersonate_candidates = self._filter_supported_impersonates(
+            self._impersonate_candidates
+        )
         self._impersonate_idx = 0
         self.session = create_http_session(
             proxy=config.proxy,
@@ -1728,6 +1734,74 @@ class AuthFlow:
                     headers[name] = fp[key]
         return headers
 
+    # ─────────────────── 换出口代理 ───────────────────
+    # ⚠️ 这是「重试没意义」的根本修复。
+    #
+    # 以前的重试（warmup 4 次、409 invalid_state 3 次）全都只是**重建 session**，
+    # 代理地址原封不动 → 出口 IP 没变 → 同一个 IP 再撞一次墙，
+    # 4 次 / 3 次全废只是时间问题（实测日志：warmup 4 次全 403、
+    # signup 3 次全 409 invalid_state）。
+    #
+    # 现在重试前先问 proxy_rotator 要一条**别的**代理（= 别的出口 IP）：
+    #   · 换到了 → 重建 session 后继续，出口 IP 真的变了，重试才有意义
+    #   · 没换到 且是静态代理（固定出口 IP）→ 再试也是同一个 IP，
+    #     直接失败交外层流程级重试（外层会换代理重跑整个流程）
+    #   · 没换到 但是动态代理（每次连接换 IP）→ 维持老行为，
+    #     重建 session 本身就可能换到新出口
+
+    def _proxy_is_static(self) -> bool:
+        """当前代理是不是「固定出口 IP」类型。"""
+        return self._proxy_type == "static"
+
+    def _rotate_proxy(self, reason: str) -> bool:
+        """换一条别的代理（= 换出口 IP）。成功返回 True。
+
+        换成功后 self.config.proxy / self.session 都会指向新代理，
+        外层（registrar）通过 options["proxy_state"] 字典拿到最终用的代理，
+        用来正确结算配额。
+        """
+        if not self._proxy_rotator:
+            return False
+        try:
+            new_proxy = str(self._proxy_rotator() or "").strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"换代理失败（rotator 异常）: {e}")
+            return False
+        cur = str(self.config.proxy or "").strip()
+        if not new_proxy or new_proxy == cur:
+            return False
+        self.config.proxy = new_proxy
+        self.session = create_http_session(
+            proxy=new_proxy,
+            impersonate=self._impersonate_candidates[self._impersonate_idx],
+            user_agent=self._ua,
+        )
+        logger.info(
+            f"已更换出口代理（{reason}）: {cur[:50]} → {new_proxy[:50]}"
+        )
+        return True
+
+    def _filter_supported_impersonates(self, candidates: list[str]) -> list[str]:
+        """滤掉当前 curl_cffi **不支持**的 impersonate 名。
+
+        ⚠️ 不支持的名字会让每一个请求都抛
+        「Impersonating xxx is not supported」→ warmup 拿不到 oai-did
+        → 必然 409 invalid_state，而错误信息完全看不出真因（实测整轮 4 次全废）。
+
+        ⚠️ 这层过滤必须出现在**每一条**会重建指纹的路径上：
+        构造时（__init__）和 check_proxy() 的 IP 地理联动重建。
+        以前只过滤了 __init__，IP 联动那条路没过滤 →
+        换了个国家就必挂（日志实测：「Impersonating safari18_4_ios is not supported」）。
+        """
+        try:
+            from services.register.fingerprint import is_supported_impersonate
+
+            supported = [c for c in candidates if is_supported_impersonate(c)]
+            # 全都不支持时保持原样（总比返回空列表导致 IndexError 好）
+            return supported or list(candidates)
+        except Exception:  # noqa: BLE001
+            return list(candidates)
+
     def warmup(self) -> bool:
         """GET chatgpt.com 种全套 cookie（含 oai-did），成功返回 True。
 
@@ -1777,14 +1851,26 @@ class AuthFlow:
 
         for attempt in range(4):
             if attempt:
-                # 只换出口 IP（新 session = 新出口），指纹保持不变：
-                # 403 是缺 client hints 导致的，已在头里修好，不是指纹的锅。
+                # ⚠️ 换出口 IP —— 不是「重建 session 就算换 IP」。
+                #    重建 session 只有在**动态代理**（每次连接换 IP）时才等价于换 IP；
+                #    静态代理（固定出口）重建 session 还是那个 IP，
+                #    再试 3 次纯属浪费（还会把失败轮次拖长）。
                 time.sleep(3 + attempt * 2)
-                self.session = create_http_session(
-                    proxy=self.config.proxy,
-                    impersonate=self._impersonate_candidates[self._impersonate_idx],
-                    user_agent=self._ua,
-                )
+                if not self._rotate_proxy(f"warmup 第 {attempt + 1} 次重试"):
+                    if self._proxy_is_static() and self._proxy_rotator:
+                        logger.error(
+                            "warmup 未种到 oai-did，当前是静态代理（固定出口 IP）"
+                            "且代理池里没有可切换的其它代理 —— 出口 IP 不变，"
+                            "再重试也是同一个结果，本轮直接放弃"
+                            "（交给外层流程级重试换代理）"
+                        )
+                        return False
+                    # 动态代理（或没有代理池可换）：换 session ≈ 换出口，维持原行为
+                    self.session = create_http_session(
+                        proxy=self.config.proxy,
+                        impersonate=self._impersonate_candidates[self._impersonate_idx],
+                        user_agent=self._ua,
+                    )
             try:
                 resp = self.session.get(
                     "https://chatgpt.com", headers=headers, timeout=40,
@@ -1837,10 +1923,18 @@ class AuthFlow:
                     self._fingerprint = generate_fingerprint(rng=rng, country_code=country_code)
                     self._ua = self._fingerprint["user_agent"]
                     new_imp = self._fingerprint["impersonate"]
-                    self._impersonate_candidates = self._fingerprint.get(
+                    cands = self._fingerprint.get(
                         "fallback_impersonates",
                         [new_imp],
                     )
+                    # ⚠️ 必须过滤！IP 联动这条路径以前**没有**过滤，
+                    #    会选出 curl_cffi 不支持的 impersonate（比如 safari18_4_ios），
+                    #    于是每一个请求都抛「Impersonating xxx is not supported」，
+                    #    warmup 4 次全废 → 报成「代理被 CF 拦」，真因完全被掩盖。
+                    cands = self._filter_supported_impersonates(cands)
+                    if new_imp not in cands:
+                        new_imp = cands[0] if cands else new_imp
+                    self._impersonate_candidates = cands
                     self._impersonate_idx = 0
                     self.session = create_http_session(
                         proxy=self.config.proxy,
@@ -3242,11 +3336,22 @@ class AuthFlow:
                 )
                 # ── 从头再来：重建 session（新的 oai-did）──
                 time.sleep(3 + attempt * 2)
-                self.session = create_http_session(
-                    proxy=self.config.proxy,
-                    impersonate=self._impersonate_candidates[self._impersonate_idx],
-                    user_agent=self._ua,
-                )
+                # ⚠️ 先换出口 IP。服务端原话是 "Please start over to continue"，
+                #    而同一个出口 IP 重来大概率还是 invalid_state（实测 3/3 全废）。
+                #    换到别的代理 = 换出口 IP，才有救。
+                if not self._rotate_proxy(f"signup invalid_state 第 {attempt} 次重试"):
+                    if self._proxy_is_static() and self._proxy_rotator:
+                        raise RuntimeError(
+                            "signup invalid_state（409）：当前是静态代理（固定出口 IP），"
+                            "代理池里也没有可切换的其它代理 —— 出口 IP 不变，"
+                            "在本流程内重试没有意义，本轮放弃（可重试）"
+                        )
+                    # 动态代理（或没有代理池可换）：换 session ≈ 换出口，维持原行为
+                    self.session = create_http_session(
+                        proxy=self.config.proxy,
+                        impersonate=self._impersonate_candidates[self._impersonate_idx],
+                        user_agent=self._ua,
+                    )
                 # 🔴 清掉上一轮的会话身份，否则 _common_headers 会一直用旧值
                 #    （`self.result.device_id or cookies["oai-did"]`，or 短路）。
                 #    不清 → 新 cookie + 旧 device-id → 必然又 409（实测 6/6）。
