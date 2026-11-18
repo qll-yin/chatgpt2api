@@ -200,7 +200,14 @@ class StateConvergeTests(unittest.TestCase):
         self.assertAlmostEqual(e1, e2, delta=0.1, msg="elapsed 还在累加")
 
     def test_state_converges_when_all_workers_exit(self):
-        """所有 worker 都退出后状态应变成 stopped（而不是一直 running）。"""
+        """所有 worker 都退出后状态应变成 stopped（而不是一直 running）。
+
+        ⚠️ 怎么让 worker **真的退出**：用「可重试分类 + max_retries=0」——
+        一次完整流程失败、重试预算为 0 → worker 收工。
+        （以前这里用 category="account"（不可重试）→ worker 会无限换号跑，
+        状态一直是 running；当时之所以能过，是因为前面用例把代理标成停用了，
+        worker 走「没代理可用」分支才退出 —— 那是个假通过。）
+        """
 
         def fake_start(account, options):
             run_id = f"CONV-{id(self)}"
@@ -208,10 +215,17 @@ class StateConvergeTests(unittest.TestCase):
 
             def _fail():
                 time.sleep(0.2)
-                db.finish_run(run_id, "failed", "boom", category="account")
+                db.finish_run(run_id, "failed", "boom", category="cf_blocked")
 
             threading.Thread(target=_fail, daemon=True).start()
             return run_id
+
+        # 清空代理池 —— 避免「没代理可用」这条分支提前让 worker 退出，
+        # 那样测的就不是「worker 跑完自己退出」了。
+        try:
+            db.clear_proxies()
+        except Exception:  # noqa: BLE001
+            pass
 
         self._patch_registrar(fake_start)
         # 用非池化来源（避免号池为空导致 30s 空转）
@@ -221,6 +235,7 @@ class StateConvergeTests(unittest.TestCase):
             "cool_down_seconds": 0,
             "mail_source": "remail",
             "auto_import": False,
+            "max_retries": 0,
         })
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -351,13 +366,25 @@ class InvalidStateProxyTests(unittest.TestCase):
     """409 invalid_state 的代理级处置。"""
 
     def test_static_proxy_auto_disabled_after_threshold(self):
-        db.replace_proxies(["http://is-1:1"], mode="replace")
+        # 池里还有另一条静态代理能顶上来 → 才允许停用这条被记死的
+        db.replace_proxies(["http://is-1:1", "http://is-1b:1"], mode="replace")
         db.update_proxy("http://is-1:1", proxy_type="static")
+        db.update_proxy("http://is-1b:1", proxy_type="static")
         r1 = db.mark_proxy_invalid_state("http://is-1:1")
         self.assertFalse(r1["disabled"])
         r2 = db.mark_proxy_invalid_state("http://is-1:1")
         self.assertTrue(r2["disabled"], "静态代理连续失效应自动停用")
         self.assertFalse(db.find_proxy("http://is-1:1")["enabled"])
+
+    def test_last_static_proxy_is_never_disabled(self):
+        """池里只剩一条静态代理时不能停用 —— 停掉重试链就没代理可换。"""
+        db.replace_proxies(["http://is-only:1"], mode="replace")
+        db.update_proxy("http://is-only:1", proxy_type="static")
+        db.mark_proxy_invalid_state("http://is-only:1")
+        r = db.mark_proxy_invalid_state("http://is-only:1")
+        self.assertFalse(r["disabled"])
+        self.assertTrue(r["kept_enabled"])
+        self.assertTrue(db.find_proxy("http://is-only:1")["enabled"])
 
     def test_dynamic_proxy_not_disabled(self):
         db.replace_proxies(["http://is-2:2"], mode="replace")

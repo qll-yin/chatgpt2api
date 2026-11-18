@@ -110,6 +110,14 @@ def _parse_proxy_pool(text: str) -> list[str]:
     return out
 
 
+def _proxy_type_label(proxy_type: str) -> str:
+    """代理类型的中文说法（日志和前端提示里用）。"""
+    return {
+        "static": "静态",
+        "dynamic": "动态",
+    }.get(str(proxy_type or "").strip().lower(), "")
+
+
 class AutoLoopController:
     """多 worker auto-loop 控制器。
 
@@ -247,6 +255,17 @@ class AutoLoopController:
                 _raw_mode if _raw_mode in REGISTER_PROXY_MODES else REGISTER_PROXY_MODE_MIXED
             )
             self._options["register_proxy_mode"] = self._register_proxy_mode
+            # 启动时把关键参数打出来 —— 用户反馈「设了重试 3 次却没重试」时，
+            # 一眼就能确认服务端到底收到了多少（而不是靠猜前端传没传）。
+            logger.info(
+                "[auto-loop] 启动：并发 %s，目标成功数 %s，流程级重试 %s 次"
+                "（= 一个号最多 %s 个「开始注册」），注册代理 %s",
+                self._concurrency,
+                self._target_count or "不限",
+                self._max_retries,
+                self._max_retries + 1,
+                self._register_proxy_mode,
+            )
             # 启 manage 线程
             self._manage_thread = threading.Thread(
                 target=self._manage_loop, daemon=True, name="auto-loop-manage"
@@ -438,7 +457,12 @@ class AutoLoopController:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
 
-    def _wait_for_proxy(self, worker_id: int, exclude: set[str] | None = None) -> str:
+    def _wait_for_proxy(
+        self,
+        worker_id: int,
+        exclude: set[str] | None = None,
+        timeout: int | None = None,
+    ) -> str:
         """代理池暂时拿不到可用代理时，等一会儿再试。
 
         ⚠️ 为什么不能直接放弃
@@ -451,8 +475,12 @@ class AutoLoopController:
         「成功 1 / 失败 0，然后就停了」。现在改成轮询等待。
 
         等待期间状态切到「等待资源」，前端能看出它在等什么。
+
+        timeout：本次最多等多少秒（None = 用批次设置）。重试时有兜底代理
+        可复用的话会传一个小值 —— 不必为了等一条新代理把重试卡两分钟。
         """
-        deadline = time.time() + max(0, int(self._proxy_wait_secs))
+        budget = self._proxy_wait_secs if timeout is None else timeout
+        deadline = time.time() + max(0, int(budget))
         announced = False
         while time.time() < deadline:
             if self._stop_event.is_set() or self._pause_event.is_set():
@@ -616,17 +644,24 @@ class AutoLoopController:
             return ""
         return str(row.get("proxy_type") or "").strip().lower()
 
-    def _settle_failed_proxy(self, worker_id: int, proxy: str, category: str) -> None:
+    def _settle_failed_proxy(
+        self, worker_id: int, proxy: str, category: str, reserved: bool = True
+    ) -> None:
         """失败时结算这条代理：还配额 + 记失败次数 + 按分类做代理级处置。
 
         ⚠️ 用的是「**实际用的那条**」—— 流程内可能换过代理
         （auth_flow 换出口 IP），原代理那条的预占已经被转移，
         按旧的结算就会算错对象。
+
+        reserved=False 表示这条代理不是 pick_proxy 预占来的
+        （重试时没别的代理可换、临时复用了上一条），
+        这时**不能**调 proxy_release —— 会把别的 worker 预占的配额还掉。
         """
         if not proxy or not self._backend_proxy_pool:
             return
         # 失败不占配额：把 pick_proxy 的预占还回去，只记失败次数。
-        db.proxy_release(proxy)
+        if reserved:
+            db.proxy_release(proxy)
         db.proxy_used(proxy, ok=False)
         # ⚠️ CF 拦截的处置与普通失败**完全不同**：
         #    · 静态代理（固定出口 IP）→ 这个 IP 已被 CF 拉黑，
@@ -634,6 +669,10 @@ class AutoLoopController:
         #    · 动态代理（每次换 IP）→ 不停用，只是这个出口不行，
         #      换一次 IP 可能就通过了
         # 具体动作交给 db.mark_proxy_cf_blocked 按类型决定。
+        #
+        # ⚠️ 但「停用」有个硬前提：停掉之后池里还得有别的代理。
+        #    池里只剩这一条时它会被保留（kept_enabled）—— 否则流程级重试
+        #    拿不到代理，worker 会提前收工，重试次数形同虚设。
         if category == "cf_blocked":
             cfres = db.mark_proxy_cf_blocked(proxy)
             # ⚠️ 键名是 "disabled"，不是 "auto_disabled" —— 以前写错了，
@@ -648,6 +687,13 @@ class AutoLoopController:
                     "reason": f"被 Cloudflare 连续拦截 {cfres.get('cf_blocked')} 次",
                     "count": cfres.get("cf_blocked"),
                 })
+            elif cfres.get("kept_enabled"):
+                logger.warning(
+                    f"[worker-{worker_id}] 代理被 CF 拦截 {cfres.get('cf_blocked')} 次，"
+                    f"但它是池里唯一可用的{_proxy_type_label(cfres.get('proxy_type'))}代理 —— "
+                    f"**不停用**（停掉就没有代理可换，重试会直接中断），"
+                    f"继续降权使用: {proxy[:60]}"
+                )
             else:
                 logger.info(
                     f"[worker-{worker_id}] 代理被 CF 拦截"
@@ -670,6 +716,13 @@ class AutoLoopController:
                     "reason": "连续会话失效(409 invalid_state)",
                     "count": isres.get("invalid_state"),
                 })
+            elif isres.get("kept_enabled"):
+                logger.warning(
+                    f"[worker-{worker_id}] 代理连续 {isres.get('invalid_state')} 次"
+                    f"会话失效(409)，但它是池里唯一可用的{_proxy_type_label(isres.get('proxy_type'))}代理 —— "
+                    f"**不停用**（停掉就没有代理可换，重试会直接中断），"
+                    f"继续降权使用: {proxy[:60]}"
+                )
             else:
                 logger.info(
                     f"[worker-{worker_id}] 代理会话失效(409 invalid_state)"
@@ -838,6 +891,7 @@ class AutoLoopController:
             #    换号 = 白烧一个付费邮箱（Remail 一封 10 块）。
             attempt = 0
             failed_proxies: set[str] = set()
+            last_proxy = ""          # 上一遍实际用的代理（重试兜底用）
             chain_ok = False
             chain_category = ""
             recorded = False
@@ -846,9 +900,35 @@ class AutoLoopController:
                 attempt += 1
 
                 # ── 取代理（避开本轮已失败的固定出口代理）──
-                proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
-                if self._backend_proxy_pool and not proxy:
-                    proxy = self._wait_for_proxy(worker_id, exclude=failed_proxies)
+                # reserved：这条代理是不是 pick_proxy **预占**来的。
+                # 预占的才需要在失败时 proxy_release 还回去。
+                reserved = False
+                proxy = ""
+                if self._backend_proxy_pool:
+                    proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
+                    reserved = bool(proxy)
+                    if not proxy:
+                        # 重试时有兜底代理（last_proxy）可复用 → 只需短暂等一小会儿
+                        # （万一别的 worker 正好把代理配额还回来了）；否则等满设置值。
+                        grace = 5 if (attempt > 1 and last_proxy) else None
+                        proxy = self._wait_for_proxy(
+                            worker_id, exclude=failed_proxies, timeout=grace
+                        )
+                        reserved = bool(proxy)
+                    if not proxy and attempt > 1 and last_proxy:
+                        # ⚠️ 重试期间「没有别的代理可用」**不能**直接收工。
+                        #    「失败重试次数」是用户定的，重试没跑完就停 worker，
+                        #    用户看到的正是：「失败一次就结束 worker，根本没重试」。
+                        #    常见成因：上一条代理被自动停用 / 配额用满 / 被手动停用。
+                        #    这里退一步：暂时复用上一条，把这一遍流程跑完
+                        #    （预算有上限，不会无限空转），并明确告诉用户。
+                        proxy = last_proxy
+                        logger.warning(
+                            f"[worker-{worker_id}] 代理池里没有别的可用代理了，"
+                            f"第 {attempt} 遍流程暂时复用上一条（{proxy[:60]}）—— "
+                            f"重试次数是用户设置的，不能因为没代理就提前收工；"
+                            f"建议补充代理"
+                        )
                     if not proxy:
                         stats = db.proxy_pool_stats()
                         by_type = stats.get("by_type") or {}
@@ -873,6 +953,8 @@ class AutoLoopController:
                             self._worker_status.pop(worker_id, None)
                         self._broadcast("state", self._snapshot())
                         return
+                else:
+                    proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
 
                 # ── 给这个 run 注入 worker 自己的代理 ──
                 run_options = dict(self._options)
@@ -955,13 +1037,27 @@ class AutoLoopController:
                 #    形同虚设 —— 号注册出来了，但号池里一个都没有。
                 if ok:
                     self._import_to_pool(account, used_proxy, run_id)
+                    # 这条出口刚刚注册成功 → 清零它的「连续被拦/连续失效」计数。
+                    # ⚠️ 不清零的话，计数会跨天累计：一条跑了几百次成功的代理
+                    #    会被历史上第 2 次 409 永久停用，而停用又发生在某个
+                    #    重试链中间 → worker 没代理可用 → 「失败一次就停」。
+                    if used_proxy and self._backend_proxy_pool:
+                        try:
+                            db.proxy_mark_success(used_proxy)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(f"清零代理计数失败: {e}")
                     consecutive_retryable_fails = 0
                     self._record_finish(True, "", count_fail=False, count_breaker=True)
                     recorded = True
                     break
 
                 # ── 失败：结算代理 ──
-                self._settle_failed_proxy(worker_id, used_proxy, category)
+                # reserved=False（复用上一条兜底）时不能还配额 —— 那一格
+                # 不是这条失败占掉的。
+                self._settle_failed_proxy(
+                    worker_id, used_proxy, category, reserved=reserved
+                )
+                last_proxy = used_proxy or proxy or last_proxy
 
                 # ── worker 级重试判定 ──
                 #

@@ -1425,8 +1425,63 @@ def proxy_release(proxy: str) -> bool:
         return bool(result.rowcount)
 
 
+def _has_other_usable_proxy(session, proxy: str, proxy_type: str) -> bool:
+    """同类代理里还有没有**别的**能用（启用 + 配额未满）的代理。
+
+    ⚠️ 为什么停用前必须问这个
+    ------------------------
+    「静态代理累计被拦 2 次就自动停用」在池里只有一条静态代理时是个死结：
+
+        第 2 次被拦 → 这条 enabled=False → 池里没有任何可用代理
+        → 流程级重试拿不到代理 → worker 直接收工
+
+    用户看到的就是「失败一次就停 worker，根本没按失败重试次数重试」。
+    所以只有「停掉它之后还有别的能顶上来」才允许停用；否则保留它，
+    只靠 cf_blocked / invalid_state 排序降权（换别的优先，它垫底）。
+    """
+    stmt = (
+        select(func.count())
+        .select_from(ProxyPoolModel)
+        .where(ProxyPoolModel.enabled.is_(True))
+        .where(ProxyPoolModel.proxy != str(proxy or ""))
+        .where(
+            (ProxyPoolModel.max_uses == 0)
+            | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses)
+        )
+    )
+    wanted = str(proxy_type or "").strip().lower()
+    if wanted in ("static", "dynamic"):
+        stmt = stmt.where(ProxyPoolModel.proxy_type == wanted)
+    return bool(session.execute(stmt).scalar() or 0)
+
+
+def proxy_mark_success(proxy: str) -> bool:
+    """这个代理刚注册成功 → 把「连续被拦 / 连续失效」计数清零。
+
+    ⚠️ cf_blocked / invalid_state 的语义是**连续**被拦 / 连续失效，
+    以前从来不清零 —— 累计满 2 次就永久停用。于是一条跑了几百次成功的
+    静态代理，会被历史上第 2 次 CF 403 永久封掉；更糟的是「封掉」发生在
+    流程级重试还没跑完的时候 → worker 没代理可用 → 直接收工。
+    成功一次就证明这条出口是通的，计数必须归零。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return False
+    with register_session_scope() as session:
+        result = session.execute(
+            sa_update(ProxyPoolModel)
+            .where(ProxyPoolModel.proxy == proxy)
+            .values(cf_blocked=0, invalid_state=0, last_used_at=time.time())
+        )
+        return bool(result.rowcount)
+
+
 def mark_proxy_cf_blocked(proxy: str, max_blocked: int = 2) -> dict[str, Any]:
-    """记录一次 CF 403。静态代理连续被拦到阈值 → 自动停用。"""
+    """记录一次 CF 403。静态代理**连续**被拦到阈值 → 自动停用。
+
+    ⚠️ 只在「同类代理还有别的可用」时才停用（见 _has_other_usable_proxy）——
+    否则会把池子自己清空，让流程级重试拿不到代理而提前收工。
+    """
     proxy = str(proxy or "").strip()
     if not proxy:
         return {}
@@ -1439,14 +1494,20 @@ def mark_proxy_cf_blocked(proxy: str, max_blocked: int = 2) -> dict[str, Any]:
         row.cf_blocked = int(row.cf_blocked or 0) + 1
         row.last_used_at = time.time()
         disabled = False
+        kept = False
         # 只有静态代理才停用 —— 动态代理换 IP 可能就通了
         if row.proxy_type == "static" and row.cf_blocked >= max_blocked:
-            row.enabled = False
-            disabled = True
+            if _has_other_usable_proxy(session, proxy, row.proxy_type):
+                row.enabled = False
+                disabled = True
+            else:
+                kept = True
         return {
             "proxy": proxy,
             "cf_blocked": row.cf_blocked,
             "disabled": disabled,
+            # kept=True → 达到停用阈值但**故意不停用**（池里只剩它了）
+            "kept_enabled": kept,
             "proxy_type": row.proxy_type,
         }
 
@@ -1482,13 +1543,20 @@ def mark_proxy_invalid_state(proxy: str, max_invalid: int = 2) -> dict[str, Any]
         row.failed_count = int(row.failed_count or 0) + 1
         row.last_used_at = time.time()
         disabled = False
+        kept = False
         if row.proxy_type == "static" and row.invalid_state >= max(1, int(max_invalid)):
-            row.enabled = False
-            disabled = True
+            # ⚠️ 同 mark_proxy_cf_blocked：池里只剩它时不停用。
+            #    停掉它 = 重试链没代理可用 = worker 提前收工。
+            if _has_other_usable_proxy(session, proxy, row.proxy_type):
+                row.enabled = False
+                disabled = True
+            else:
+                kept = True
         return {
             "proxy": proxy,
             "invalid_state": row.invalid_state,
             "disabled": disabled,
+            "kept_enabled": kept,
             "proxy_type": row.proxy_type,
         }
 

@@ -648,6 +648,17 @@ def _do_register(
         #    但「单次注册」页是用户手填的代理，没走过 pick_proxy()，
         #    所以那种情况要在这里补记一次（代理不在池里时 proxy_used 也不会命中，
         #    只是个记账，不会出错）。
+        #
+        # 成功 = 这条出口是通的 → 清零它的「连续被拦 / 连续失效」计数。
+        # 不清零的话计数会跨天累计（第 2 次 409 就永久停用），
+        # 而停用可能正好发生在流程级重试中间 → worker 没代理可用 → 提前收工。
+        if run_proxy:
+            try:
+                db.proxy_mark_success(run_proxy)
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("registrar").warning(
+                    f"[register] 清零代理计数失败: {e}"
+                )
 
         # Remail：把这笔订单关联到注册成功的账号，
         # 这样「邮箱服务」页能看出哪一单对应哪个号。

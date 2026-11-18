@@ -410,5 +410,144 @@ class RealDbAccountLifecycleTests(unittest.TestCase):
         self.assertEqual(self._status_of("flowtest@outlook.com"), "available")
 
 
+class ProxyAutoDisableGuardTests(unittest.TestCase):
+    """代理「自动停用」不能把流程级重试掐断。
+
+    用户报的现象：第 1 个成功，第 2 个失败后 worker 就结束了 ——
+    根因是「静态代理累计被拦 2 次 → enabled=False」把池子清空，
+    下一遍流程 pick_proxy 拿不到代理 → worker 直接收工。
+    """
+
+    def setUp(self):
+        from services.storage import register_store
+
+        self.store = register_store
+        self.store.replace_proxies([], mode="replace")
+
+    def tearDown(self):
+        self.store.replace_proxies([], mode="replace")
+
+    def _add(self, entries):
+        for proxy, ptype in entries:
+            self.store.replace_proxies([proxy], mode="append")
+            self.store.update_proxy(proxy, proxy_type=ptype)
+
+    def test_only_proxy_is_kept_enabled(self):
+        """池里只剩一条静态代理时，被 CF 拦到阈值也**不能**停用。"""
+        self._add([("http://only:1", "static")])
+        self.store.mark_proxy_cf_blocked("http://only:1")
+        res = self.store.mark_proxy_cf_blocked("http://only:1")
+        self.assertFalse(res["disabled"])
+        self.assertTrue(res["kept_enabled"])
+        self.assertTrue(self.store.find_proxy("http://only:1")["enabled"])
+
+    def test_only_proxy_kept_on_invalid_state(self):
+        self._add([("http://only409:1", "static")])
+        self.store.mark_proxy_invalid_state("http://only409:1")
+        res = self.store.mark_proxy_invalid_state("http://only409:1")
+        self.assertFalse(res["disabled"])
+        self.assertTrue(res["kept_enabled"])
+        self.assertTrue(self.store.find_proxy("http://only409:1")["enabled"])
+
+    def test_proxy_is_disabled_when_another_can_take_over(self):
+        """还有别的同类代理能顶上来时才允许停用。"""
+        self._add([("http://a:1", "static"), ("http://b:1", "static")])
+        self.store.mark_proxy_cf_blocked("http://a:1")
+        res = self.store.mark_proxy_cf_blocked("http://a:1")
+        self.assertTrue(res["disabled"])
+        self.assertFalse(self.store.find_proxy("http://a:1")["enabled"])
+        self.assertTrue(self.store.find_proxy("http://b:1")["enabled"])
+
+    def test_success_resets_the_streak(self):
+        """成功一次就证明出口是通的 → 「连续被拦」计数必须归零。"""
+        self._add([("http://c:1", "static"), ("http://d:1", "static")])
+        self.store.mark_proxy_cf_blocked("http://c:1")
+        self.assertEqual(self.store.find_proxy("http://c:1")["cf_blocked"], 1)
+        self.store.proxy_mark_success("http://c:1")
+        row = self.store.find_proxy("http://c:1")
+        self.assertEqual(row["cf_blocked"], 0)
+        self.assertEqual(row["invalid_state"], 0)
+        # 之后再被拦一次，还是第 1 次，不停用
+        res = self.store.mark_proxy_cf_blocked("http://c:1")
+        self.assertFalse(res["disabled"])
+
+
+class SuccessThenFailureStillRetriesTests(unittest.TestCase):
+    """用户报的原始场景：第 1 个成功 → 第 2 个失败 → 必须继续重试 3 遍。
+
+    用**真实数据库 + 真实代理池**跑，代理停用/记账/重试全走真代码。
+    """
+
+    def setUp(self):
+        from services.storage import register_store
+
+        self.store = register_store
+        self.store.replace_proxies([], mode="replace")
+        self.store.replace_proxies(["http://static1:1"], mode="append")
+        self.store.update_proxy("http://static1:1", proxy_type="static")
+
+    def tearDown(self):
+        self.store.replace_proxies([], mode="replace")
+
+    def test_one_success_then_failures_runs_full_retry_budget(self):
+        ctrl = register_batch.AutoLoopController()
+        ctrl._options = {
+            "max_retries": 3,
+            "cool_down_seconds": 0.01,
+            "target_count": 0,
+            "batch_id": "success-then-fail",
+            "mail_source": "outlook",
+            "auto_import": False,
+        }
+        ctrl._max_retries = 3
+        ctrl._backend_proxy_pool = True
+        ctrl._register_proxy_mode = register_batch.REGISTER_PROXY_MODE_MIXED
+        ctrl._proxy_wait_secs = 0
+
+        emails: list[str] = []
+        claimed: list[str] = []
+
+        def fake_claim(kind=""):
+            claimed.append(f"acc{len(claimed) + 1}@x.com")
+            return {
+                "email": claimed[-1], "password": "pw", "client_id": "",
+                "refresh_token": "", "relay_url": "", "kind": kind or "outlook",
+            }
+
+        def fake_start(account, options):
+            emails.append(account["email"])
+            if len(emails) >= 8:
+                ctrl._stop_event.set()
+            return f"run-{len(emails)}"
+
+        def fake_wait(run_id, timeout=1800):
+            idx = len(emails) - 1
+            if idx == 0:
+                return True, ""           # 第 1 个号成功
+            if idx >= 6:
+                ctrl._stop_event.set()
+                return True, ""
+            return False, "cf_blocked"    # 之后一直 CF 拦
+
+        provider = _FakeProvider()
+        provider.pooled = True
+
+        with mock.patch.object(register_batch, "get_provider_class", return_value=provider), \
+             mock.patch.object(register_batch.db, "get_setting", return_value="outlook"), \
+             mock.patch.object(register_batch.db, "claim_next", side_effect=fake_claim), \
+             mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
+             mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
+             mock.patch.object(ctrl, "_forward_run_logs", return_value=None):
+            ctrl._worker_loop_inner(0, "success-then-fail")
+
+        # 1 次成功 + 第 2 个号跑 1 遍 + 重试 3 遍 = 5 个「开始注册」
+        self.assertEqual(len(emails), 5)
+        self.assertEqual(emails[0], "acc1@x.com")
+        self.assertEqual(set(emails[1:]), {"acc2@x.com"})
+        # 池里只剩这一条静态代理 → 不能被停用（否则重试没代理可用）
+        row = self.store.find_proxy("http://static1:1")
+        self.assertTrue(row["enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()
