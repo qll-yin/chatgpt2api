@@ -162,9 +162,10 @@ class StateConvergeTests(unittest.TestCase):
 
     def _drain(self):
         """停掉并等 worker 完全退出（只等 state 不够，worker 是异步退出的）。"""
-        # ⚠️ 先把 registrar mock 成「立刻失败」，否则 worker 会卡在
-        #    _wait_run_finish 里等一个真跑几分钟的注册。
-        rb.registrar.start_registration = lambda account, options: "NEVER"
+        # ⚠️ 必须让 run **真的结束**：现在的停止语义是「当前号跑完再停」，
+        #    返回假 run_id（"NEVER"）会让 worker 在 _wait_run_finish 里
+        #    等满 1800 秒，drain 永远等不到。
+        rb.registrar.start_registration = _instant_fail_registrar()
         self.ctrl.stop()
         deadline = time.time() + 20
         while time.time() < deadline:
@@ -265,6 +266,22 @@ class WaitingStateTests(unittest.TestCase):
         #    状态变成 stopped 而不是 waiting，断言就废了。
         try:
             db.clear_proxies()
+        except Exception:  # noqa: BLE001
+            pass
+        # ⚠️ 邮箱池也要清空：这个用例断言的是「号池空 → waiting」。
+        #    其他测试模块可能往同一个临时库导过邮箱（测试执行顺序不同时
+        #    尤其明显），不清掉 worker 会真的领到号去跑，状态一直是 running。
+        try:
+            rows, _ = db.list_accounts()
+            emails = [str(r.get("email") or "") for r in rows if r.get("email")]
+            if emails:
+                db.delete_accounts(emails)
+        except Exception:  # noqa: BLE001
+            pass
+        # ⚠️ 邮箱来源必须是**池化**的（outlook）：非池化来源（remail）会自己
+        #    造占位邮箱，号池空也照样一直跑 → 状态永远是 running，测不出 waiting。
+        try:
+            db.set_setting("mail_source", "outlook")
         except Exception:  # noqa: BLE001
             pass
         self._drain()

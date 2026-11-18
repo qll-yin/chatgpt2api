@@ -77,6 +77,10 @@ class ImportTextRequest(BaseModel):
 class ProxyImportRequest(BaseModel):
     text: str
     mode: str = "replace"  # replace | append
+    # 新导入代理的类型：static（固定出口）/ dynamic（每次换 IP）。
+    # ⚠️ 以前写死 static，导入一批动态代理后必须逐个手改，
+    #    选「注册使用代理 = 只用动态」时一个号都跑不了。
+    proxy_type: str = "static"
 
 
 class RegisterSettingsRequest(BaseModel):
@@ -477,7 +481,9 @@ def create_router() -> APIRouter:
             for line in str(body.text or "").splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
-        return store.replace_proxies(proxies, mode=mode)
+        return store.replace_proxies(
+            proxies, mode=mode, proxy_type=body.proxy_type or "static"
+        )
 
     @router.patch("/api/register/proxies")
     async def update_proxy(
@@ -879,6 +885,19 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)})
         return {"ok": True, **result, "stats": store.stats()}
 
+    @router.post("/api/register/mail-pool/release-stale")
+    async def release_stale_mail_pool(
+        timeout_secs: int = 600,
+        authorization: str | None = Header(default=None),
+    ):
+        """把卡在「使用中」的邮箱放回可用（进程崩溃 / 强制停止后的手动自愈）。
+
+        只释放 claim 超过 timeout_secs 的号，不会动正在跑的那批。
+        """
+        require_admin(authorization)
+        released = store.release_stale(max(60, int(timeout_secs)))
+        return {"released": released, "stats": store.stats()}
+
     @router.delete("/api/register/mail-pool")
     async def delete_mail_pool(
         body: MailPoolDeleteRequest,
@@ -1191,22 +1210,16 @@ def create_router() -> APIRouter:
         body: RegisterOnceRequest,
         authorization: str | None = Header(default=None),
     ):
-        """跑一次注册（同步等待完成）。"""
+        """跑一次注册（同步等待完成）。
+
+        ⚠️ 必须走线程池：注册是分钟级阻塞操作，直接在 async 里
+        `thread.join()` 会把整个事件循环卡住（SSE、状态轮询、所有接口
+        全部无响应）。
+        """
         require_admin(authorization)
-        import threading
-
-        result: dict = {}
-
-        def _run():
-            try:
-                result.update(register_service.register_one(body.model_dump()))
-            except Exception as exc:  # noqa: BLE001
-                result.update({"ok": False, "error": str(exc), "error_category": "unknown"})
-
-        thread = threading.Thread(target=_run, daemon=True, name="register-once")
-        thread.start()
-        thread.join()
-        return result
+        return await run_in_threadpool(
+            register_service.register_one, body.model_dump()
+        )
 
     @router.get("/api/register/stream/{run_id}")
     async def register_stream(run_id: str, authorization: str | None = Header(default=None)):

@@ -259,9 +259,13 @@ class RegisterOncePoolImportTests(unittest.TestCase):
 
     def tearDown(self):
         _clear_pool()
+        store.delete_proxy("http://proxy-once:1")
 
     def test_register_one_imports_with_real_email(self):
         store.save_registered(email="one@remail.local", access_token="AT-ONE")
+        # ⚠️ 入池只接受**登记过的静态代理**（动态/未登记一律不带入号池）。
+        #    这里先把这条代理登记为静态，验证「注册用静态 → 入池沿用同一条」。
+        store.replace_proxies(["http://proxy-once:1"], mode="append", proxy_type="static")
 
         def _fake_start_registration(account, options):
             store.create_run(
@@ -315,10 +319,17 @@ class BatchWorkerIntegrationTests(unittest.TestCase):
         _clear_pool()
         store.replace_proxies([], mode="replace")
         store.replace_proxies(["http://px-int:1"], mode="replace")
+        # 记下原来的来源，tearDown 还原 —— 否则会把全局 mail_source 改成
+        # remail，影响其它测试模块（它们以为号池是空的，却一直跑非池化来源）。
+        self._orig_mail_source = store.get_setting("mail_source", "outlook")
         store.set_setting("mail_source", "remail")
 
     def tearDown(self):
         _clear_pool()
+        try:
+            store.set_setting("mail_source", self._orig_mail_source or "outlook")
+        except Exception:  # noqa: BLE001
+            pass
 
     def test_worker_registers_and_imports_to_pool(self):
         controller = register_batch.AutoLoopController()

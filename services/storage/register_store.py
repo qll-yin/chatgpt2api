@@ -994,7 +994,9 @@ def is_static_proxy(proxy: str) -> bool:
     return str(row.get("proxy_type") or "static").strip().lower() != "dynamic"
 
 
-def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
+def replace_proxies(
+    proxies: list[str], *, mode: str = "replace", proxy_type: str = "static"
+) -> dict:
     """批量导入代理。
 
     mode="replace"：清空后写入（保留已有代理的 enabled/上限/用量？
@@ -1003,6 +1005,11 @@ def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
                   这里改为：replace 只清掉**不在新列表里**的代理，
                   新列表里已存在的代理保留其状态和用量。）
     mode="append"：只追加新代理，已存在的保持不变。
+
+    proxy_type：新导入代理的类型（static / dynamic）。
+    ⚠️ 以前这里写死 "static"，用户导入一批动态 socks5 后必须逐个手改 ——
+       选「注册使用代理 = 只用动态」时一个号都跑不了（池里没有动态代理）。
+       现在导入时就能选类型。
     """
     cleaned: list[str] = []
     seen: set[str] = set()
@@ -1014,6 +1021,9 @@ def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
         cleaned.append(s)
 
     now = time.time()
+    wanted_type = str(proxy_type or "static").strip().lower()
+    if wanted_type not in ("static", "dynamic"):
+        wanted_type = "static"
     with register_session_scope() as session:
         if mode == "replace":
             # 删掉不在新列表里的
@@ -1040,7 +1050,7 @@ def replace_proxies(proxies: list[str], *, mode: str = "replace") -> dict:
                     max_uses=50,
                     used_count=0,
                     failed_count=0,
-                    proxy_type="static",
+                    proxy_type=wanted_type,
                     cf_blocked=0,
                     ipv6_status="untested",
                     created_at=now,
@@ -1564,7 +1574,10 @@ def mark_proxy_invalid_state(proxy: str, max_invalid: int = 2) -> dict[str, Any]
         if row is None:
             return {}
         row.invalid_state = int(row.invalid_state or 0) + 1
-        row.failed_count = int(row.failed_count or 0) + 1
+        # ⚠️ 这里**不再**累加 failed_count：调用方（_settle_failed_proxy）
+        #    已经先调过 proxy_used(ok=False) 记了一次失败。
+        #    以前两处都加 → 一次 409 记两次失败，pick_proxy 的
+        #    「失败少的优先」排序被放大一倍，代理权重失真。
         row.last_used_at = time.time()
         disabled = False
         kept = False
@@ -1619,6 +1632,24 @@ def proxy_pool_stats() -> dict[str, Any]:
             "static": sum(1 for i in items if i.get("proxy_type") == "static"),
         },
     }
+
+
+def usable_proxy_count(proxy_type: str = "") -> int:
+    """当前**真的能拿来注册**的代理数量（启用 + 未超注册配额）。
+
+    proxy_type 为空 = 不限类型；"static" / "dynamic" = 只看该类。
+
+    用途：批量启动前校验「注册使用代理」选的那一类到底有没有货 ——
+    以前不做校验，选了「只用动态」但池里全是静态时，worker 要等满
+    120 秒才报「没有可用的动态代理」，用户以为程序卡死了。
+    """
+    wanted = str(proxy_type or "").strip().lower()
+    return sum(
+        1
+        for item in list_proxies()
+        if item.get("status") == "available"
+        and (not wanted or str(item.get("proxy_type") or "") == wanted)
+    )
 
 
 

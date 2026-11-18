@@ -287,16 +287,38 @@ class ProxyWaitTests(unittest.TestCase):
         self.assertEqual(proxy, "")
 
 
-class StoppedCategoryTests(unittest.TestCase):
-    """被停止的 run 不该算失败、更不该触发重试。"""
+class GracefulStopTests(unittest.TestCase):
+    """停止语义：**当前号跑完再停**。
 
-    def test_wait_run_finish_returns_stopped_sentinel(self):
+    ⚠️ 以前 stop_event 一置位 _wait_run_finish 就立刻返回哨兵，
+    worker 提前退出 → registrar 线程还在跑 → 号卡在 in_use、代理配额
+    不归还、注册成功了也不入号池。现在必须把这一遍等完。
+    """
+
+    def test_stop_does_not_abandon_running_run(self):
         ctrl = register_batch.AutoLoopController()
         ctrl._stop_event = __import__("threading").Event()
         ctrl._stop_event.set()
-        ok, category = ctrl._wait_run_finish("run-x", timeout=1)
+        with mock.patch.object(
+            register_batch.db, "get_run", return_value={"status": "done"}
+        ):
+            ok, category = ctrl._wait_run_finish("run-x", timeout=5)
+        # 停止请求下也要等出真实结果（不是 STOPPED 哨兵）
+        self.assertTrue(ok)
+        self.assertEqual(category, "")
+
+    def test_stop_still_reports_real_failure(self):
+        ctrl = register_batch.AutoLoopController()
+        ctrl._stop_event = __import__("threading").Event()
+        ctrl._stop_event.set()
+        with mock.patch.object(
+            register_batch.db,
+            "get_run",
+            return_value={"status": "failed", "error_category": "cf_blocked"},
+        ):
+            ok, category = ctrl._wait_run_finish("run-y", timeout=5)
         self.assertFalse(ok)
-        self.assertEqual(category, register_batch.STOPPED_CATEGORY)
+        self.assertEqual(category, "cf_blocked")
 
 
 if __name__ == "__main__":

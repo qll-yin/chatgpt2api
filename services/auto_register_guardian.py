@@ -187,7 +187,9 @@ def _batch_running() -> bool:
         from services import register_batch
 
         state = str(register_batch.CONTROLLER.status().get("state") or "").lower()
-        return state in {"running", "paused"}
+        # ⚠️ waiting 也算「在跑」—— worker 还活着（在等号池/代理），
+        #    这时再触发会被 CONTROLLER.start() 拒绝，每轮检查都白报一次错。
+        return state in {"running", "paused", "waiting"}
     except Exception as exc:  # noqa: BLE001
         logger.debug("[auto-register] 查询批量注册状态失败: %s", exc)
         return False

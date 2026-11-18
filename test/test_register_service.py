@@ -226,7 +226,7 @@ class RegisterPoolManagementTests(unittest.TestCase):
 
 class RegisterErrorClassifyTests(unittest.TestCase):
     def test_classify(self):
-        self.assertEqual(rs.classify_error("HTTP 409 invalid_state"), "account")
+        self.assertEqual(rs.classify_error("HTTP 409 invalid_state"), "invalid_state")
         self.assertEqual(rs.classify_error("Cloudflare 403 blocked"), "cf_blocked")
         self.assertEqual(rs.classify_error("OTP timeout waiting"), "mail_limited")
         self.assertEqual(rs.classify_error("connection reset by peer"), "network")

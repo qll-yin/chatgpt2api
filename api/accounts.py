@@ -339,8 +339,31 @@ def create_router() -> APIRouter:
         updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy}.items() if value is not None}
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
+        # 改代理时同步调整「静态代理绑定名额」：
+        # 先给新代理占坑（占不上就拒绝修改），再释放旧代理原来占的那格。
+        if "proxy" in updates:
+            current = next(
+                (item for item in account_service.list_accounts()
+                 if str(item.get("access_token") or "") == access_token),
+                None,
+            )
+            old_proxy = str((current or {}).get("proxy") or "").strip()
+            from services import register_service
+
+            ok, message = await run_in_threadpool(
+                register_service.rebind_account_proxy, old_proxy, str(updates.get("proxy") or "")
+            )
+            if not ok:
+                raise HTTPException(status_code=400, detail={"error": message})
         account = account_service.update_account(access_token, updates)
         if account is None:
+            # 账号没更新成功 → 把刚才调整的绑定名额回滚，别留下幽灵占用
+            if "proxy" in updates:
+                await run_in_threadpool(
+                    register_service.rebind_account_proxy,
+                    str(updates.get("proxy") or ""),
+                    old_proxy,
+                )
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
 

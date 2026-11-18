@@ -17,7 +17,8 @@
   4. 409 invalid_state 归到「可重试」分类（以前归 account → 重试根本没触发）。
   5. 流程内部重建会话时（warmup / 409），auth_flow 会**换代理**；
      固定出口又换不到别的代理时，直接失败交外层重试（不再原地空转）。
-  6. 固定出口代理失败后被排除；动态代理不排除（否则池子会被挑空）。
+  6. 失败过的代理（静态/动态都算）下一遍要避开；池里只剩一条时自动回退，
+     不会因此卡死。
 """
 
 from __future__ import annotations
@@ -192,8 +193,13 @@ class FlowRetryLoopTests(unittest.TestCase):
         self.assertEqual(excludes[1], {"http://static-a:1"})
         self.assertEqual(excludes[2], {"http://static-a:1"})
 
-    def test_dynamic_proxy_is_not_excluded(self):
-        """动态代理每次连接换 IP —— 排除它反而会把池子挑空。"""
+    def test_dynamic_proxy_is_also_excluded(self):
+        """动态代理失败后也要避开：导入 5 条时不能一直随机回同一条。
+
+        用户原话：「如果只有一个动态的，随机到同一个是正常的，但如果我导入了
+        5 个，肯定就不能还是只选那一个了」。
+        池里只剩一条时 pick_proxy 会自动回退到它，不会卡死。
+        """
         ctrl = register_batch.AutoLoopController()
         ctrl._options = {
             "max_retries": 2,
@@ -230,12 +236,13 @@ class FlowRetryLoopTests(unittest.TestCase):
              mock.patch.object(ctrl, "_import_to_pool", return_value=None), \
              mock.patch.object(ctrl, "_record_finish", return_value=None), \
              mock.patch.object(ctrl, "_settle_failed_proxy", return_value=None), \
-             mock.patch.object(ctrl, "_finalize_account", return_value=None), \
-             mock.patch.object(ctrl, "_proxy_type_of", return_value="dynamic"):
+             mock.patch.object(ctrl, "_finalize_account", return_value=None):
             ctrl._worker_loop_inner(0, "dynamic-test")
 
-        # 动态代理始终不排除
-        self.assertTrue(all(not ex for ex in excludes))
+        # 第 1 遍没有排除项；之后每一遍都避开刚失败的动态代理
+        self.assertEqual(excludes[0], set())
+        self.assertEqual(excludes[1], {"http://dyn:1"})
+        self.assertEqual(excludes[2], {"http://dyn:1"})
 
 
 class ExcludeProxyTests(unittest.TestCase):

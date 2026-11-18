@@ -113,7 +113,8 @@ export function BatchRegisterPanel() {
   const [providers, setProviders] = useState<MailProvider[]>([]);
   const [mailSource, setMailSource] = useState("");
   const [concurrency, setConcurrency] = useState(1);
-  const [targetCount, setTargetCount] = useState(0);
+  // 目标成功数默认 5（0 = 不限量）。想跑单次就设成 1。
+  const [targetCount, setTargetCount] = useState(5);
   const [coolDown, setCoolDown] = useState(3);
   const [maxRetries, setMaxRetries] = useState(3);
   const [otpTimeout, setOtpTimeout] = useState(180);
@@ -541,7 +542,7 @@ export function BatchRegisterPanel() {
             </div>
 
             <div className="flex flex-wrap gap-2 border-t pt-4">
-              <Button onClick={handleStart} disabled={busy || isRunning}>
+              <Button onClick={handleStart} disabled={busy || isRunning || state === "waiting"}>
                 {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Users className="size-4" />}
                 开始
               </Button>
@@ -610,6 +611,16 @@ export function BatchRegisterPanel() {
                 <dt className="text-xs text-muted-foreground">失败</dt>
                 <dd className="text-lg font-semibold tabular-nums text-red-600 dark:text-red-400">
                   {status?.registered_fail ?? 0}
+                </dd>
+              </div>
+              <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">
+                <dt className="text-xs text-muted-foreground">
+                  共尝试
+                  <span className="ml-1 text-[10px] opacity-70">（含重试）</span>
+                </dt>
+                <dd className="text-lg font-semibold tabular-nums">
+                  {status?.attempts ?? 0}
+                  <span className="ml-1 text-xs font-normal text-muted-foreground">遍</span>
                 </dd>
               </div>
               <div className="rounded-xl bg-stone-50 px-3 py-2 dark:bg-white/5">

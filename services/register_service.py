@@ -229,6 +229,47 @@ POOL_PROXY_MODES = frozenset(
 )
 
 
+def rebind_account_proxy(old_proxy: str, new_proxy: str) -> tuple[bool, str]:
+    """号池里的账号**换代理**：释放旧绑定名额、占用新绑定名额。
+
+    返回 (ok, message)。ok=False 表示新代理的绑定名额满了 —— 调用方
+    应该拒绝这次修改，否则账号会绑着一个没记账的代理，名额彻底对不上。
+    """
+    from services.storage import register_store as store
+
+    old = str(old_proxy or "").strip()
+    new = str(new_proxy or "").strip()
+    if old == new:
+        return True, ""
+    if new and store.is_static_proxy(new):
+        if not store.bind_proxy(new):
+            return False, "新代理的绑定名额已满，请先释放其它账号或调大上限"
+    # 新绑定占上了才释放旧的（先占后退，避免中途失败把名额丢了）
+    if old and store.is_static_proxy(old):
+        store.release_bind_proxy(old)
+    return True, ""
+
+
+def pool_proxy_of_email(email: str) -> str:
+    """这个号**已经**在号池里时，返回它在号池里现绑的代理（没有则空串）。
+
+    只用于「重新导入」时的幂等判断：同一份绑定不能反复占名额。
+    """
+    address = str(email or "").strip().lower()
+    if not address:
+        return ""
+    try:
+        from services.account_service import account_service
+
+        account = account_service.get_account_by_email(address)
+        if isinstance(account, dict):
+            return str(account.get("proxy") or "").strip()
+    except Exception:  # noqa: BLE001
+        # 查询失败不影响导入，最多退化成「按新绑定处理」
+        pass
+    return ""
+
+
 def resolve_pool_proxy(
     mode: str,
     *,
@@ -236,6 +277,7 @@ def resolve_pool_proxy(
     bind_proxy: str = "",
     auto_bind: bool = False,
     prefer_register_static: bool = False,
+    existing_proxy: str = "",
 ) -> tuple[str, str]:
     """决定账号入池时绑哪个代理。返回 ``(proxy, reason)``。
 
@@ -261,12 +303,33 @@ def resolve_pool_proxy(
     （注册出口 = 长期使用出口，保持一致）。这个开关只在 mode="static"
     时生效：优先沿用注册时那条静态代理（占它的绑定名额），名额满了
     再回落到自动分配。
+
+    existing_proxy（幂等，防重复占名额）
+    ------------------------------------
+    这个号**已经在号池里**时，把它在号池里现绑的代理传进来。
+    · 没显式指定 bind_proxy 且原代理仍是可用的静态代理 → 直接沿用它，
+      **不再占一个绑定名额**（以前每次「重新导入」都会多占一格，
+      静态代理默认只允许绑 10 个号，点几次就满了）
+    · 要改绑别的代理 → 释放原来的绑定名额再绑新的
     """
     from services.storage import register_store as store
 
     normalized = str(mode or POOL_PROXY_MODE_NONE).strip().lower()
     if normalized not in POOL_PROXY_MODES:
         normalized = POOL_PROXY_MODE_NONE
+
+    existing = str(existing_proxy or "").strip()
+
+    def _rebind(new_proxy: str) -> bool:
+        """把绑定从 existing 换成 new_proxy（同一个就不重复占名额）。"""
+        if existing and existing == new_proxy:
+            return True
+        if existing and store.is_static_proxy(existing):
+            try:
+                store.release_bind_proxy(existing)
+            except Exception:  # noqa: BLE001
+                pass
+        return store.bind_proxy(new_proxy)
 
     if normalized == POOL_PROXY_MODE_NONE:
         return "", "未选择入池代理"
@@ -284,15 +347,21 @@ def resolve_pool_proxy(
     if explicit:
         if not store.is_static_proxy(explicit):
             return "", "指定的代理不是静态代理，按空代理入池"
-        if not store.bind_proxy(explicit):
+        if not _rebind(explicit):
             return "", "指定代理绑定名额已满，按空代理入池"
         return explicit, "使用指定的静态代理"
+
+    # 已在号池且原代理还是可用静态代理 → 直接沿用，不重复占名额
+    if existing and not explicit and store.is_static_proxy(existing):
+        row = store.find_proxy(existing) or {}
+        if row.get("enabled"):
+            return existing, "沿用账号已绑定的静态代理（不重复占用名额）"
 
     # ⚠️ 注册时用的就是静态代理 → 优先沿用它（与注册出口保持一致）
     if prefer_register_static:
         reg = str(register_proxy or "").strip()
         if reg and store.is_static_proxy(reg):
-            if store.bind_proxy(reg):
+            if _rebind(reg):
                 return reg, "沿用注册时的静态代理（与注册出口保持一致）"
             # 绑定名额已满 → 落到下面的自动分配
         # 注册用的是动态代理 → 不能入池，继续走自动分配静态代理
@@ -391,11 +460,13 @@ def import_registered_to_pool(
             register_proxy=str(record.get("proxy") or "").strip(),
             bind_proxy=str(bind_proxy or "").strip(),
             auto_bind=auto_bind,
+            existing_proxy=pool_proxy_of_email(email),
         )
         if assigned_proxy:
             payload["proxy"] = assigned_proxy
-            # 只有「从静态池分配」才占绑定配额（沿用注册代理不占）
-            if mode == POOL_PROXY_MODE_STATIC:
+            # 只有「从静态池分配 / 指定」且**真的新占了一个名额**才记 ——
+            # 沿用账号已绑定的代理时不能再算一次，否则重导入会越占越多。
+            if mode == POOL_PROXY_MODE_STATIC and "不重复占用" not in reason:
                 bound.append(assigned_proxy)
             bind_stats["bound"] += 1
         else:
@@ -416,11 +487,13 @@ def import_registered_to_pool(
 
     result = import_to_pool_with_refresh(payloads, refresh=refresh)
     imported = int(result.get("imported") or 0)
-    # 导入失败的账号要把名额还回去 —— 否则配额被"幽灵账号"占着
-    if imported < len(payloads) and bound:
-        # import_to_pool_with_refresh 的 items 里有每个账号的结果，
-        # 这里按成功数粗略还：宁可少还也别多占（多占会让代理提前耗尽）
-        release_count = len(bound) - imported
+    skipped = int(result.get("skipped") or 0)
+    # 真正没进池子的（失败）才把新占的名额还回去。
+    # ⚠️ 不能按 imported 算 —— skipped 是「号已在池中」，它的绑定是有效的，
+    #    按 imported 减会把它的名额误释放掉。
+    landed = imported + skipped
+    if landed < len(payloads) and bound:
+        release_count = len(payloads) - landed
         for proxy in bound[:max(0, release_count)]:
             store.release_bind_proxy(proxy)
 
@@ -605,10 +678,19 @@ def register_one(options: dict[str, Any]) -> dict[str, Any]:
 
     imported = False
     if ok and access_token and bool(options.get("auto_import", False)):
-        payload = build_pool_payload(email, access_token, str(options.get("proxy") or ""))
-        # 「入池时携带代理」关掉时，即使注册记录里存了代理也不带进号池
-        if not options.get("with_proxy", True):
-            payload.pop("proxy", None)
+        # ⚠️ 动态代理绝不入池（与批量/导入号池同一条规则）。
+        #    以前这里直接把 options.proxy 塞进 payload，且 allow_record_proxy
+        #    默认 True → 单次注册能把注册用的动态代理带进号池。
+        mode = POOL_PROXY_MODE_STATIC if options.get("with_proxy", True) else POOL_PROXY_MODE_NONE
+        assigned_proxy, _reason = resolve_pool_proxy(
+            mode,
+            register_proxy=str(options.get("proxy") or "").strip(),
+            prefer_register_static=True,
+            existing_proxy=pool_proxy_of_email(email),
+        )
+        payload = build_pool_payload(
+            email, access_token, assigned_proxy, allow_record_proxy=False
+        )
         # 单次注册只有一个号，直接带刷新（用户想立刻看到额度）
         result = import_to_pool_with_refresh([payload])
         imported = bool(result.get("imported"))
@@ -662,8 +744,11 @@ def classify_error(err: str, mail_source: str = "") -> str:
       - mail_limited       → 邮箱侧限制，不再复用该邮箱
     """
     text = str(err or "").lower()
+    # ⚠️ 必须与 registrar.classify_error 保持一致：
+    #    409 invalid_state 是「出口 IP 被记」→ 可重试，不是账号本身的问题。
+    #    以前这里归成 account（不可重试）→ 每次 409 都换号、白烧付费邮箱。
     if "invalid_state" in text or "http 409" in text:
-        return "account"
+        return "invalid_state"
     if "cloudflare" in text or "403" in text or "cf_blocked" in text:
         return "cf_blocked"
     if "otp" in text or "验证码" in text or "timeout" in text or "超时" in text:

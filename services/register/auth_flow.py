@@ -113,6 +113,7 @@ class AuthFlow:
         account_callback: Optional[Any] = None,
         proxy_rotator: Optional[Callable[[], str]] = None,
         proxy_type: str = "",
+        proxy_type_resolver: Optional[Callable[[str], str]] = None,
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -133,6 +134,10 @@ class AuthFlow:
         # static = 固定出口 IP（换 session 也不会换 IP）；
         # dynamic = 每次连接换 IP（换 session ≈ 换出口）。
         self._proxy_type = str(proxy_type or "").strip().lower()
+        # 换代理后重新查类型（static/dynamic）—— 否则换到另一种类型后
+        # _proxy_is_static() 还在用旧代理的判断，后面的「静态代理别原地重试」
+        # 决策就错了。
+        self._proxy_type_resolver = proxy_type_resolver
         self._country_code = ""  # IP 地理国家码，check_proxy() 时填充
         self._fingerprint = generate_fingerprint()  # 先生成默认指纹
         self._ua = self._fingerprint["user_agent"]
@@ -1771,6 +1776,12 @@ class AuthFlow:
         if not new_proxy or new_proxy == cur:
             return False
         self.config.proxy = new_proxy
+        # 类型跟着新代理走（换到动态代理后就不该再"静态⇒原地重试没意义"）
+        if self._proxy_type_resolver is not None:
+            try:
+                self._proxy_type = str(self._proxy_type_resolver(new_proxy) or "").strip().lower()
+            except Exception:  # noqa: BLE001
+                self._proxy_type = ""
         self.session = create_http_session(
             proxy=new_proxy,
             impersonate=self._impersonate_candidates[self._impersonate_idx],

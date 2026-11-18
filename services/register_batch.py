@@ -144,6 +144,9 @@ class AutoLoopController:
         self._finished_at: float = 0.0
         self._registered_ok = 0
         self._registered_fail = 0
+        # 一共跑了多少遍完整流程（含重试）。用于前端显示「共尝试 N 遍」，
+        # 与「失败数（按号算）」分开。
+        self._attempts = 0
         # 本次批量导入号池的 access_token —— 批量结束后统一刷额度用
         self._imported_tokens: list[str] = []
         # 当前每个 worker 在跑啥（worker_id → email）
@@ -217,6 +220,7 @@ class AutoLoopController:
             self._imported_tokens = []
             self._registered_ok = 0
             self._registered_fail = 0
+            self._attempts = 0
             self._last_fail_reason = ""
             self._worker_status.clear()
             # ⚠️ 不清 _alive_workers —— 旧批次的 worker 可能还活着，
@@ -255,6 +259,45 @@ class AutoLoopController:
                 _raw_mode if _raw_mode in REGISTER_PROXY_MODES else REGISTER_PROXY_MODE_MIXED
             )
             self._options["register_proxy_mode"] = self._register_proxy_mode
+            # 启动前自愈：上次进程崩溃 / 被 kill 时，claim 了的号会卡在 in_use，
+            # 没有任何入口能恢复（release_stale 以前从没被调用过）。
+            # 只释放 10 分钟以上没动静的，避免误伤正在跑的号。
+            try:
+                stale = db.release_stale(600)
+                if stale:
+                    logger.warning(
+                        "[auto-loop] 启动自愈：把 %s 个卡在 in_use 的邮箱放回 available", stale
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[auto-loop] 启动自愈失败（不影响启动）: %s", e)
+            # 「注册使用代理」选了具体类型时，池里必须有该类可用代理 ——
+            # 否则 worker 要等满 120 秒才报「没有可用的动态代理」，像卡死了。
+            if self._register_proxy_mode in (
+                REGISTER_PROXY_MODE_DYNAMIC,
+                REGISTER_PROXY_MODE_STATIC,
+            ):
+                usable = 0
+                try:
+                    usable = db.usable_proxy_count(self._register_proxy_mode)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[auto-loop] 查询可用代理失败: %s", e)
+                if usable <= 0:
+                    label = (
+                        "动态代理"
+                        if self._register_proxy_mode == REGISTER_PROXY_MODE_DYNAMIC
+                        else "静态代理"
+                    )
+                    self._state = AutoLoopState.STOPPED
+                    self._last_message = f"代理池里没有可用的{label}，无法启动"
+                    logger.warning(self._last_message)
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"代理池里没有可用的{label}（启用中且未超注册上限）。"
+                            f"请先到「代理池」导入并选对类型，或把「注册使用代理」"
+                            f"改成「混合随机」。"
+                        ),
+                    }
             # 启动时把关键参数打出来 —— 用户反馈「设了重试 3 次却没重试」时，
             # 一眼就能确认服务端到底收到了多少（而不是靠猜前端传没传）。
             logger.info(
@@ -282,9 +325,9 @@ class AutoLoopController:
 
     def pause(self) -> dict:
         with self._lock:
-            if self._state == AutoLoopState.WAITING:
-                return {"ok": False, "error": "当前在等资源，没在跑，不用暂停"}
-            if self._state != AutoLoopState.RUNNING:
+            # 「等待资源」也允许暂停 —— worker 正在等代理/号池，
+            # 用户想先停下来补资源是合理操作（以前直接拒绝）。
+            if self._state not in (AutoLoopState.RUNNING, AutoLoopState.WAITING):
                 return {"ok": False, "error": f"当前 state={self._state}，不可暂停"}
             self._pause_event.set()
             self._state = AutoLoopState.PAUSED
@@ -366,6 +409,8 @@ class AutoLoopController:
                 "elapsed": elapsed,
                 "registered_ok": self._registered_ok,
                 "registered_fail": self._registered_fail,
+                # 尝试遍数（含重试）—— 与「失败数（按号）」分开显示
+                "attempts": self._attempts,
                 "target_count": self._target_count,
                 "remaining": (
                     max(0, self._target_count - self._registered_ok)
@@ -513,21 +558,44 @@ class AutoLoopController:
         budget = self._proxy_wait_secs if timeout is None else timeout
         deadline = time.time() + max(0, int(budget))
         announced = False
+        paused_at: float | None = None
         while time.time() < deadline:
-            if self._stop_event.is_set() or self._pause_event.is_set():
+            if self._stop_event.is_set():
                 return ""
+            if self._pause_event.is_set():
+                # ⚠️ 暂停时**原地等恢复**，不能直接 return ""。
+                #    以前这里返回空串 → 第 1 遍流程会走「没有可用代理」分支
+                #    收尾退出 → 暂停一下就把 worker 弄死了，resume 也救不回来。
+                #    暂停的这段时间不算进等待预算。
+                paused_at = paused_at or time.time()
+                while self._pause_event.is_set() and not self._stop_event.is_set():
+                    time.sleep(0.5)
+                deadline += time.time() - paused_at
+                paused_at = None
+                continue
             picked = self._proxy_for_worker(worker_id, exclude=exclude)
             if picked:
+                # 拿到代理 → 如果刚才因为等待被标成「等待资源」，切回运行中。
+                # ⚠️ 只在 WAITING 时切 —— 别把用户刚点的 PAUSED 覆盖掉。
+                if self._state == AutoLoopState.WAITING:
+                    self._set_state(
+                        AutoLoopState.RUNNING, str(self._options.get("batch_id") or "")
+                    )
                 return picked
             if not announced:
                 announced = True
                 self._set_message(
                     f"worker-{worker_id} 暂时拿不到代理（池内被其他 worker 占用），等待中…"
                 )
-                self._set_state(
-                    AutoLoopState.WAITING, str(self._options.get("batch_id") or "")
-                )
-                self._broadcast("state", self._snapshot())
+                # ⚠️ 只有「一个注册都没在跑」时才把整批标成等待资源 ——
+                #    否则别的 worker 正在注册，前端却显示「等待资源」。
+                with self._lock:
+                    busy = bool(self._worker_status)
+                if not busy:
+                    self._set_state(
+                        AutoLoopState.WAITING, str(self._options.get("batch_id") or "")
+                    )
+                    self._broadcast("state", self._snapshot())
             time.sleep(2)
         return ""
 
@@ -776,6 +844,22 @@ class AutoLoopController:
                     f"{isres.get('invalid_state')} 次）→ 换下一个代理: {proxy[:60]}"
                 )
 
+    def _release_account(self, account: dict, pooled: bool) -> None:
+        """把号放回 available（用户停止 / 还没真正注册就被打断时）。
+
+        ⚠️ 与 mark_failed 的区别：这不是号的问题，下次还能用。
+        """
+        if not pooled:
+            return
+        email = str((account or {}).get("email") or "").strip()
+        if not email:
+            return
+        try:
+            db.release_unused(email)
+            logger.info(f"[register] {email} 已放回号池（任务被停止，号未消耗）")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"账号 {email} 放回号池失败: {e}")
+
     def _finalize_account(self, account: dict, category: str, pooled: bool) -> None:
         """这个号重试到底之后的最终处置（号池型来源才有号池记录）。
 
@@ -963,9 +1047,24 @@ class AutoLoopController:
             recorded = False
             run_id = ""
             while True:
-                attempt += 1
+                # 暂停时不开始新的尝试（等恢复）；停止则把号放回号池再退出。
+                # ⚠️ 以前只在「领号」之前检查暂停 —— 一个号正在重试链中间时，
+                #    用户点暂停，下一遍流程还是会照跑。
+                while self._pause_event.is_set() and not self._stop_event.is_set():
+                    time.sleep(0.5)
+                if self._stop_event.is_set():
+                    self._release_account(account, pooled)
+                    with self._lock:
+                        self._worker_status.pop(worker_id, None)
+                    self._set_message("已停止")
+                    self._broadcast("state", self._snapshot())
+                    return
 
-                # ── 取代理（避开本轮已失败的固定出口代理）──
+                attempt += 1
+                with self._lock:
+                    self._attempts += 1
+
+                # ── 取代理（避开本轮已失败的那条）──
                 # reserved：这条代理是不是 pick_proxy **预占**来的。
                 # 预占的才需要在失败时 proxy_release 还回去。
                 reserved = False
@@ -996,6 +1095,14 @@ class AutoLoopController:
                             f"建议补充代理"
                         )
                     if not proxy:
+                        # 用户点了停止 → 不是「代理没了」，别报成代理故障
+                        if self._stop_event.is_set():
+                            self._release_account(account, pooled)
+                            with self._lock:
+                                self._worker_status.pop(worker_id, None)
+                            self._set_message("已停止")
+                            self._broadcast("state", self._snapshot())
+                            return
                         stats = db.proxy_pool_stats()
                         by_type = stats.get("by_type") or {}
                         want = {
@@ -1022,6 +1129,15 @@ class AutoLoopController:
                         return
                 else:
                     proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
+
+                # ⚠️ 池里没有「别的」代理时，pick_proxy 会回退到被排除的那条
+                #    （不这样的话重试会直接卡死）。这等于**没有换出口 IP** ——
+                #    必须说清楚，否则用户以为在换 IP 重试。
+                if proxy and proxy in failed_proxies:
+                    logger.warning(
+                        f"[worker-{worker_id}] 池里没有别的可用代理，第 {attempt} 遍"
+                        f"仍复用同一条（{proxy[:60]}）—— 这一遍不会换出口 IP"
+                    )
 
                 # ── 给这个 run 注入 worker 自己的代理 ──
                 run_options = dict(self._options)
@@ -1077,17 +1193,8 @@ class AutoLoopController:
                 #    详细过程只能去「运行记录」里翻。
                 self._forward_run_logs(run_id, worker_id, account["email"])
 
-                # 等当前 run 跑完
+                # ── 等这一遍跑完（停止请求也等它结束：当前号跑完再停）──
                 ok, category = self._wait_run_finish(run_id)
-
-                # ── 被外部停止（用户点停止 / 目标达成）──
-                # 这不是失败：不该计失败数、不该触发重试、不该退到「换号继续」，
-                # 直接干净退出这个 worker。
-                if category == STOPPED_CATEGORY:
-                    with self._lock:
-                        self._worker_status.pop(worker_id, None)
-                    self._broadcast("state", self._snapshot())
-                    return
 
                 # 空分类一律按 unknown 处理（unknown 在可重试集合里）。
                 # ⚠️ 之前空分类既不在 RETRYABLE 也不在 NON_RETRYABLE 里 →
@@ -1135,6 +1242,22 @@ class AutoLoopController:
                 )
                 last_proxy = used_proxy or proxy or last_proxy
 
+                # ── 用户已请求停止：这一遍跑完就不再重试 ──
+                # 「当前号跑完再停」—— 号不该因为用户点停止被判定为废号，
+                # 放回 available 下次还能用。
+                if self._stop_event.is_set():
+                    self._release_account(account, pooled)
+                    self._record_finish(
+                        False, category, count_fail=True, count_breaker=True
+                    )
+                    recorded = True
+                    self._emit_log(
+                        f"已请求停止：第 {attempt} 遍流程失败（{category}）后不再重试，"
+                        f"号已放回号池",
+                        level="warning",
+                    )
+                    break
+
                 # ── worker 级重试判定 ──
                 #
                 # 一个完整流程（含 auth_flow 内部的重建会话重试）算**一次**尝试。
@@ -1163,11 +1286,14 @@ class AutoLoopController:
                         )
                     break
 
-                # 可重试 → 这条（静态）代理的出口 IP 已经被记，下一遍避开它。
-                # ⚠️ 只有**静态**代理才排除：它的出口 IP 是固定的，
-                #    再用一次还是撞同一堵墙。动态代理每次连接换 IP，
-                #    排除它反而会把池子挑空（用户常常只有一条动态代理）。
-                if used_proxy and self._proxy_type_of(used_proxy) == "static":
+                # 可重试 → 这条代理这一遍已经失败，下一遍优先避开它。
+                # ⚠️ 静态**和**动态都要避开：
+                #    · 静态：出口 IP 固定，再用一次还是撞同一堵墙
+                #    · 动态：用户常常导入多条；失败后还随机回同一条，
+                #      等于这一遍没换出口（用户明确要求：导入 5 条就不能
+                #      还是只选那一条）。池里只有一条时 pick_proxy 会自动
+                #      回退到它，不会因为排除而卡死。
+                if used_proxy:
                     failed_proxies.add(used_proxy)
 
                 consecutive_retryable_fails += 1
@@ -1198,10 +1324,12 @@ class AutoLoopController:
                     })
                     return
 
-                # 这一遍失败要记账（失败数 = 试了几遍），但**不**计熔断 ——
-                # 熔断只在整条重试链最终失败时计一次。
+                # 这一遍失败**不**计失败数 —— 失败数按「号」算（用户口径：
+                # 一个号重试 3 遍最终成功 = 成功 1 / 失败 0，而不是失败 3）。
+                # 尝试遍数单独由 _attempts 统计，前端显示「共尝试 N 遍」。
+                # 熔断也只在整条重试链最终失败时计一次。
                 self._record_finish(
-                    False, category, count_fail=True, count_breaker=False
+                    False, category, count_fail=False, count_breaker=False
                 )
                 recorded = True
                 self._emit_log(
@@ -1439,6 +1567,8 @@ class AutoLoopController:
                 # ⚠️ 「注册使用代理」选的是静态代理时，入池**沿用同一条** ——
                 #    注册出口 = 长期使用出口，账号不会注册完就换 IP。
                 prefer_register_static=True,
+                # 号已在池中（重跑/重复导入）→ 沿用原绑定，不重复占名额
+                existing_proxy=register_service.pool_proxy_of_email(email),
             )
             if assigned_proxy:
                 logger.info(
@@ -1522,19 +1652,23 @@ class AutoLoopController:
 
         返回 (ok, category)。
 
-        ⚠️ category 有三种含义，别混：
-          · 正常失败 → 具体分类（cf_blocked / network / account / mail_limited /
-            unknown）—— 空值一律归为 unknown（可重试），不能静默当成
-            「不重试也不换号」的缝。
-          · 被停止   → 返回哨兵值 STOPPED_CATEGORY —— 用户点停止或目标达成，
-            **不算失败**（不该计失败数、更不该触发重试）。
+        ⚠️ 停止语义：**当前号跑完再停**（用户明确要求）。
+           以前 stop_event 一置位这里就立刻返回哨兵 STOPPED，worker 直接
+           return —— 但 registrar 的线程还在跑，后果是：
+             · 号永远卡在 in_use（registrar 被 hold_account 关了状态回写，
+               worker 又提前走了，没人收尾）
+             · 代理预占的配额不归还
+             · 该 run 之后若注册成功，**永远不会入号池**（入池在 worker 里）
+           现在不管 stop 有没有置位，都把这一遍等完；收尾逻辑跑完后再退出。
+
+        category 的两种含义：
+          · 正常失败 → 具体分类（cf_blocked / network / account /
+            mail_limited / invalid_state / unknown）—— 空值一律归 unknown。
           · 超时     → 归 unknown（可重试）—— 之前返回空串，被当成不可重试，
             worker 直接换号收工。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._stop_event.is_set():
-                return False, STOPPED_CATEGORY
             try:
                 row = db.get_run(run_id)
             except Exception as e:  # noqa: BLE001

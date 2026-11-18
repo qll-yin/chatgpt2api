@@ -81,6 +81,8 @@ export function ProxyPoolPanel() {
   const [items, setItems] = useState<RegisterProxy[]>([]);
   const [stats, setStats] = useState<RegisterProxyStats | null>(null);
   const [text, setText] = useState("");
+  // 导入时统一指定的代理类型 —— 以前写死「静态」，导入动态代理后要逐个手改
+  const [importType, setImportType] = useState<"static" | "dynamic">("static");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testingAll, setTestingAll] = useState(false);
@@ -117,8 +119,10 @@ export function ProxyPoolPanel() {
     }
     setSaving(true);
     try {
-      const result = await importRegisterProxies(text, mode);
-      toast.success(`已导入 ${result.total} 个代理`);
+      const result = await importRegisterProxies(text, mode, importType);
+      toast.success(
+        `已导入 ${result.total} 个${importType === "dynamic" ? "动态" : "静态"}代理`,
+      );
       setText("");
       await load();
     } catch (error) {
@@ -332,6 +336,24 @@ export function ProxyPoolPanel() {
             <strong>覆盖</strong>会删掉不在列表里的代理（已在池中的代理保留用量和启用状态）；
             <strong>追加</strong>只加新的。
           </p>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">导入为</span>
+            <Select
+              value={importType}
+              onValueChange={(v) => setImportType(v as "static" | "dynamic")}
+            >
+              <SelectTrigger className="h-8 w-52">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="static">静态代理（固定出口 IP）</SelectItem>
+                <SelectItem value="dynamic">动态代理（每次换 IP）</SelectItem>
+              </SelectContent>
+            </Select>
+            <span className="text-xs text-muted-foreground">
+              只影响<strong>新导入</strong>的代理，已有的不会改
+            </span>
+          </div>
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}

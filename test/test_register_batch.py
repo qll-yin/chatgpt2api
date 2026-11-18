@@ -271,7 +271,7 @@ class RegisterStoreCompatTests(unittest.TestCase):
 
 class ClassifyErrorTests(unittest.TestCase):
     def test_classify(self):
-        self.assertEqual(register_service.classify_error("HTTP 409 invalid_state"), "account")
+        self.assertEqual(register_service.classify_error("HTTP 409 invalid_state"), "invalid_state")
         self.assertEqual(register_service.classify_error("Cloudflare 403 blocked"), "cf_blocked")
         self.assertEqual(register_service.classify_error("OTP timeout waiting"), "mail_limited")
         self.assertEqual(register_service.classify_error("connection reset by peer"), "network")

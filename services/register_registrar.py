@@ -29,6 +29,12 @@ from services.storage import register_store as db  # noqa: E402
 
 # run_id -> queue of log strings; sentinel = None 表示流结束
 _run_queues: dict[str, queue.Queue] = {}
+# run 的「最后一次活动」时间 —— 用来回收队列，避免长期运行内存一直涨。
+# ⚠️ 以前 _run_queues 只增不删（remove_run_queue 没有任何调用方），
+#    跑几千个号就是几千个 Queue + 日志串常驻内存。
+_run_queue_ts: dict[str, float] = {}
+_RUN_QUEUE_TTL_SECS = 1800
+_RUN_QUEUE_MAX = 300
 _lock = threading.Lock()
 
 # 当前线程正在跑哪个 run。
@@ -80,6 +86,9 @@ class QueueLogHandler(logging.Handler):
             msg = self.format(record)
             self._fh.write(msg + "\n")
             self._fh.flush()
+            # 每写一行都刷新「最后活动时间」—— 长任务（OTP/2FA/Codex 授权
+            # 可能跑二十多分钟）不会因为 TTL 到了被回收掉队列。
+            _run_queue_ts[self.run_id] = time.time()
             q = _run_queues.get(self.run_id)
             if q is not None:
                 q.put(msg)
@@ -102,6 +111,7 @@ def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
         return
     body = payload if isinstance(payload, dict) else {"message": str(payload)}
     body["kind"] = kind
+    _run_queue_ts[run_id] = time.time()
     q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
 
 
@@ -381,6 +391,19 @@ def _do_register(
         _can_rotate = _proxy_row is not None
         _proxy_type = str((_proxy_row or {}).get("proxy_type") or "").strip().lower()
 
+        # 「注册使用代理」选的具体类型 —— 流程内换代理也必须遵守。
+        # ⚠️ 以前这里不传类型，选「只用静态」也可能换到动态代理，
+        #    用户对风控效果的判断直接失真。
+        _rotate_mode = str(options.get("register_proxy_mode") or "").strip().lower()
+        _rotate_type = _rotate_mode if _rotate_mode in ("static", "dynamic") else ""
+
+        def _resolve_proxy_type(proxy_addr: str) -> str:
+            try:
+                row = db.find_proxy(str(proxy_addr or "").strip()) or {}
+            except Exception:  # noqa: BLE001
+                return ""
+            return str(row.get("proxy_type") or "").strip().lower()
+
         # 外层（auto_loop worker）用它拿到"这次实际用的那条代理"，
         # 好按正确的对象结算配额（换过代理时，原代理那条是旧的）。
         _proxy_state = options.get("proxy_state")
@@ -393,15 +416,21 @@ def _do_register(
             if not cur:
                 return ""
             try:
-                new = db.pick_proxy(exclude={cur})
+                new = db.pick_proxy(exclude={cur}, proxy_type=_rotate_type)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger("registrar").warning(f"[register] 换代理失败: {e}")
                 return ""
             if not new:
                 return ""
-            # ⚠️ 挑回自己 = 池里没有别的代理了（pick_proxy 有"没有就回退"的兜底）。
-            #    这时候**不能**动配额 —— 这条代理这一轮还在用。
+            # ⚠️ 挑回自己 = 池里没有别的（同类）代理了（pick_proxy 有回退兜底）。
+            #    pick_proxy 这次**已经又 +1 预占**了同一条，必须马上还回去：
+            #    外层第 1 遍已经占过一格，这里再占一格就永远多算一次用量
+            #    （max_uses 会被这种"没换到"的重试慢慢吃光）。
             if new == cur:
+                try:
+                    db.proxy_release(new)
+                except Exception:  # noqa: BLE001
+                    pass
                 return ""
             # 预占（used_count）从旧代理转移到新代理：
             # 旧代理那格还回去（它这一轮没真正注册成），新代理占一格。
@@ -489,6 +518,7 @@ def _do_register(
             account_callback=_account_callback_for_flow,
             proxy_rotator=_rotate_proxy if _can_rotate else None,
             proxy_type=_proxy_type,
+            proxy_type_resolver=_resolve_proxy_type,
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         # 把关键开关的实际生效值打进日志 —— 主人反馈过"关掉 2FA 好像没反应"，
@@ -633,7 +663,14 @@ def _do_register(
         # 记下这个号用的代理。
         # 用途：① 导出「access_token----代理」给 chatgpt2api，让注册和使用同一个 IP；
         #      ② 账号被删除 / 标注异常时，把这个代理占用的配额还回去。
-        run_proxy = str(options.get("proxy") or "").strip()
+        #
+        # ⚠️ 必须取「流程内最终用的那条」（proxy_state 由 auth_flow 在换代理时
+        #    更新），不能用 options["proxy"]：那是第 1 遍的旧代理。
+        #    以前用错对象 → 注册记录里的 proxy 是旧的、"连续被拦"计数清零
+        #    也清在旧代理上，真正成功的那条一直不清 → 后续被误停用。
+        run_proxy = str(
+            (_proxy_state or {}).get("proxy") if isinstance(_proxy_state, dict) else ""
+        ).strip() or str(options.get("proxy") or "").strip()
         if run_proxy:
             d["proxy"] = run_proxy
         # 标记这枚 refresh_token 是 Codex CLI 的 client 铸出来的。
@@ -643,11 +680,9 @@ def _do_register(
             d["codex_refresh_token"] = True
         # 落库（密码已在 2FA 之前回读补齐，这里 d 里该有的都有了）
         db.save_registered(d)
-        # ⚠️ 这里**不再**给 used_count +1：自动跑号时 pick_proxy() 选中代理
+        # ⚠️ 这里**不**给 used_count +1：自动跑号时 pick_proxy() 选中代理
         #    已经预占了一格，成功就是确认这格；失败由 auto_loop 把预占还回去。
-        #    但「单次注册」页是用户手填的代理，没走过 pick_proxy()，
-        #    所以那种情况要在这里补记一次（代理不在池里时 proxy_used 也不会命中，
-        #    只是个记账，不会出错）。
+        #    （单次注册接口已不单独走代理预占 —— 它现在复用批量那套入池规则。）
         #
         # 成功 = 这条出口是通的 → 清零它的「连续被拦 / 连续失效」计数。
         # 不清零的话计数会跨天累计（第 2 次 409 就永久停用），
@@ -801,6 +836,11 @@ def _do_register(
         q = _run_queues.get(run_id)
         if q is not None:
             q.put(None)  # sentinel: 流结束
+        # 记下结束时间 —— 队列本身由 _prune_run_queues 半小时后回收
+        #（立刻删会让刚结束的 run 在批次日志里少几行，前端还可能正在读）。
+        with _lock:
+            if run_id in _run_queue_ts:
+                _run_queue_ts[run_id] = time.time()
         # 线程标记清掉。理论上线程跑完就回收了，但 threading.local 是绑在
         # 线程对象上的，万一以后换成线程池复用线程，残留的 run_id 会让下一个
         # 任务的日志全被投递到上一个 run 的（已关闭的）文件里去。
@@ -953,6 +993,26 @@ def _sms_ready() -> bool:
     return True
 
 
+def _prune_run_queues() -> None:
+    """回收已经结束的 run 队列（保留半小时，够前端把日志拉完）。"""
+    now = time.time()
+    with _lock:
+        stale = [
+            rid
+            for rid, ts in _run_queue_ts.items()
+            if now - ts > _RUN_QUEUE_TTL_SECS
+        ]
+        for rid in stale:
+            _run_queues.pop(rid, None)
+            _run_queue_ts.pop(rid, None)
+        # 极端情况（短时间跑了大量号）再按时间砍到上限
+        if len(_run_queues) > _RUN_QUEUE_MAX:
+            ordered = sorted(_run_queue_ts.items(), key=lambda kv: kv[1])
+            for rid, _ts in ordered[: len(_run_queues) - _RUN_QUEUE_MAX]:
+                _run_queues.pop(rid, None)
+                _run_queue_ts.pop(rid, None)
+
+
 def start_registration(account: dict, options: dict) -> str:
     """启动一次注册任务，返回 run_id。"""
     run_id = uuid.uuid4().hex[:12]
@@ -965,8 +1025,10 @@ def start_registration(account: dict, options: dict) -> str:
     )
 
     q: queue.Queue = queue.Queue()
+    _prune_run_queues()
     with _lock:
         _run_queues[run_id] = q
+        _run_queue_ts[run_id] = time.time()
 
     th = threading.Thread(
         target=_do_register,

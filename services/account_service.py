@@ -21,6 +21,29 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
+def _release_bind_proxies(proxies: list[str]) -> None:
+    """账号从号池移除后，把它占用的**静态代理绑定名额**还回去。
+
+    ⚠️ 以前只有「注册结果导入号池失败」会回滚绑定名额；号池里删账号
+    从不释放 → 静态代理默认只能绑 10 个号，删了号名额也不回来，
+    慢慢就"名额已满"，新号只能直连入池。
+    """
+    unique = {str(p or "").strip() for p in (proxies or []) if str(p or "").strip()}
+    if not unique:
+        return
+    try:
+        from services.storage import register_store as store
+    except Exception:  # noqa: BLE001
+        return
+    for proxy in unique:
+        try:
+            if store.is_static_proxy(proxy):
+                store.release_bind_proxy(proxy)
+        except Exception:  # noqa: BLE001
+            # 释放失败不影响删除账号本身
+            continue
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -1283,6 +1306,13 @@ class AccountService:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
+            # 删之前记下它们绑的代理 —— 号没了，绑定名额要还回代理池，
+            # 否则静态代理的 bind_max_uses 会被"幽灵账号"永久占住。
+            freed_proxies = [
+                str((self._accounts.get(token) or {}).get("proxy") or "").strip()
+                for token in target_set
+                if token in self._accounts
+            ]
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
@@ -1300,6 +1330,8 @@ class AccountService:
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
+        # 锁外做数据库写（释放绑定名额），避免持锁做 I/O
+        _release_bind_proxies(freed_proxies)
         return {"removed": removed, "items": items}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:

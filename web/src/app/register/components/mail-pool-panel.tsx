@@ -28,6 +28,7 @@ import {
   deleteMailPool,
   fetchMailPool,
   importMailPool,
+  releaseStaleMailPool,
   type MailPoolItem,
   type RegisterStatus,
 } from "@/lib/register-api";
@@ -204,6 +205,24 @@ export function MailPoolPanel() {
             <Button variant="secondary" size="sm" onClick={() => void load()}>
               <RefreshCw className="size-4" />
               刷新
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              title="把卡在「使用中」超过 10 分钟的号放回可用（进程崩溃 / 强制停止后用）"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    const result = await releaseStaleMailPool(600);
+                    toast.success(`已释放 ${result.released} 个卡住的号`);
+                    await load();
+                  } catch (error) {
+                    toast.error(`释放失败：${(error as Error).message ?? error}`);
+                  }
+                })();
+              }}
+            >
+              释放卡住的号
             </Button>
           </div>
         </CardHeader>

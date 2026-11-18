@@ -88,9 +88,12 @@ class RegisterProxyModeFilterTests(unittest.TestCase):
         ctrl = register_batch.AutoLoopController()
         with mock.patch.object(
             register_batch.AutoLoopController, "_manage_loop", return_value=None
-        ), mock.patch.object(register_batch, "db"), mock.patch.object(
+        ), mock.patch.object(register_batch, "db") as db_mock, mock.patch.object(
             register_batch, "_parse_proxy_pool", return_value=[]
         ):
+            db_mock.release_stale.return_value = 0
+            db_mock.usable_proxy_count.return_value = 1
+            db_mock.list_proxies.return_value = []
             ctrl.start({"concurrency": 1, "register_proxy_mode": "瞎写的"})
         self.assertEqual(ctrl._register_proxy_mode, register_batch.REGISTER_PROXY_MODE_MIXED)
 
@@ -98,11 +101,32 @@ class RegisterProxyModeFilterTests(unittest.TestCase):
         ctrl = register_batch.AutoLoopController()
         with mock.patch.object(
             register_batch.AutoLoopController, "_manage_loop", return_value=None
-        ), mock.patch.object(register_batch, "db"), mock.patch.object(
+        ), mock.patch.object(register_batch, "db") as db_mock, mock.patch.object(
             register_batch, "_parse_proxy_pool", return_value=[]
         ):
+            db_mock.release_stale.return_value = 0
+            db_mock.usable_proxy_count.return_value = 1
+            db_mock.list_proxies.return_value = []
             ctrl.start({"concurrency": 1, "register_proxy_mode": "static"})
         self.assertEqual(ctrl._register_proxy_mode, register_batch.REGISTER_PROXY_MODE_STATIC)
+
+    def test_start_rejects_when_type_has_no_proxy(self):
+        """选了「只用动态」但池里没有可用动态代理 → 直接拒绝启动（不再等 120 秒）。
+
+        用户明确要求：不能等 worker 空转两分钟才报错。
+        """
+        ctrl = register_batch.AutoLoopController()
+        with mock.patch.object(
+            register_batch.AutoLoopController, "_manage_loop", return_value=None
+        ), mock.patch.object(register_batch, "db") as db_mock, mock.patch.object(
+            register_batch, "_parse_proxy_pool", return_value=[]
+        ):
+            db_mock.release_stale.return_value = 0
+            db_mock.usable_proxy_count.return_value = 0
+            db_mock.list_proxies.return_value = []
+            result = ctrl.start({"concurrency": 1, "register_proxy_mode": "dynamic"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("动态代理", str(result.get("error") or ""))
 
     def test_proxy_for_worker_passes_mode_to_pick(self):
         """worker 取代理时把类型过滤传给存储层。"""

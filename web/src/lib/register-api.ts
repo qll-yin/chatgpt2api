@@ -136,7 +136,10 @@ export type BatchStatus = {
   started_at: number;
   elapsed: number;
   registered_ok: number;
+  /** 失败数**按号**算：一个号重试 3 遍最终成功 → 失败 0 */
   registered_fail: number;
+  /** 一共跑了多少遍完整流程（含重试） */
+  attempts?: number;
   target_count: number;
   remaining: number | null;
   concurrency: number;
@@ -476,11 +479,13 @@ export async function fetchBindableProxies(): Promise<{
 export async function importRegisterProxies(
   text: string,
   mode: "replace" | "append" = "replace",
+  proxyType: "static" | "dynamic" = "static",
 ): Promise<{ total: number }> {
-  // 后端负责把文本拆成代理列表（每行一个），这里原样传过去
+  // 后端负责把文本拆成代理列表（每行一个），这里原样传过去。
+  // proxy_type 只作用于**新导入**的代理（已在池中的保留原类型/用量）。
   return httpRequest<{ total: number }>("/api/register/proxies", {
     method: "POST",
-    body: { text, mode },
+    body: { text, mode, proxy_type: proxyType },
   });
 }
 
@@ -749,6 +754,14 @@ export async function deleteMailPool(emails: string[]) {
     method: "DELETE",
     body: { emails },
   });
+}
+
+/** 把卡在「使用中」的邮箱放回可用（进程崩溃 / 强制停止后的手动自愈）。 */
+export async function releaseStaleMailPool(timeoutSecs = 600) {
+  return httpRequest<{ released: number; stats: RegisterStatus }>(
+    `/api/register/mail-pool/release-stale?timeout_secs=${Math.max(60, timeoutSecs)}`,
+    { method: "POST" },
+  );
 }
 
 // ──────────────────────── SMS 接码配置 ────────────────────────
