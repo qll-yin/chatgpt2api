@@ -215,6 +215,17 @@ export function BatchRegisterPanel() {
           pushLog("run", `开始注册 ${describeRun(data)}${describeAttempt(data)}`);
           return;
         }
+        if (kind === "batch_log") {
+          // 批次级决策（重试第几遍 / 为什么停 worker）—— 以前只在服务端日志里，
+          // 前端一行都看不到，用户只能看到「失败 → 然后就结束了」。
+          const lv = String(data.level ?? "info");
+          pushLog(
+            "run",
+            String(data.message ?? ""),
+            lv === "error" ? "error" : lv === "warning" ? "warn" : undefined,
+          );
+          return;
+        }
         if (kind === "run_finished") {
           const ok = Boolean(data.ok);
           pushLog(

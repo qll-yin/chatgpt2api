@@ -390,6 +390,30 @@ class AutoLoopController:
             except queue.Full:
                 pass
 
+    def _emit_log(self, text: str, level: str = "info") -> None:
+        """把**批次级**决策写进前端实时日志。
+
+        ⚠️ 为什么需要
+        ------------
+        registrar 的日志走 run queue 转发到前端，但 auto-loop 自己的决策
+        （「第 N 遍流程失败 → 开始第 x/y 次重试」「代理池没代理了，停止 worker」
+        「重试次数用尽，停止 worker」）只在服务端 logger 里，**前端一行都看不到**。
+        用户看到的现象就是：注册失败 → 然后就结束了，完全不知道为什么。
+
+        这里把这些决策同时写进日志文件和前端面板（kind="batch_log"）。
+        """
+        msg = str(text or "")
+        if not msg:
+            return
+        log = logger.error if level == "error" else (
+            logger.warning if level == "warning" else logger.info
+        )
+        try:
+            log(f"[auto-loop] {msg}")
+        except Exception:  # noqa: BLE001
+            pass
+        self._broadcast("batch_log", {"message": msg, "level": level})
+
     def _set_state(self, state: str, batch_id: str = "") -> None:
         """切换状态（只在真的变了才广播，避免刷屏）。
 
@@ -443,10 +467,17 @@ class AutoLoopController:
         后端池为空时回落到旧的文本代理池（按 worker_id 取模，保持老行为）。
         """
         if self._backend_proxy_pool:
-            picked = db.pick_proxy(
-                exclude=exclude,
-                proxy_type=self._register_proxy_mode_filter(),
-            )
+            try:
+                picked = db.pick_proxy(
+                    exclude=exclude,
+                    proxy_type=self._register_proxy_mode_filter(),
+                )
+            except Exception as e:  # noqa: BLE001
+                # ⚠️ 取代理时数据库抽风不能让 worker 当场死掉 ——
+                #    那样批次会静默结束、重试一次都不跑。当成「暂时没代理」，
+                #    交给调用方等待 / 复用上一条。
+                logger.warning(f"[worker-{worker_id}] 挑代理失败（按暂时没代理处理）: {e}")
+                picked = ""
             if picked:
                 return picked
             # 池里没有可用代理了 —— 返回空串，让调用方决定是等待还是停止。
@@ -647,6 +678,21 @@ class AutoLoopController:
     def _settle_failed_proxy(
         self, worker_id: int, proxy: str, category: str, reserved: bool = True
     ) -> None:
+        """失败时结算这条代理 —— **记账失败绝不能中断重试**。
+
+        ⚠️ 这里必须自己吞异常：这只是记账（还配额 / 记失败次数 / 按分类
+        处置代理）。一旦抛出去，worker 线程当场死亡 → 批次瞬间变 stopped →
+        用户看到的就是「失败一次就结束 worker，重试一次都没跑」。
+        记账出错最多数据不准，绝不能因此把整条重试链掐掉。
+        """
+        try:
+            self._settle_failed_proxy_inner(worker_id, proxy, category, reserved)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[worker-{worker_id}] 结算代理失败（忽略，继续重试）: {e}")
+
+    def _settle_failed_proxy_inner(
+        self, worker_id: int, proxy: str, category: str, reserved: bool = True
+    ) -> None:
         """失败时结算这条代理：还配额 + 记失败次数 + 按分类做代理级处置。
 
         ⚠️ 用的是「**实际用的那条**」—— 流程内可能换过代理
@@ -764,6 +810,26 @@ class AutoLoopController:
         my_batch = str(self._options.get("batch_id") or "")
         try:
             self._worker_loop_inner(worker_id, my_batch)
+        except Exception as e:  # noqa: BLE001
+            # ⚠️ 这条 except 是「止血」用的，不能删。
+            #    以前 worker 线程里任何未捕获异常都会**静默杀死**这个 worker：
+            #    线程直接退出 → manage_loop join 到 → 批次瞬间变 stopped，
+            #    前端实时日志里一行提示都没有（用户看到的是「注册失败后
+            #    莫名其妙就结束了，重试一次都没跑」）。
+            #    现在至少：① 日志打出完整 traceback；② 广播到前端；
+            #    ③ 状态栏说清楚是 worker 崩了而不是正常结束。
+            logger.exception(f"[worker-{worker_id}] 线程异常退出")
+            try:
+                self._emit_log(
+                    f"worker-{worker_id} 线程异常退出：{type(e).__name__}: {e}",
+                    level="error",
+                )
+                self._set_message(
+                    f"worker-{worker_id} 线程异常退出（{type(e).__name__}: {e}），"
+                    f"已停止该 worker —— 请把服务端日志发给开发者"
+                )
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             with self._lock:
                 # ⚠️ 按 worker_id 清掉**所有**条目，不只 (my_batch, worker_id)。
@@ -948,6 +1014,7 @@ class AutoLoopController:
                         )
                         self._set_message(msg)
                         logger.warning(msg)
+                        self._emit_log(msg, level="error")
                         self._finalize_account(account, "cf_blocked", pooled)
                         with self._lock:
                             self._worker_status.pop(worker_id, None)
@@ -1036,7 +1103,16 @@ class AutoLoopController:
                 #    旧注册机不管号池，所以「注册成功自动导入号池」这个开关
                 #    形同虚设 —— 号注册出来了，但号池里一个都没有。
                 if ok:
-                    self._import_to_pool(account, used_proxy, run_id)
+                    try:
+                        self._import_to_pool(account, used_proxy, run_id)
+                    except Exception as e:  # noqa: BLE001
+                        # 入池失败不能让 worker 死掉（号已经注册出来了，
+                        # 死了等于白烧一个邮箱还不给号）。
+                        logger.exception("[auto-loop] 注册成功但写入号池失败")
+                        self._emit_log(
+                            f"注册成功但写入号池失败：{type(e).__name__}: {e}",
+                            level="error",
+                        )
                     # 这条出口刚刚注册成功 → 清零它的「连续被拦/连续失效」计数。
                     # ⚠️ 不清零的话，计数会跨天累计：一条跑了几百次成功的代理
                     #    会被历史上第 2 次 409 永久停用，而停用又发生在某个
@@ -1080,9 +1156,10 @@ class AutoLoopController:
                     )
                     recorded = True
                     if category in NON_RETRYABLE_CATEGORIES:
-                        logger.info(
-                            f"[worker-{worker_id}] 失败分类 {category} 不可重试"
-                            f"（号/邮箱本身的问题）→ 换下一个号继续"
+                        self._emit_log(
+                            f"第 {attempt} 遍流程失败（{category}：号/邮箱本身的问题），"
+                            f"不可重试 → 换下一个号",
+                            level="warning",
                         )
                     break
 
@@ -1101,6 +1178,7 @@ class AutoLoopController:
                     )
                     logger.warning(msg)
                     self._set_message(msg)
+                    self._emit_log(msg, level="error")
                     self._finalize_account(account, category, pooled)
                     self._record_finish(
                         False, category, count_fail=True, count_breaker=True
@@ -1126,10 +1204,11 @@ class AutoLoopController:
                     False, category, count_fail=True, count_breaker=False
                 )
                 recorded = True
-                logger.info(
-                    f"[worker-{worker_id}] 第 {attempt} 遍流程失败（{category}）→ "
+                self._emit_log(
+                    f"第 {attempt}/{self._max_retries + 1} 遍流程失败（{category}）→ "
                     f"第 {consecutive_retryable_fails}/{self._max_retries} 次重试："
-                    f"换出口 IP，用同一个号从头再走一遍完整流程"
+                    f"换出口 IP，用同一个号从头再走一遍完整流程",
+                    level="warning",
                 )
                 # 继续内层循环 → 同一个号、换代理、再走一遍完整流程
                 # （用户会看到又一个「开始注册」）
@@ -1456,7 +1535,14 @@ class AutoLoopController:
         while time.time() < deadline:
             if self._stop_event.is_set():
                 return False, STOPPED_CATEGORY
-            row = db.get_run(run_id)
+            try:
+                row = db.get_run(run_id)
+            except Exception as e:  # noqa: BLE001
+                # ⚠️ 读运行记录出错不能让 worker 直接死掉（那样批次会静默结束、
+                #    重试一次都不跑）。记一笔，下一轮接着读。
+                logger.warning(f"[auto-loop] 读运行记录 {run_id} 失败（稍后重试）: {e}")
+                time.sleep(1)
+                continue
             if row:
                 st = row.get("status")
                 if st == "done":

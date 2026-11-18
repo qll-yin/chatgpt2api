@@ -23,6 +23,7 @@ import json
 import time
 from typing import Any, Iterable, Optional
 
+from sqlalchemy import case as sa_case
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, update as sa_update
 
@@ -1339,6 +1340,24 @@ def bind_proxy(proxy: str) -> bool:
         return bool(result.rowcount)
 
 
+def _dec_floor_zero(column):
+    """`column - 1`，且不会减到负数 —— **跨数据库**写法。
+
+    ⚠️ 以前这里写的是 `func.max(0, column - 1)`：
+       · SQLite 里 `max(a, b)` 是标量函数，能跑；
+       · PostgreSQL 里 `max()` 是**聚合函数**，只接受一个参数 ——
+         生成 `max(0, used_count - 1)` 会直接报
+         「function max(integer, integer) does not exist」，
+         整个 UPDATE 抛异常。
+    这条 SQL 出现在「注册失败 → 归还代理配额」路径上，于是在 PG 上
+    每次失败都会抛异常 → worker 线程崩溃 → 批次瞬间停止、重试一次都不跑
+    （用户看到的就是「第二个失败了就结束 worker」）。
+
+    改用 CASE 表达式：SQLite / PostgreSQL / MySQL 全部支持，行为一致。
+    """
+    return sa_case((column > 0, column - 1), else_=0)
+
+
 def release_bind_proxy(proxy: str) -> bool:
     """归还一个绑定名额（导入失败时回滚）。"""
     proxy = str(proxy or "").strip()
@@ -1349,7 +1368,7 @@ def release_bind_proxy(proxy: str) -> bool:
             sa_update(ProxyPoolModel)
             .where(ProxyPoolModel.proxy == proxy)
             .values(
-                bind_used_count=func.max(0, ProxyPoolModel.bind_used_count - 1),
+                bind_used_count=_dec_floor_zero(ProxyPoolModel.bind_used_count),
                 last_used_at=time.time(),
             )
         )
@@ -1409,9 +1428,14 @@ def proxy_used(proxy: str, *, ok: bool) -> bool:
 
 
 def proxy_release(proxy: str) -> bool:
-    """释放一个代理的配额（账号被删除 / 标注异常时调用）。
+    """释放一个代理的配额（注册失败 / 账号被删除 / 标注异常时调用）。
 
     used_count 不会减到负数 —— 重复释放是安全的。
+
+    ⚠️ 这条 SQL 以前是 `func.max(0, used_count - 1)`，在 PostgreSQL 上
+    直接报错（max 是聚合函数）。它正好在「注册失败 → 结算代理」路径上，
+    于是 PG 部署下**每次失败都会抛异常把 worker 线程炸掉** ——
+    这就是「第 1 个成功、第 2 个失败后 worker 立刻结束、重试一次都没跑」的真因。
     """
     proxy = str(proxy or "").strip()
     if not proxy:
@@ -1420,7 +1444,7 @@ def proxy_release(proxy: str) -> bool:
         result = session.execute(
             sa_update(ProxyPoolModel)
             .where(ProxyPoolModel.proxy == proxy)
-            .values(used_count=func.max(0, ProxyPoolModel.used_count - 1))
+            .values(used_count=_dec_floor_zero(ProxyPoolModel.used_count))
         )
         return bool(result.rowcount)
 

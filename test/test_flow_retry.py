@@ -549,5 +549,124 @@ class SuccessThenFailureStillRetriesTests(unittest.TestCase):
         self.assertTrue(row["enabled"])
 
 
+class WorkerVisibilityTests(unittest.TestCase):
+    """批次级决策必须出现在前端实时日志里（batch_log 事件）。
+
+    用户报的原话：「第二个失败了，就结束 worker 了」—— 前端日志里
+    只有「注册出错：…」，后面一行都没有，完全看不出为什么停。
+    """
+
+    def _events(self, ctrl):
+        """订阅 SSE，返回 (收集列表, 排空函数)。"""
+        q = ctrl.subscribe()
+        out = []
+
+        def drain():
+            while True:
+                try:
+                    out.append(q.get_nowait())
+                except Exception:  # noqa: BLE001
+                    return
+
+        return out, drain
+
+    def test_emit_log_broadcasts_batch_log(self):
+        ctrl = register_batch.AutoLoopController()
+        out, drain = self._events(ctrl)
+        ctrl._emit_log("第 1/4 遍流程失败 → 开始第 1/3 次重试", level="warning")
+        drain()
+        kinds = [e for e in out if e.get("kind") == "batch_log"]
+        self.assertTrue(kinds)
+        self.assertIn("第 1/3 次重试", kinds[0]["data"]["message"])
+        self.assertEqual(kinds[0]["data"]["level"], "warning")
+
+    def test_worker_exception_is_visible_not_silent(self):
+        """worker 线程异常不能静默杀死批次 —— 必须广播出来。"""
+        ctrl = register_batch.AutoLoopController()
+        q = ctrl.subscribe()
+        ctrl._options = {"batch_id": "crash-test"}
+        with mock.patch.object(ctrl, "_worker_loop_inner", side_effect=RuntimeError("DB 挂了")):
+            ctrl._worker_loop(0)
+        events = []
+        while True:
+            try:
+                events.append(q.get_nowait())
+            except Exception:  # noqa: BLE001
+                break
+        msgs = [
+            str(e.get("data", {}).get("message") or "")
+            for e in events
+            if e.get("kind") == "batch_log"
+        ]
+        self.assertTrue(
+            any("线程异常退出" in m and "DB 挂了" in m for m in msgs),
+            f"没广播 worker 异常：{msgs}",
+        )
+        self.assertIn("线程异常退出", str(ctrl.status().get("last_message") or ""))
+
+    def test_settle_failed_proxy_swallows_errors(self):
+        """代理记账出错不能把重试链掐掉。"""
+        ctrl = register_batch.AutoLoopController()
+        ctrl._backend_proxy_pool = True
+        with mock.patch.object(
+            register_batch.db, "proxy_release", side_effect=RuntimeError("db down")
+        ):
+            # 不抛异常 = 通过
+            ctrl._settle_failed_proxy(0, "http://p:1", "cf_blocked")
+
+
+class PostgresSqlCompatTests(unittest.TestCase):
+    """代理配额归还的 SQL 必须跨数据库可用。
+
+    ⚠️ 真实事故：`func.max(0, used_count - 1)` 在 SQLite 里能跑
+    （max 是标量函数），在 **PostgreSQL** 里直接报
+    「function max(integer, integer) does not exist」（max 是聚合函数）。
+    这条 SQL 在「注册失败 → 归还代理配额」路径上 → PG 部署下每次失败
+    都抛异常把 worker 线程炸掉 → 批次瞬间停止、重试一次都没跑。
+    """
+
+    def test_proxy_release_sql_has_no_aggregate_max(self):
+        from sqlalchemy import update
+        from sqlalchemy.dialects import postgresql
+
+        from services.storage.register_models import ProxyPoolModel
+        from services.storage.register_store import _dec_floor_zero
+
+        stmt = update(ProxyPoolModel).values(
+            used_count=_dec_floor_zero(ProxyPoolModel.used_count)
+        )
+        sql = str(
+            stmt.compile(
+                dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+            )
+        ).lower()
+        self.assertNotIn("max(", sql, f"PG 不认 max(a,b)：{sql}")
+        self.assertIn("case when", sql)
+
+    def test_proxy_release_floors_at_zero(self):
+        """重复释放不能减到负数。"""
+        from services.storage import register_store
+
+        register_store.replace_proxies(["http://floor:1"], mode="replace")
+        register_store.pick_proxy()
+        self.assertEqual(register_store.find_proxy("http://floor:1")["used_count"], 1)
+        register_store.proxy_release("http://floor:1")
+        self.assertEqual(register_store.find_proxy("http://floor:1")["used_count"], 0)
+        register_store.proxy_release("http://floor:1")
+        self.assertEqual(register_store.find_proxy("http://floor:1")["used_count"], 0)
+
+    def test_release_bind_proxy_floors_at_zero(self):
+        from services.storage import register_store
+
+        register_store.replace_proxies(["http://bindfloor:1"], mode="replace")
+        register_store.update_proxy("http://bindfloor:1", proxy_type="static")
+        register_store.bind_proxy("http://bindfloor:1")
+        register_store.release_bind_proxy("http://bindfloor:1")
+        register_store.release_bind_proxy("http://bindfloor:1")
+        self.assertEqual(
+            register_store.find_proxy("http://bindfloor:1")["bind_used_count"], 0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
