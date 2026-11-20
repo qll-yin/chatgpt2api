@@ -84,29 +84,27 @@ class ProxyBlacklistTests(unittest.TestCase):
             self.ctrl._proxy_for_worker(0, exclude={"http://only:1"})
         self.assertFalse(captured["strict"], "没有黑名单时保留「只有一条代理」的回退行为")
 
-    def test_wait_writes_batch_log(self):
+    def test_stop_writes_batch_log(self):
         tmpdir = Path(tempfile.mkdtemp(prefix="batch-log-"))
         with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
              mock.patch.object(self.ctrl, "_emit_log", return_value=None), \
              mock.patch.object(self.ctrl, "_broadcast", return_value=None), \
-             mock.patch.object(self.ctrl, "_proxy_recovery_budget", return_value=0), \
-             mock.patch.object(register_batch.db, "count_usable_proxies", return_value=0):
-            outcome = self.ctrl._wait_for_proxy_recovery(0, 3)
+             mock.patch.object(self.ctrl, "_refresh_pool_quota_async", return_value=None):
+            self.ctrl._stop_batch_for_proxy_exhausted(0, 3)
 
-        self.assertEqual(outcome, "timeout")
+        self.assertEqual(self.ctrl.status()["state"], "stopped")
         log_path = tmpdir / "test-batch.batch.log"
         self.assertTrue(log_path.is_file())
         self.assertIn("全部被 CF 拦截", log_path.read_text(encoding="utf-8"))
 
 
-class ProxyRecoveryWaitTests(unittest.TestCase):
-    """池全黑不能「暂停等人工点继续」，要自己等恢复、恢复后自己继续。
+class ProxyExhaustedStopTests(unittest.TestCase):
+    """批次内代理全进黑名单 → 直接停批，不等待。
 
-    用户实测反馈（2026-11-20）：
-      · 日志写着「黑名单 120 秒后自动解除」，但批次一直是 paused ——
-        黑名单确实过期了，可没有任何代码去清 `_pause_event`，必须手动点；
-      · 更糟的是「号池自动补充」把 paused 算作「批量注册已在运行」，
-        于是一路 skip，全自动场景直接死锁。
+    用户要求（2026-11-20）：
+      「谁说一定非得 180 秒的，这个机制移除吧，如果当前批次内代理 IP 都黑名单后，
+        直接停止任务并刷新账号额度。等待下一次的自动补充任务启动。
+        手动批量注册也这样做，不要加时间等待了」
     """
 
     def setUp(self):
@@ -114,78 +112,43 @@ class ProxyRecoveryWaitTests(unittest.TestCase):
         self.ctrl._options = {"batch_id": "test-batch"}
         self.ctrl._state = "running"
 
-    def test_thread_never_enters_paused(self):
-        """等待期间不能置全局 PAUSED —— 那会让自动补充永远拉不起来。"""
-        calls = {"n": 0}
-
-        def fake_count(*args, **kwargs):
-            calls["n"] += 1
-            return 0 if calls["n"] < 2 else 1  # 第 2 次检查时代理恢复了
-
-        tmpdir = Path(tempfile.mkdtemp(prefix="proxy-wait-"))
-        with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
-             mock.patch.object(self.ctrl, "_emit_log", return_value=None), \
-             mock.patch.object(self.ctrl, "_broadcast", return_value=None), \
-             mock.patch.object(self.ctrl, "_proxy_recovery_budget", return_value=5), \
-             mock.patch.object(register_batch.time, "sleep", return_value=None), \
-             mock.patch.object(register_batch.db, "count_usable_proxies", side_effect=fake_count):
-            outcome = self.ctrl._wait_for_proxy_recovery(0, 3)
-
-        self.assertEqual(outcome, "recovered")
-        self.assertFalse(self.ctrl._pause_event.is_set(), "自动等待不能顺手把批次暂停掉")
-        self.assertEqual(self.ctrl.status()["state"], "running", "恢复后应自动回到运行中")
-
-    def test_waiting_state_while_exhausted(self):
-        """没有其它 worker 在跑时，等待要显示成「等待中」而不是「运行中」。"""
-        seen = {}
-
-        def fake_count(*args, **kwargs):
-            seen["state"] = self.ctrl.status()["state"]
-            return 1
-
-        tmpdir = Path(tempfile.mkdtemp(prefix="proxy-wait2-"))
-        with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
-             mock.patch.object(self.ctrl, "_emit_log", return_value=None), \
-             mock.patch.object(self.ctrl, "_broadcast", return_value=None), \
-             mock.patch.object(self.ctrl, "_proxy_recovery_budget", return_value=5), \
-             mock.patch.object(register_batch.time, "sleep", return_value=None), \
-             mock.patch.object(register_batch.db, "count_usable_proxies", side_effect=fake_count):
-            self.ctrl._wait_for_proxy_recovery(0, 3)
-
-        self.assertEqual(seen.get("state"), "waiting")
-
-    def test_unrecoverable_stops_instead_of_pausing(self):
-        """等满仍全黑 → 停批（stopped），不是 paused。
-
-        stopped 不在守护的 active 集合（running / paused / waiting）里，
-        所以「号池自动补充」下一轮就能重新拉起，不会死锁。
-        """
+    def _stop(self, total=3):
         tmpdir = Path(tempfile.mkdtemp(prefix="proxy-stop-"))
+        refreshed = []
         with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
              mock.patch.object(self.ctrl, "_emit_log", return_value=None), \
              mock.patch.object(self.ctrl, "_broadcast", return_value=None), \
-             mock.patch.object(self.ctrl, "_proxy_recovery_budget", return_value=0):
-            self.ctrl._stop_for_proxy_unrecoverable(0, 3)
+             mock.patch.object(
+                 self.ctrl, "_refresh_pool_quota_async",
+                 side_effect=lambda: refreshed.append(True),
+             ):
+            started = time.time()
+            self.ctrl._stop_batch_for_proxy_exhausted(0, total)
+            elapsed = time.time() - started
+        return tmpdir, refreshed, elapsed
 
+    def test_stops_immediately(self):
+        """不能有任何等待 —— 全黑就立刻停。"""
+        tmpdir, _, elapsed = self._stop()
+        self.assertLess(elapsed, 1.0, "全黑必须立刻停批，不能 sleep 等 TTL")
         self.assertEqual(self.ctrl.status()["state"], "stopped")
-        self.assertNotEqual(self.ctrl.status()["state"], "paused")
+
+    def test_never_leaves_batch_paused(self):
+        """必须是 stopped，不能是 paused —— paused 会让自动补充永远拉不起来。"""
+        self._stop()
+        self.assertEqual(self.ctrl.status()["state"], "stopped")
+        self.assertFalse(self.ctrl._pause_event.is_set())
         self.assertTrue(self.ctrl._stop_event.is_set())
-        content = (tmpdir / "test-batch.batch.log").read_text(encoding="utf-8")
-        self.assertIn("全部被 CF 拦截", content)
-        self.assertIn("已停止", content)
 
-    def test_does_not_interrupt_other_running_workers(self):
-        """别的 worker 还在跑时，不能 set 全局 stop_event 把它的注册打断。"""
-        self.ctrl._alive_workers.add(("test-batch", 1))  # 还有 worker-1 活着
-        tmpdir = Path(tempfile.mkdtemp(prefix="proxy-keepalive-"))
-        with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
-             mock.patch.object(self.ctrl, "_emit_log", return_value=None), \
-             mock.patch.object(self.ctrl, "_broadcast", return_value=None), \
-             mock.patch.object(self.ctrl, "_proxy_recovery_budget", return_value=0):
-            self.ctrl._stop_for_proxy_unrecoverable(0, 3)
+    def test_refreshes_quota_on_stop(self):
+        """停批时要刷一次额度，让前端数字和守护判断都用最新值。"""
+        _, refreshed, _ = self._stop()
+        self.assertEqual(len(refreshed), 1)
 
-        self.assertFalse(self.ctrl._stop_event.is_set(), "不能打断正在注册的 worker")
-        self.assertNotEqual(self.ctrl.status()["state"], "stopped")
+    def test_stop_reason_is_visible(self):
+        """状态栏要能看到「为什么停」，不能被「已停止（成功 X / 失败 Y）」盖掉。"""
+        self._stop()
+        self.assertIn("全部被 CF 拦截", self.ctrl.status()["last_message"])
 
     def test_pick_timeout_skips_two_minute_idle_wait(self):
         """全黑时 `_wait_for_proxy` 要立刻返回，不能先空等满 2 分钟。"""
@@ -205,7 +168,7 @@ class ProxyRecoveryWaitTests(unittest.TestCase):
         elapsed = time.time() - started
 
         self.assertEqual(picked, "")
-        self.assertLess(elapsed, 5, "池全黑应立即返回，交给等待恢复的分支，不能先睡满 120 秒")
+        self.assertLess(elapsed, 5, "池全黑应立即返回，不能先睡满 120 秒")
 
 
 class BatchLogEndpointTests(unittest.TestCase):

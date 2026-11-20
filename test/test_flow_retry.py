@@ -552,7 +552,7 @@ class SuccessThenFailureStillRetriesTests(unittest.TestCase):
              mock.patch.object(register_batch.db, "claim_next", side_effect=fake_claim), \
              mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
              mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
-             mock.patch.object(ctrl, "_proxy_recovery_budget", return_value=0), \
+             mock.patch.object(ctrl, "_refresh_pool_quota_async", return_value=None), \
              mock.patch.object(ctrl, "_forward_run_logs", return_value=None):
             thread = threading.Thread(
                 target=ctrl._worker_loop_inner, args=(0, "pool-exhausted"), daemon=True

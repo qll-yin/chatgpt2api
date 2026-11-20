@@ -184,7 +184,7 @@ class AutoLoopController:
         # 可能已经换了出口，可以再用）。
         self._proxy_blacklist: dict[str, float] = {}
         self._proxy_blacklist_lock = threading.Lock()
-        # 池全黑等待的提示节流：多个 worker 会同时进入等待，只记一条批次日志
+        # 池全黑的提示节流：多个 worker 会同时发现全黑，只记一条批次日志
         self._proxy_wait_notice_at: float = 0.0
         self._proxy_wait_notice_text: str = ""
         self._concurrency: int = 1
@@ -589,146 +589,49 @@ class AutoLoopController:
             return False, 0
         return (remaining == 0 and total > 0), total
 
-    def _proxy_recovery_budget(self) -> int:
-        """池全黑时最多等多久（秒）：黑名单 TTL + 60 秒缓冲，至少 2 分钟。
+    def _stop_batch_for_proxy_exhausted(self, worker_id: int, total_usable: int) -> None:
+        """本批次内所有可用代理都进了黑名单 → **直接停批，不等待**。
 
-        抽成方法是为了可测 —— 测试里可以把它 patch 成 0 秒，
-        不必真的等三分钟。
+        用户要求（2026-11-20）：不要再「等黑名单 TTL 过期再继续」那套 ——
+        全黑就立刻停，交给「号池自动补充」下一轮重新拉起；手动批量注册同理。
+
+        三个要点：
+        · 停成 `stopped` 而不是 `paused`：守护把 paused 算作「已在运行」，
+          停成 paused 就再也拉不起来了（这正是之前那个死锁）。
+        · `_stop_event.set()` 不会掐断正在跑的注册 —— `_wait_run_finish`
+          在 stop 置位后仍会把当前这一遍等完，号已经建出来的还能正常入池，
+          也不会留下「号卡在 in_use / 代理配额没归还」的烂摊子。
+        · 停完触发一次额度刷新（后台线程），前端数字立刻更新。
         """
-        try:
-            ttl = int(config.register_proxy_blacklist_secs)
-        except Exception:  # noqa: BLE001
-            ttl = 120
-        return max(120, ttl) + 60
-
-    def _wait_for_proxy_recovery(self, worker_id: int, total_usable: int) -> str:
-        """代理全被 CF 拦 → 原地等它自己恢复，**不需要人工点「继续」**。
-
-        以前这里是把整批设成 PAUSED 然后干等 `resume()`：
-          · 黑名单 120 秒后确实会过期，但没有任何代码去清 `_pause_event` ——
-            文案写着「自动解除」，实际永远要人手动点一下；
-          · 更麻烦的是「号池自动补充」守护把 paused 也算成「批量注册已在运行」，
-            于是一路 skip，永远不会再拉起新批次 —— 全自动场景直接死锁。
-
-        现在改成轮询等待，恢复条件（任一即可）：
-          · 黑名单里的代理到期（动态代理届时通常已经换了出口 IP）
-          · 用户或自动补充往池子里加了新的可用代理
-
-        等待上限 = max(120, 黑名单 TTL) + 60 秒缓冲。等不到就返回 "timeout"，
-        由调用方停掉这一批 —— 停下来之后自动补充才能重新拉起（paused 拉不起来）。
-
-        返回值：`recovered` / `timeout` / `stopped`
-        """
-        try:
-            ttl = int(config.register_proxy_blacklist_secs)
-        except Exception:  # noqa: BLE001
-            ttl = 120
-        budget = self._proxy_recovery_budget()
-        deadline = time.monotonic() + budget
-        batch_id = str(self._options.get("batch_id") or "")
-        mode_filter = self._register_proxy_mode_filter()
-
-        message = (
-            f"代理池里 {total_usable} 条可用代理全部被 CF 拦截（403 / 409）。"
-            f"已自动等待恢复：黑名单 {ttl} 秒后过期（动态代理届时可能已换出口 IP），"
-            f"补充新代理也会立即继续，最多等 {budget} 秒 —— 不需要手动操作。"
+        msg = (
+            f"代理池里 {total_usable} 条可用代理全部被 CF 拦截（403 / 409）—— "
+            f"本批次已直接停止，不再等待。补充代理或等出口 IP 恢复后重新开始；"
+            f"开启「号池自动补充」的话它下一轮会自己拉起。"
         )
-        # 多个 worker 会同时发现「全黑」，提示只记一次（60 秒内相同文案去重）
+        # 多个 worker 会同时发现全黑，提示只记一次（60 秒内相同文案去重）
         now = time.monotonic()
         if (
-            message != self._proxy_wait_notice_text
+            msg != self._proxy_wait_notice_text
             or now - self._proxy_wait_notice_at >= 60
         ):
             self._proxy_wait_notice_at = now
-            self._proxy_wait_notice_text = message
-            self._append_batch_log(message, level="WARNING")
-            self._emit_log(message, level="warning")
-            logger.warning(f"[worker-{worker_id}] {message}")
-        self._set_message(message)
+            self._proxy_wait_notice_text = msg
+            self._append_batch_log(msg, level="ERROR")
+            self._emit_log(msg, level="error")
+            logger.warning(f"[worker-{worker_id}] {msg}")
+
+        self._stop_reason = msg
+        self._stop_event.set()
         with self._lock:
-            busy = bool(self._worker_status)
-        if not busy:
-            self._set_state(AutoLoopState.WAITING, batch_id)
-            self._broadcast("state", self._snapshot())
-
-        last_notice = time.monotonic()
-        while time.monotonic() < deadline:
-            if self._stop_event.is_set():
-                return "stopped"
-            if self._pause_event.is_set():
-                # 用户手动暂停：原地等，暂停时长不计入等待预算
-                paused_at = time.monotonic()
-                while self._pause_event.is_set() and not self._stop_event.is_set():
-                    time.sleep(0.5)
-                deadline += time.monotonic() - paused_at
-                if self._stop_event.is_set():
-                    return "stopped"
-                continue
-
-            blocked = self._blacklisted_proxies()
-            try:
-                remaining = db.count_usable_proxies(exclude=blocked, proxy_type=mode_filter)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[worker-{worker_id}] 统计可用代理解析失败（忽略）: {exc}")
-                remaining = 0
-
-            if remaining > 0:
-                msg = (
-                    f"代理已恢复（{remaining} 条可用），自动继续注册 —— 无需手动操作"
-                )
-                self._append_batch_log(msg, level="INFO")
-                self._emit_log(msg, level="info")
-                self._set_message(msg)
-                if self._state == AutoLoopState.WAITING:
-                    self._set_state(AutoLoopState.RUNNING, batch_id)
-                    self._broadcast("state", self._snapshot())
-                return "recovered"
-
-            # 每 30 秒刷新一次「还剩多久」，让人知道它在等而不是卡死
-            if time.monotonic() - last_notice >= 30:
-                last_notice = time.monotonic()
-                left = int(max(0, deadline - time.monotonic()))
-                self._set_message(
-                    f"代理全部被 CF 拦截，等待自动恢复中（还剩约 {left} 秒）…"
-                )
-                self._broadcast("state", self._snapshot())
-            time.sleep(2)
-        return "timeout"
-
-    def _stop_for_proxy_unrecoverable(self, worker_id: int, total_usable: int) -> None:
-        """等满预算仍是全黑 → 停批（而不是 paused，paused 会让自动补充拉不起来）。
-
-        ⚠️ 不能直接 `_stop_event.set()` 把整批打断：别的 worker 可能正在跑一个
-        快要成功的注册（号已经建出来了，此刻打断就是白烧一个邮箱）。所以还有
-        别的 worker 活着时，只让当前这个退出；等它们各自也等满超时，最后一个
-        退出的负责把状态收敛成 stopped。
-        """
-        budget = self._proxy_recovery_budget()
-        msg = (
-            f"代理池里 {total_usable} 条可用代理全部被 CF 拦截，已自动等待 {budget} 秒"
-            f"仍未恢复 —— 本批次已停止。补充新代理或等出口 IP 恢复后重新开始；"
-            f"开启「号池自动补充」的话它会自己重新拉起。"
-        )
-        self._append_batch_log(msg, level="ERROR")
-        self._emit_log(msg, level="error")
-        logger.warning(msg)
-
-        cur_batch = str(self._options.get("batch_id") or "")
-        with self._lock:
-            alive = {wid for (bid, wid) in self._alive_workers if bid == cur_batch}
-            others = alive - {worker_id}
-            self._stop_reason = msg
-            if others:
-                # 还有别的 worker 在跑（可能正在注册）—— 只让自己退出，别打断它
-                return
             if self._state != AutoLoopState.STOPPED:
                 self._state = AutoLoopState.STOPPED
                 if not self._finished_at:
                     self._finished_at = time.time()
                 self._last_message = msg
                 self._worker_status.clear()
-        self._stop_event.set()
         self._broadcast("state", self._snapshot())
+        # 停完刷一次额度（只刷本批次导入的号；没有就跳过，不会去打整个号池）
+        self._refresh_pool_quota_async()
 
     def _proxy_for_worker(
         self, worker_id: int, exclude: set[str] | None = None
@@ -834,8 +737,7 @@ class AutoLoopController:
                     )
                 return picked
             # 池里本来有代理、但全被本批次拉黑了 → 别在这儿空等满 2 分钟。
-            # 直接返回空，交给调用方走「等黑名单过期 / 等新代理入池」的分支，
-            # 那个分支的等待时长才是按黑名单 TTL 算的。
+            # 直接返回空，交给调用方「全黑就停批」的分支处理。
             if self._proxy_pool_exhausted_by_blacklist()[0]:
                 return ""
             if not announced:
@@ -984,7 +886,9 @@ class AutoLoopController:
             self._broadcast("state", self._snapshot())
             # 批量期间为了不拖慢 worker，入池时没刷额度。
             # 这里统一刷一次 —— 后台线程跑，不阻塞管理线程。
-            if self._options.get("auto_import", True):
+            # ⚠️ 代理全黑停批时已经在 _stop_batch_for_proxy_exhausted 里刷过，
+            #    这里跳过，免得同一批号被并发刷两遍（上游请求翻倍）。
+            if self._options.get("auto_import", True) and not self._stop_reason:
                 self._refresh_pool_quota_async()
 
     # ─────────────────── 流程级重试的三个辅助 ───────────────────
@@ -1319,12 +1223,6 @@ class AutoLoopController:
             chain_ok = False
             chain_category = ""
             recorded = False
-            # 因为「代理全被 CF 拦」而中止了这一遍：号已放回号池、不该记失败。
-            # pause_outcome 记录等待结果（recovered / timeout / stopped），
-            # 在下面「一遍流程链结束」处决定继续还是停批。
-            paused_out = False
-            pause_outcome = ""
-            pause_total = 0
             run_id = ""
             while True:
                 # 暂停时不开始新的尝试（等恢复）；停止则把号放回号池再退出。
@@ -1354,17 +1252,14 @@ class AutoLoopController:
                     reserved = bool(proxy)
                     if not proxy:
                         # ── 池子全被 CF 拦了？别再拿死 IP 烧邮箱 ──
-                        # 注意：这里不是「暂停等人工」，而是原地等黑名单过期
-                        # 或新代理入池，恢复后自己继续（见 _wait_for_proxy_recovery）。
+                        # 直接停批，不等待：交给「号池自动补充」下一轮拉起。
                         exhausted, total_blocked = self._proxy_pool_exhausted_by_blacklist()
                         if exhausted:
                             self._release_account(account, pooled)
-                            paused_out = True
-                            pause_total = total_blocked
-                            pause_outcome = self._wait_for_proxy_recovery(
-                                worker_id, total_blocked
-                            )
-                            break
+                            with self._lock:
+                                self._worker_status.pop(worker_id, None)
+                            self._stop_batch_for_proxy_exhausted(worker_id, total_blocked)
+                            return
                         # 重试时有兜底代理（last_proxy）可复用 → 只需短暂等一小会儿
                         # （万一别的 worker 正好把代理配额还回来了）；否则等满设置值。
                         grace = 5 if (attempt > 1 and last_proxy) else None
@@ -1397,17 +1292,15 @@ class AutoLoopController:
                             return
                         # ── 池子是不是「全被 CF 拦了」？──
                         # 这和「一条代理都没配」是两回事：
-                        #   · 全被拦 → 等黑名单过期（默认 2 分钟）就能再用，暂停批次即可
+                        #   · 全被拦 → 直接停批（不再等 TTL），交给自动补充下一轮拉起
                         #   · 一条都没 → 配置问题，得让用户补代理
                         exhausted, total_usable = self._proxy_pool_exhausted_by_blacklist()
                         if exhausted:
                             self._release_account(account, pooled)
-                            paused_out = True
-                            pause_total = total_usable
-                            pause_outcome = self._wait_for_proxy_recovery(
-                                worker_id, total_usable
-                            )
-                            break
+                            with self._lock:
+                                self._worker_status.pop(worker_id, None)
+                            self._stop_batch_for_proxy_exhausted(worker_id, total_usable)
+                            return
                         stats = db.proxy_pool_stats()
                         by_type = stats.get("by_type") or {}
                         want = {
@@ -1660,18 +1553,6 @@ class AutoLoopController:
             # ── 一遍流程链结束 ──
             with self._lock:
                 self._worker_status.pop(worker_id, None)
-            if paused_out:
-                # 代理全被 CF 拦了：号已放回号池，**不记失败**（不是号的锅）。
-                # ⚠️ 以前是原地等 `_pause_event`（= 必须人工点「继续」），
-                #    黑名单过期了也没人清标志位；而且 paused 会让「号池自动补充」
-                #    一直认为「已在运行」而不拉起 —— 全自动场景直接死锁。
-                #    现在只有三种结局：恢复就继续、用户点了暂停就等、等满就停批。
-                if pause_outcome == "recovered":
-                    continue
-                if pause_outcome == "stopped":
-                    return
-                self._stop_for_proxy_unrecoverable(worker_id, pause_total)
-                return
             if not recorded:
                 self._record_finish(
                     False, chain_category or "unknown",
