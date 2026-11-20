@@ -603,7 +603,7 @@ export function BatchRegisterPanel() {
               </Badge>
               {state === "waiting" ? (
                 <span className="text-xs text-amber-700 dark:text-amber-300">
-                  没有可用邮箱/代理，暂未在注册 —— 补上资源后会自动继续
+                  没有可用邮箱/代理，暂未在注册 —— 补上资源或代理黑名单到期后会自动继续，不用手动操作
                 </span>
               ) : null}
               <span className="text-xs text-muted-foreground">

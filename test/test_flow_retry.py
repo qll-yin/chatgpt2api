@@ -552,20 +552,22 @@ class SuccessThenFailureStillRetriesTests(unittest.TestCase):
              mock.patch.object(register_batch.db, "claim_next", side_effect=fake_claim), \
              mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
              mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
+             mock.patch.object(ctrl, "_proxy_recovery_budget", return_value=0), \
              mock.patch.object(ctrl, "_forward_run_logs", return_value=None):
             thread = threading.Thread(
                 target=ctrl._worker_loop_inner, args=(0, "pool-exhausted"), daemon=True
             )
             thread.start()
             deadline = time.time() + 15
-            while time.time() < deadline and ctrl.status()["state"] != "paused":
+            while time.time() < deadline and ctrl.status()["state"] != "stopped":
                 time.sleep(0.05)
             state = ctrl.status()["state"]
-            # 停掉，否则 worker 会一直等「继续」
             ctrl._stop_event.set()
             thread.join(timeout=5)
 
-        self.assertEqual(state, "paused", "代理全被拦时应暂停批次，而不是继续空转")
+        # ⚠️ 语义变更（用户实测反馈）：等满仍全黑时是 **stopped**，不是 paused。
+        #    paused 会让「号池自动补充」一直认为「已在运行」而不拉起 → 死锁。
+        self.assertEqual(state, "stopped", "等不到代理恢复时应停批，而不是暂停等人工点继续")
         # 成功 1 次 + 第 2 个号失败 1 遍；没有把 3 次重试全跑完
         self.assertEqual(len(emails), 2)
         self.assertEqual(emails[0], "acc1@x.com")
