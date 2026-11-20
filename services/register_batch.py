@@ -21,6 +21,7 @@ from typing import Optional
 
 from services.storage import register_store as db
 from services import register_registrar as registrar
+from services.config import config
 from services.register.mail_providers import MailProviderError, get_provider_class
 
 logger = logging.getLogger("auto_loop")
@@ -170,6 +171,15 @@ class AutoLoopController:
         # 代理池 / 并发数
         self._proxy_pool: list[str] = []
         self._backend_proxy_pool: bool = False
+        # ── 批次级代理黑名单（跨 worker 共享）──
+        # 为什么是**批次级**而不是 worker 级：3 个 worker 各自维护一份的话，
+        # 每个 worker 都会把同一批被 CF 拦死的 IP 重新试一遍 ——
+        # 实测日志里 5 条代理被 3 个 worker 轮流撞，一条 IP 被用了 56 次。
+        # 共享一份后，谁撞到 403，其他人立刻绕开。
+        # value = 过期时刻（time.monotonic），到期自动失效（动态代理粘性窗口过了
+        # 可能已经换了出口，可以再用）。
+        self._proxy_blacklist: dict[str, float] = {}
+        self._proxy_blacklist_lock = threading.Lock()
         self._concurrency: int = 1
         # 目标成功数：0 = 不限量（保持旧行为）；>0 时累计成功达标即自动停止
         self._target_count: int = 0
@@ -210,6 +220,9 @@ class AutoLoopController:
             # 重置
             self._stop_event.clear()
             self._pause_event.clear()
+            # 新批次 → 黑名单清空（上一批的 403 是上一批的代理状态，
+            # 而且 TTL 也是按批次开始的，不该跨批继承）
+            self._clear_proxy_blacklist()
             self._options = dict(options or {})
             # 批次号 —— 一次批量 = 一个批次，下面的每个 run 都带上它，
             # 运行记录就能按「这一轮」归组看日志和邮箱。
@@ -485,6 +498,101 @@ class AutoLoopController:
             self._last_message = msg
         self._broadcast("state", self._snapshot())
 
+    # ─────────────────── 代理黑名单（批次级）───────────────────
+
+    def _mark_proxy_blocked(self, proxy: str, reason: str = "") -> None:
+        """把一条代理拉进本批次黑名单（TTL 见 register_proxy_blacklist_secs）。
+
+        ⚠️ 只对「出口 IP 被判死」的失败调用（CF 403 / 409 invalid_state）。
+        网络抽风、TLS 瞬断不算 —— 那换条 IP 也没用，反而会把好代理也拉黑。
+        """
+        proxy = str(proxy or "").strip()
+        if not proxy:
+            return
+        try:
+            ttl = int(config.register_proxy_blacklist_secs)
+        except Exception:  # noqa: BLE001
+            ttl = 120
+        if ttl <= 0:
+            return
+        until = time.monotonic() + ttl
+        with self._proxy_blacklist_lock:
+            self._proxy_blacklist[proxy] = until
+        logger.info(
+            f"[auto-loop] 代理进入黑名单 {ttl}s（{reason or '出口被拦'}）: {proxy[:60]}"
+        )
+
+    def _blacklisted_proxies(self) -> set[str]:
+        """当前还在黑名单里的代理（顺手清理过期项）。"""
+        now = time.monotonic()
+        with self._proxy_blacklist_lock:
+            expired = [key for key, until in self._proxy_blacklist.items() if until <= now]
+            for key in expired:
+                self._proxy_blacklist.pop(key, None)
+            return set(self._proxy_blacklist)
+
+    def _clear_proxy_blacklist(self) -> None:
+        with self._proxy_blacklist_lock:
+            self._proxy_blacklist.clear()
+
+    def _batch_log_path(self, batch_id: str):
+        from services.register_registrar import LOG_DIR
+
+        return LOG_DIR / f"{str(batch_id or 'batch')}.batch.log"
+
+    def _append_batch_log(self, message: str, level: str = "WARNING") -> None:
+        """把批次级事件追加到「运行记录 → 日志」的最后。
+
+        运行记录是按批次列出的，点「日志」看的是这个批次下所有 run 的日志拼接。
+        run 日志只记单个号的流程，批次级决策（比如「代理全被拦，已暂停」）没有
+        归属的 run —— 单独落一个 `<batch_id>.batch.log`，接口会把它拼在最后。
+        """
+        batch_id = str(self._options.get("batch_id") or "")
+        if not batch_id:
+            return
+        try:
+            from datetime import datetime
+
+            path = self._batch_log_path(batch_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = f"{datetime.now().strftime('%H:%M:%S')} [{level}] auto_loop: {message}\n"
+            with path.open("a", encoding="utf-8") as file:
+                file.write(line)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[auto-loop] 写批次日志失败: {exc}")
+
+    def _proxy_pool_exhausted_by_blacklist(self) -> tuple[bool, int]:
+        """所有「本来能用」的代理是不是都被本批次拉黑了。
+
+        返回 (是否全黑, 同类可用代理总数)。
+        ⚠️ 要区分「全被拦」和「一条都没配」：
+          · 全被拦 → 等 TTL 过期就能再用，暂停批次即可
+          · 一条都没 → 配置问题，得让用户补代理
+        """
+        blocked = self._blacklisted_proxies()
+        if not blocked:
+            return False, 0
+        mode_filter = self._register_proxy_mode_filter()
+        try:
+            remaining = db.count_usable_proxies(exclude=blocked, proxy_type=mode_filter)
+            total = db.count_usable_proxies(proxy_type=mode_filter)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[auto-loop] 统计代理失败（忽略）: {exc}")
+            return False, 0
+        return (remaining == 0 and total > 0), total
+
+    def _pause_for_proxy_exhausted(self, worker_id: int, message: str) -> None:
+        """所有候选代理都被 CF 拦了 → 暂停整批，别继续空转烧邮箱。"""
+        with self._lock:
+            self._pause_event.set()
+            self._state = AutoLoopState.PAUSED
+            self._last_message = message
+            self._worker_status.pop(worker_id, None)
+        self._append_batch_log(message, level="ERROR")
+        self._emit_log(message, level="error")
+        logger.warning(message)
+        self._broadcast("state", self._snapshot())
+
     def _proxy_for_worker(
         self, worker_id: int, exclude: set[str] | None = None
     ) -> str:
@@ -512,10 +620,16 @@ class AutoLoopController:
         后端池为空时回落到旧的文本代理池（按 worker_id 取模，保持老行为）。
         """
         if self._backend_proxy_pool:
+            # 批次级黑名单：谁撞到 CF 403 / 409，其他人立刻绕开它。
+            # strict=True 是必须的 —— 否则 pick_proxy 在「全被排除」时会回退到
+            # 被排除的那条，等于又把刚判死的 IP 挑回来（日志里就是这样循环的）。
+            blocked = self._blacklisted_proxies()
+            merged_exclude = set(exclude or set()) | blocked
             try:
                 picked = db.pick_proxy(
-                    exclude=exclude,
+                    exclude=merged_exclude,
                     proxy_type=self._register_proxy_mode_filter(),
+                    strict=bool(blocked),
                 )
             except Exception as e:  # noqa: BLE001
                 # ⚠️ 取代理时数据库抽风不能让 worker 当场死掉 ——
@@ -702,13 +816,24 @@ class AutoLoopController:
             with self._lock:
                 stale = str(self._options.get("batch_id") or "") != my_batch
                 if not stale:
-                    self._state = AutoLoopState.STOPPED
-                    if not self._finished_at:
-                        self._finished_at = time.time()
-                    self._worker_status.clear()
-                    self._last_message = (
-                        f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
-                    )
+                    if self._pause_event.is_set():
+                        # ⚠️ 因为「暂停」退出的 worker，批次要停在「已暂停」——
+                        #    否则 resume() 只接受 paused，用户点「继续」会被告知
+                        #    「当前 state=stopped，不可恢复」，等于暂停之后只能重开。
+                        #    代理全被 CF 拦时就是暂停 → 等黑名单过期 → 继续，
+                        #    所以这里必须保住 paused。
+                        self._state = AutoLoopState.PAUSED
+                        self._worker_status.clear()
+                        if not self._last_message:
+                            self._last_message = "已暂停"
+                    else:
+                        self._state = AutoLoopState.STOPPED
+                        if not self._finished_at:
+                            self._finished_at = time.time()
+                        self._worker_status.clear()
+                        self._last_message = (
+                            f"已停止（成功 {self._registered_ok} / 失败 {self._registered_fail}）"
+                        )
             if stale:
                 logger.info("[auto-loop] 上一批 manage_loop 收尾（不影响当前批次）")
                 return
@@ -773,6 +898,11 @@ class AutoLoopController:
         """
         if not proxy or not self._backend_proxy_pool:
             return
+        # ── 出口 IP 被判死 → 进本批次黑名单（跨 worker 共享，TTL 到期自动解除）──
+        # 只有「IP 被拦」这类失败才算；network / unknown 换 IP 不一定有用，
+        # 拉黑反而会把好代理浪费掉。
+        if category in ("cf_blocked", "invalid_state"):
+            self._mark_proxy_blocked(proxy, reason=category)
         # 失败不占配额：把 pick_proxy 的预占还回去，只记失败次数。
         if reserved:
             db.proxy_release(proxy)
@@ -1045,6 +1175,9 @@ class AutoLoopController:
             chain_ok = False
             chain_category = ""
             recorded = False
+            # 因为「代理全被 CF 拦」而中止了这一遍：号已放回号池、不该记失败。
+            # 置位后跳出重试链，等用户点「继续」再从外层重新领号。
+            paused_out = False
             run_id = ""
             while True:
                 # 暂停时不开始新的尝试（等恢复）；停止则把号放回号池再退出。
@@ -1073,6 +1206,20 @@ class AutoLoopController:
                     proxy = self._proxy_for_worker(worker_id, exclude=failed_proxies)
                     reserved = bool(proxy)
                     if not proxy:
+                        # ── 池子全被 CF 拦了？立刻暂停，别先干等 120 秒 ──
+                        exhausted, total_blocked = self._proxy_pool_exhausted_by_blacklist()
+                        if exhausted:
+                            ttl = config.register_proxy_blacklist_secs
+                            msg = (
+                                f"代理池里 {total_blocked} 条可用代理全部被 CF 拦截"
+                                f"（403 / 409），已暂停本批次 —— 不要再拿死 IP 烧邮箱了。"
+                                f"黑名单 {ttl} 秒后自动解除（动态代理届时可能已换出口 IP），"
+                                f"也可以补充新代理后点「继续」。"
+                            )
+                            self._release_account(account, pooled)
+                            self._pause_for_proxy_exhausted(worker_id, msg)
+                            paused_out = True
+                            break
                         # 重试时有兜底代理（last_proxy）可复用 → 只需短暂等一小会儿
                         # （万一别的 worker 正好把代理配额还回来了）；否则等满设置值。
                         grace = 5 if (attempt > 1 and last_proxy) else None
@@ -1103,6 +1250,23 @@ class AutoLoopController:
                             self._set_message("已停止")
                             self._broadcast("state", self._snapshot())
                             return
+                        # ── 池子是不是「全被 CF 拦了」？──
+                        # 这和「一条代理都没配」是两回事：
+                        #   · 全被拦 → 等黑名单过期（默认 2 分钟）就能再用，暂停批次即可
+                        #   · 一条都没 → 配置问题，得让用户补代理
+                        exhausted, total_usable = self._proxy_pool_exhausted_by_blacklist()
+                        if exhausted:
+                            ttl = config.register_proxy_blacklist_secs
+                            msg = (
+                                f"代理池里 {total_usable} 条可用代理全部被 CF 拦截"
+                                f"（403 / 409），已暂停本批次 —— 不要再拿死 IP 烧邮箱了。"
+                                f"黑名单 {ttl} 秒后自动解除（动态代理届时可能已换出口 IP），"
+                                f"也可以补充新代理后点「继续」。"
+                            )
+                            self._release_account(account, pooled)
+                            self._pause_for_proxy_exhausted(worker_id, msg)
+                            paused_out = True
+                            break
                         stats = db.proxy_pool_stats()
                         by_type = stats.get("by_type") or {}
                         want = {
@@ -1143,6 +1307,17 @@ class AutoLoopController:
                 run_options = dict(self._options)
                 if proxy:
                     run_options["proxy"] = proxy
+                # 流程内部换代理时也要避开批次黑名单，并把自己撞到的 403 报回来
+                run_options["proxy_blacklist"] = self._blacklisted_proxies()
+                run_options["on_proxy_blocked"] = (
+                    lambda blocked_proxy, reason="": self._mark_proxy_blocked(
+                        blocked_proxy, reason
+                    )
+                )
+                run_options["proxy_blocked_check"] = (
+                    lambda candidate: str(candidate or "").strip()
+                    in self._blacklisted_proxies()
+                )
                 # 记录「这次实际用的代理」—— 流程内如果换了代理，
                 # registrar 会把 holder 更新成新的，最终按它结算配额。
                 proxy_holder = {"proxy": proxy}
@@ -1344,6 +1519,15 @@ class AutoLoopController:
             # ── 一遍流程链结束 ──
             with self._lock:
                 self._worker_status.pop(worker_id, None)
+            if paused_out:
+                # 代理全被 CF 拦了：号已放回号池，**不记失败**（不是号的锅）。
+                # 这里必须原地等「继续」，不能让 worker 直接退出 ——
+                # 退出后 manage 线程不会补人，批次就少一个并发。
+                while self._pause_event.is_set() and not self._stop_event.is_set():
+                    time.sleep(0.5)
+                if self._stop_event.is_set():
+                    return
+                continue
             if not recorded:
                 self._record_finish(
                     False, chain_category or "unknown",
@@ -1470,6 +1654,11 @@ class AutoLoopController:
             #    用户补上号后它会自己继续跑。收敛成 stopped 就等于把
             #    还在等待的批次说成「已结束」，用户会以为白跑了。
             if self._state == AutoLoopState.WAITING:
+                return
+            # ⚠️ 「已暂停」也不收敛 —— 暂停时 worker 会跑完当前号就退出，
+            #    全部退出后如果收敛成 stopped，「继续」按钮就点不了了
+            #    （resume 只接受 paused）。代理全被 CF 拦时就是靠暂停 + 继续恢复的。
+            if self._state == AutoLoopState.PAUSED:
                 return
             self._state = AutoLoopState.STOPPED
             # ⚠️ _finished_at 只在**第一次**结束时设置 —— 后面还有

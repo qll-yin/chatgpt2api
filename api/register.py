@@ -36,6 +36,28 @@ from services import register_service, reauth_service
 from services.storage import register_store as store
 
 
+def _append_batch_level_log(content: str, batch_id: str) -> str:
+    """把「批次级事件」拼到日志最后。
+
+    run 日志只记单个号的流程；批次级决策（比如「代理全被 CF 拦，已暂停」）
+    没有归属的 run，单独写在 `<batch_id>.batch.log`，这里拼在末尾，
+    用户打开「运行记录 → 日志」就能看到停下来的原因。
+    """
+    try:
+        from services.register_registrar import LOG_DIR
+        from pathlib import Path
+
+        path = Path(LOG_DIR) / f"{batch_id}.batch.log"
+        if not path.is_file():
+            return content
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return content
+        return f"{content}\n\n───── 批次日志 ─────\n{text}" if content else text
+    except Exception:  # noqa: BLE001
+        return content
+
+
 class AccessTokensRequest(BaseModel):
     """批量取 access_token 的请求体（批量复制用）。"""
 
@@ -317,7 +339,7 @@ def create_router() -> APIRouter:
         return {
             "batch_id": batch_id,
             "emails": batch.get("emails") or [],
-            "content": "\n".join(chunks),
+            "content": _append_batch_level_log("\n".join(chunks), batch_id),
         }
 
     @router.get("/api/register/registered")

@@ -357,7 +357,11 @@ docker logs -f chatgpt2api
   文件很大时首次打开会慢一次，之后正常。
 - **新增可选配置**（不配就用默认值）：`image_quota_wait_secs`（默认 15）、
   `fail_guard_enabled`（默认关）、`fail_guard_threshold`（默认 20）、
-  `fail_guard_interval_minute`（默认 60）。
+  `fail_guard_interval_minute`（默认 60）、`register_proxy_blacklist_secs`（默认 120）。
+- **注册代理行为有变化（重要）**：被 CF 403 / 409 的代理会进**批次级黑名单**
+  （TTL 默认 120 秒，适配动态住宅代理 3 分钟粘性），所有 worker 一起绕开；
+  当所有可用代理都在黑名单里时，批次会**自动暂停**而不是继续空转重试 ——
+  原因写在「运行记录 → 日志」的最后。补代理或等黑名单过期后点「继续」。
 - **`image_account_concurrency` 的语义变了**：以前只限制「同时在途数」，现在还会
   受剩余额度约束（额度 1 的号同时只接 1 个请求）。日志里看到请求在等号属于正常排队。
 - 回滚到旧版本时，`accounts.data` 仍然保留完整 JSON，旧代码只读 `data` 也能跑；

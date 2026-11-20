@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -496,13 +498,22 @@ class SuccessThenFailureStillRetriesTests(unittest.TestCase):
     def tearDown(self):
         self.store.replace_proxies([], mode="replace")
 
-    def test_one_success_then_failures_runs_full_retry_budget(self):
+    def test_pool_exhausted_pauses_instead_of_burning_retries(self):
+        """1 个号成功 → 第 2 个号 CF 拦 → 池里唯一的代理进黑名单 → 暂停整批。
+
+        ⚠️ 语义变更（用户确认）：代理全被 CF 拦时**不要再空转重试**——
+        同一个 IP 撞 4 遍只是白烧付费邮箱，正确做法是暂停等黑名单过期
+        （或补代理）后点「继续」。
+        """
+        import tempfile
+        from pathlib import Path
+
         ctrl = register_batch.AutoLoopController()
         ctrl._options = {
             "max_retries": 3,
             "cool_down_seconds": 0.01,
             "target_count": 0,
-            "batch_id": "success-then-fail",
+            "batch_id": "pool-exhausted",
             "mail_source": "outlook",
             "auto_import": False,
         }
@@ -523,37 +534,48 @@ class SuccessThenFailureStillRetriesTests(unittest.TestCase):
 
         def fake_start(account, options):
             emails.append(account["email"])
-            if len(emails) >= 8:
-                ctrl._stop_event.set()
             return f"run-{len(emails)}"
 
         def fake_wait(run_id, timeout=1800):
             idx = len(emails) - 1
             if idx == 0:
                 return True, ""           # 第 1 个号成功
-            if idx >= 6:
-                ctrl._stop_event.set()
-                return True, ""
-            return False, "cf_blocked"    # 之后一直 CF 拦
+            return False, "cf_blocked"    # 之后 CF 拦
 
         provider = _FakeProvider()
         provider.pooled = True
+        tmpdir = Path(tempfile.mkdtemp(prefix="pool-exhausted-"))
 
-        with mock.patch.object(register_batch, "get_provider_class", return_value=provider), \
+        with mock.patch("services.register_registrar.LOG_DIR", tmpdir), \
+             mock.patch.object(register_batch, "get_provider_class", return_value=provider), \
              mock.patch.object(register_batch.db, "get_setting", return_value="outlook"), \
              mock.patch.object(register_batch.db, "claim_next", side_effect=fake_claim), \
              mock.patch.object(register_batch.registrar, "start_registration", side_effect=fake_start), \
              mock.patch.object(ctrl, "_wait_run_finish", side_effect=fake_wait), \
              mock.patch.object(ctrl, "_forward_run_logs", return_value=None):
-            ctrl._worker_loop_inner(0, "success-then-fail")
+            thread = threading.Thread(
+                target=ctrl._worker_loop_inner, args=(0, "pool-exhausted"), daemon=True
+            )
+            thread.start()
+            deadline = time.time() + 15
+            while time.time() < deadline and ctrl.status()["state"] != "paused":
+                time.sleep(0.05)
+            state = ctrl.status()["state"]
+            # 停掉，否则 worker 会一直等「继续」
+            ctrl._stop_event.set()
+            thread.join(timeout=5)
 
-        # 1 次成功 + 第 2 个号跑 1 遍 + 重试 3 遍 = 5 个「开始注册」
-        self.assertEqual(len(emails), 5)
+        self.assertEqual(state, "paused", "代理全被拦时应暂停批次，而不是继续空转")
+        # 成功 1 次 + 第 2 个号失败 1 遍；没有把 3 次重试全跑完
+        self.assertEqual(len(emails), 2)
         self.assertEqual(emails[0], "acc1@x.com")
-        self.assertEqual(set(emails[1:]), {"acc2@x.com"})
-        # 池里只剩这一条静态代理 → 不能被停用（否则重试没代理可用）
-        row = self.store.find_proxy("http://static1:1")
-        self.assertTrue(row["enabled"])
+        self.assertEqual(emails[1], "acc2@x.com")
+        # 环境问题不该记成「号失败」
+        self.assertEqual(ctrl._registered_fail, 0)
+        # 批次级原因写进「运行记录 → 日志」
+        log_path = tmpdir / "pool-exhausted.batch.log"
+        self.assertTrue(log_path.is_file())
+        self.assertIn("全部被 CF 拦截", log_path.read_text(encoding="utf-8"))
 
 
 class WorkerVisibilityTests(unittest.TestCase):

@@ -114,6 +114,7 @@ class AuthFlow:
         proxy_rotator: Optional[Callable[[], str]] = None,
         proxy_type: str = "",
         proxy_type_resolver: Optional[Callable[[str], str]] = None,
+        proxy_blocked_check: Optional[Callable[[str], bool]] = None,
     ):
         # 本次流程专属的配置覆盖（WEBUI_ALLOW_LOGIN / OTP_TIMEOUT / OAuth 开关等）。
         # ⚠️ 以前 registrar 是直接写 os.environ 再在 finally 里还原的，
@@ -138,6 +139,10 @@ class AuthFlow:
         # _proxy_is_static() 还在用旧代理的判断，后面的「静态代理别原地重试」
         # 决策就错了。
         self._proxy_type_resolver = proxy_type_resolver
+        # 「这条出口代理是不是已经被本批次判死（CF 403 / 409）」的查询回调。
+        # 有它才能做到：换不到别的代理时**立刻失败**，而不是拿同一条死 IP
+        # 把 warmup 4 次 / signup 3 次重新撞一遍（日志里 77% 的预热都是 403）。
+        self._proxy_blocked_check = proxy_blocked_check
         self._country_code = ""  # IP 地理国家码，check_proxy() 时填充
         self._fingerprint = generate_fingerprint()  # 先生成默认指纹
         self._ua = self._fingerprint["user_agent"]
@@ -1758,6 +1763,15 @@ class AuthFlow:
         """当前代理是不是「固定出口 IP」类型。"""
         return self._proxy_type == "static"
 
+    def _proxy_is_blocked(self) -> bool:
+        """当前出口代理是不是已经被本批次判死（CF 403 / 409）。"""
+        if self._proxy_blocked_check is None:
+            return False
+        try:
+            return bool(self._proxy_blocked_check(str(self.config.proxy or "").strip()))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _rotate_proxy(self, reason: str) -> bool:
         """换一条别的代理（= 换出口 IP）。成功返回 True。
 
@@ -1768,7 +1782,11 @@ class AuthFlow:
         if not self._proxy_rotator:
             return False
         try:
-            new_proxy = str(self._proxy_rotator() or "").strip()
+            try:
+                new_proxy = str(self._proxy_rotator(reason) or "").strip()
+            except TypeError:
+                # 兼容只接受零参的 rotator（老签名 / 测试桩）
+                new_proxy = str(self._proxy_rotator() or "").strip()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"换代理失败（rotator 异常）: {e}")
             return False
@@ -1868,12 +1886,12 @@ class AuthFlow:
                 #    再试 3 次纯属浪费（还会把失败轮次拖长）。
                 time.sleep(3 + attempt * 2)
                 if not self._rotate_proxy(f"warmup 第 {attempt + 1} 次重试"):
-                    if self._proxy_is_static() and self._proxy_rotator:
+                    if (self._proxy_is_static() or self._proxy_is_blocked()) and self._proxy_rotator:
                         logger.error(
-                            "warmup 未种到 oai-did，当前是静态代理（固定出口 IP）"
+                            "warmup 未种到 oai-did，当前出口已被 CF 拦过（或静态代理固定出口）"
                             "且代理池里没有可切换的其它代理 —— 出口 IP 不变，"
                             "再重试也是同一个结果，本轮直接放弃"
-                            "（交给外层流程级重试换代理重跑整个流程）。"
+                            "（交给外层流程级重试换代理 / 暂停批次等黑名单过期）。"
                             "若这条代理其实每次连接都换 IP，请在代理池里把它标记为"
                             "「动态」，那样重建会话仍有机会换到新出口"
                         )
@@ -2009,8 +2027,26 @@ class AuthFlow:
         return csrf
 
     # ── Step 3: 获取 auth URL ──
-    def get_auth_url(self, csrf_token: str, email: str = "") -> str:
-        logger.info("[2/10] 获取 OpenAI 授权地址...")
+    def probe_auth_endpoint(self, csrf_token: str) -> None:
+        """下单付费邮箱前，先确认 auth.openai.com 这条链路是通的。
+
+        ⚠️ 为什么值得多一次请求：
+            warmup 只能证明「chatgpt.com 能过 CF」。auth 域名被拦时，
+            warmup 全绿、邮箱已经付了钱，才在 authorize/continue 撞 409 ——
+            实测一批 12 单里有 10 个付费邮箱是这么白烧的（每个 10 块）。
+            这里先请求一次「获取授权地址」（不消耗邮箱、不创建账号），
+            失败就立刻让这一轮失败 → 外层换代理，邮箱一分钱不花。
+        """
+        try:
+            self.get_auth_url(csrf_token, probe=True)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"下单邮箱前预检 auth 域名失败（{exc}）—— 本轮未消耗邮箱，请换代理重试"
+            ) from exc
+
+    def get_auth_url(self, csrf_token: str, email: str = "", probe: bool = False) -> str:
+        if not probe:
+            logger.info("[2/10] 获取 OpenAI 授权地址...")
         headers = self._common_headers("https://chatgpt.com/auth/login")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         if not self.result.device_id:
@@ -3284,6 +3320,10 @@ class AuthFlow:
         # 登录/注册链路
         csrf_token = self.get_csrf_token()
 
+        # ⚠️ 下单前先探一次 auth 域名 —— 邮箱是花钱的，不能等 warmup 全绿、
+        #    钱付了之后才发现 auth.openai.com 被拦（实测 10/12 个付费邮箱这么烧掉）。
+        self.probe_auth_endpoint(csrf_token)
+
         # ── 下单邮箱 ──
         # ⚠️ 下单放在**第 1 步之后、第 2 步之前**：
         #    第 2 步 get_auth_url 要用 email 拼 login_hint（"预填邮箱"提示），
@@ -3353,12 +3393,12 @@ class AuthFlow:
                 #    而同一个出口 IP 重来大概率还是 invalid_state（实测 3/3 全废）。
                 #    换到别的代理 = 换出口 IP，才有救。
                 if not self._rotate_proxy(f"signup invalid_state 第 {attempt} 次重试"):
-                    if self._proxy_is_static() and self._proxy_rotator:
+                    if (self._proxy_is_static() or self._proxy_is_blocked()) and self._proxy_rotator:
                         raise RuntimeError(
-                            "signup invalid_state（409）：当前是静态代理（固定出口 IP），"
-                            "代理池里也没有可切换的其它代理 —— 出口 IP 不变，"
-                            "在本流程内重试没有意义，本轮放弃（可重试，"
-                            "外层会换代理重跑整个流程）。"
+                            "signup invalid_state（409）：当前出口已被 CF 拦过"
+                            "（或静态代理固定出口），代理池里也没有可切换的其它代理 —— "
+                            "出口 IP 不变，在本流程内重试没有意义，本轮放弃（可重试，"
+                            "外层会换代理重跑整个流程 / 暂停批次等黑名单过期）。"
                             "若这条代理其实每次连接都换 IP，请在代理池里把它标记为"
                             "「动态」"
                         )
@@ -3779,7 +3819,18 @@ class AuthFlow:
             if not (self.result.refresh_token or self.result.access_token):
                 raise RuntimeError("流程完成但未获取 refresh_token/access_token")
         elif not self.result.is_valid():
-            raise RuntimeError("注册完成但未获取有效凭证")
+            # ⚠️ 账号其实已经创建成功了，凭证可能只是「还没落盘」的竞态 ——
+            #    再抓一次 session。不能靠「重新登录」补救：短效邮箱只能收一封邮件，
+            #    那封验证码已经用掉了。抓不到就认亏（号在 OpenAI 已存在，
+            #    邮箱也不能再复用）。
+            logger.warning("注册完成但 session 为空，重试一次获取凭证...")
+            time.sleep(1.5)
+            try:
+                self.get_auth_session()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"重试获取凭证失败: {exc}")
+            if not self.result.is_valid():
+                raise RuntimeError("注册完成但未获取有效凭证")
 
         logger.info("注册流程完成!")
         return self.result

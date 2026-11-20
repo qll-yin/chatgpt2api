@@ -1179,6 +1179,7 @@ def set_proxy_ipv6_status(proxy: str, status: str) -> bool:
 def pick_proxy(
     exclude: Optional[Iterable[str]] = None,
     proxy_type: str = "",
+    strict: bool = False,
 ) -> str:
     """挑一个可用代理：启用中 + 未超配额 + 用得少的优先。
 
@@ -1203,6 +1204,11 @@ def pick_proxy(
        选错了类型宁可取不到（调用方会明确提示），也不能偷偷换类型。
 
     池里没有可用代理时返回空串（调用方负责停下并提示）。
+
+    strict：**严格排除** —— 只挑不在 exclude 里的，一条都没有就返回空串，
+       不再「回头用被排除的那条」。
+       默认 False（老行为：池里只剩一条时回退，避免重试直接卡死）；
+       批次级「代理黑名单」必须用 True，否则被 CF 拦的代理会被反复挑回来。
     """
     now = time.time()
     ex = {str(p or "").strip() for p in (exclude or []) if str(p or "").strip()}
@@ -1235,6 +1241,9 @@ def pick_proxy(
         #    否则池里只有一条代理时，重试会直接没得挑 → worker 等 120 秒后
         #    直接收工（比原来的行为还差）。
         for phase in (0, 1):
+            if phase == 1 and strict:
+                # 严格模式：宁可返回空串（调用方会暂停），也不回头用被排除的
+                break
             for candidate in candidates:
                 if phase == 0 and ex and candidate.proxy in ex:
                     continue
@@ -1254,10 +1263,36 @@ def pick_proxy(
         return ""
 
 
+def count_usable_proxies(
+    exclude: Optional[Iterable[str]] = None,
+    proxy_type: str = "",
+) -> int:
+    """只读统计「还能挑的代理有几条」（不预占配额）。
+
+    用途：判断「池子全被 CF 拦了」还是「本来就一条代理都没有」——
+    前者要暂停批次等黑名单过期/补充代理，后者是配置问题。
+    两者提示完全不同，不能用同一句话打发用户。
+    """
+    ex = {str(p or "").strip() for p in (exclude or []) if str(p or "").strip()}
+    wanted = str(proxy_type or "").strip().lower()
+    with register_session_scope() as session:
+        stmt = (
+            select(func.count())
+            .select_from(ProxyPoolModel)
+            .where(ProxyPoolModel.enabled.is_(True))
+            .where(
+                (ProxyPoolModel.max_uses == 0)
+                | (ProxyPoolModel.used_count < ProxyPoolModel.max_uses)
+            )
+        )
+        if wanted in ("dynamic", "static"):
+            stmt = stmt.where(ProxyPoolModel.proxy_type == wanted)
+        if ex:
+            stmt = stmt.where(~ProxyPoolModel.proxy.in_(list(ex)))
+        return int(session.execute(stmt).scalar_one() or 0)
+
+
 # ─────────────────── 号池绑定（静态代理专用）───────────────────
-#
-# 为什么要跟注册配额分开
-# --------------------
 # 动态代理只用于**注册**过程 —— 出口 IP 每次连接都变，注册时 IP 分散，
 # 正是防风控要的。账号注册完导入号池后要长期使用，IP 不能每次都变，
 # 否则同一账号在多个出口之间跳变反而更容易触发风控。

@@ -408,15 +408,38 @@ def _do_register(
         # 好按正确的对象结算配额（换过代理时，原代理那条是旧的）。
         _proxy_state = options.get("proxy_state")
 
-        def _rotate_proxy() -> str:
+        # ── 批次级代理黑名单 ──
+        # worker 把「本批次已经被 CF 拦过」的代理传进来；这里换代理时必须避开，
+        # 换到新的一条后把旧的报回去（其他 worker 也不用再撞）。
+        _proxy_blacklist: set[str] = {
+            str(item or "").strip()
+            for item in (options.get("proxy_blacklist") or set())
+            if str(item or "").strip()
+        }
+        _on_proxy_blocked = options.get("on_proxy_blocked")
+
+        def _rotate_proxy(reason: str = "") -> str:
             """换一条别的代理（= 换出口 IP）。拿不到就返回空串。"""
             if not _can_rotate:
                 return ""
             cur = str(cfg.proxy or "").strip()
             if not cur:
                 return ""
+            # 当前这条已经判死（warmup 403 / 409）→ 记进批次黑名单，
+            # 别让别的 worker 再去撞同一堵墙。
+            _proxy_blacklist.add(cur)
+            if _on_proxy_blocked is not None:
+                try:
+                    _on_proxy_blocked(cur, reason or "换出口 IP")
+                except Exception:  # noqa: BLE001
+                    pass
             try:
-                new = db.pick_proxy(exclude={cur}, proxy_type=_rotate_type)
+                # strict=True：全被排除时返回空串，而不是回头挑一条已判死的。
+                new = db.pick_proxy(
+                    exclude=_proxy_blacklist,
+                    proxy_type=_rotate_type,
+                    strict=True,
+                )
             except Exception as e:  # noqa: BLE001
                 logging.getLogger("registrar").warning(f"[register] 换代理失败: {e}")
                 return ""
@@ -519,6 +542,7 @@ def _do_register(
             proxy_rotator=_rotate_proxy if _can_rotate else None,
             proxy_type=_proxy_type,
             proxy_type_resolver=_resolve_proxy_type,
+            proxy_blocked_check=options.get("proxy_blocked_check"),
         )
         _emit_status(run_id, "phase", {"phase": "starting", "email": email})
         # 把关键开关的实际生效值打进日志 —— 主人反馈过"关掉 2FA 好像没反应"，

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.6 - 2026-11-20
+
++ [修复] **代理全被 CF 拦时还在空转重试**（用户日志：目标 3、并发 3，11 分钟失败 14 次、白烧 10 个付费邮箱）。根因是 5 条代理全被拦，但每个 worker 仍按「warmup 4 次 × 流程重试 4 遍」撞了 16 次，流程内换代理还只排除「当前那一条」，会换回刚失败过的 IP。
+  · **批次级代理黑名单**：CF 403 / 409 立刻把这条代理拉黑（跨 worker 共享），所有取号和换代理都绕开它；TTL 默认 **120 秒**（适配动态住宅代理 3 分钟粘性会话），可用 `register_proxy_blacklist_secs` 调整。
+  · `pick_proxy(strict=True)`：全被排除时返回空串而不是「回退到被排除的那条」，不会再挑回死 IP。
+  · **代理全被拦 → 自动暂停整批**（不再先干等 120 秒），号放回号池、不记失败；暂停原因写进「运行记录 → 日志」的最后。修掉「暂停后 worker 全部退出，批次被收敛成 stopped，导致『继续』点不了」的老问题。
++ [新增] **下单付费邮箱前预检 auth 域名**：warmup 只能证明 chatgpt.com 通；这里先请求一次「获取授权地址」（不花钱、不消耗邮箱），失败就先换出口 —— 用户这批 12 单里有 10 单是「邮箱付了钱才发现 auth 被拦」。
++ [修复] **「注册完成但未获取凭证」再抓一次**：账号已创建、回调也有，但 `/api/auth/session` 首次返回空（竞态）时直接判失败，等于白烧一个号 + 一个邮箱。现在会隔 1.5 秒再取一次（短效邮箱只能收一封邮件，不能靠重新登录补救），仍失败才放弃。
++ [测试] 新增 `test/test_proxy_blacklist_and_gate.py`（10 例）：黑名单 TTL、跨 worker 传递、strict 排除、池全黑暂停 + 批次日志、下单前预检拦截。原「单代理跑满重试预算」用例按新语义改写为「池全黑 → 暂停」。
+
 ## 1.11.5 - 2026-11-20
 
 + [优化] **`accounts` 表从「`data` 单列 JSON」拆成真列并加索引**：`email` / `type` / `status` / `source_type` / `quota` / `success` / `fail` / `proxy` / `user_id` / `created_at` / `last_used_at` / `restore_at` / `invalid_count` / `default_model_slug` / `export_type` 全部独立成列，冷字段进 `extra`，完整快照仍写一份到 `data`（老数据兜底 + 回滚用）。索引：`access_token`(唯一) / `email` / `status` / `source_type` / `(status, quota)`。补列与补索引发应用启动时自动完成（纯 DDL、幂等）。

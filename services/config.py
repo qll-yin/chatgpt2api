@@ -935,6 +935,20 @@ class ConfigStore:
             return 60
 
     @property
+    def register_proxy_blacklist_secs(self) -> int:
+        """一次 CF 拦截后，这条代理进黑名单多久（秒，默认 120）。
+
+        为什么要 TTL：动态住宅代理通常是「粘性会话」，比如 3 分钟换一次 IP。
+        刚被 CF 403 的那条在粘性窗口内再用还是同一个出口，纯属白撞；
+        等窗口过去，同一个代理 URL 背后可能已经换了出口，可以再用。
+        默认 120 秒（略短于 3 分钟粘性窗口）。
+        """
+        try:
+            return max(0, min(3600, int(self.data.get("register_proxy_blacklist_secs", 120))))
+        except (TypeError, ValueError):
+            return 120
+
+    @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
         if not isinstance(levels, list):
@@ -1020,6 +1034,7 @@ class ConfigStore:
         data["fail_guard_enabled"] = self.fail_guard_enabled
         data["fail_guard_threshold"] = self.fail_guard_threshold
         data["fail_guard_interval_minute"] = self.fail_guard_interval_minute
+        data["register_proxy_blacklist_secs"] = self.register_proxy_blacklist_secs
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
