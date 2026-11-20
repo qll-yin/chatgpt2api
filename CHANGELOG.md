@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.11.5 - 2026-11-20
+
++ [优化] **`accounts` 表从「`data` 单列 JSON」拆成真列并加索引**：`email` / `type` / `status` / `source_type` / `quota` / `success` / `fail` / `proxy` / `user_id` / `created_at` / `last_used_at` / `restore_at` / `invalid_count` / `default_model_slug` / `export_type` 全部独立成列，冷字段进 `extra`，完整快照仍写一份到 `data`（老数据兜底 + 回滚用）。索引：`access_token`(唯一) / `email` / `status` / `source_type` / `(status, quota)`。补列与补索引发应用启动时自动完成（纯 DDL、幂等）。
++ [优化] **单账号变更只写一行**：以前每次生图成功扣额度都会把整个号池重新序列化 + 整表 UPSERT（2000 个号 = 一张图写 2000 行）。现在数据库后端支持单行 upsert，`mark_image_result` / `update_account` 只碰自己那一行；JSON 后端没有这个能力，自动回退到整文件写。
++ [新增] **迁移脚本 `scripts/migrate_accounts_columns.py`**：把老行的 `data` JSON 分批拆进真列，支持 `--dry-run` / `--batch-size`，幂等（只处理 `created_at IS NULL`）。**不跑也不会错** —— 未回填的行读时回退到 `data` 快照。
++ [说明] 拆分**不会**让「刷新账号」变快：那个按钮是逐个账号去上游拉信息（网络耗时），与存储无关。列表页读的是内存副本。真正变快的是「写入」（从 O(N) 降到 O(1)）以及后续可以按状态/额度/邮箱直接 SQL 查询。
++ [测试] 新增 `test/test_account_db_columns.py`（8 例）：真列读写往返、UPSERT 更新列、差集删除、单行保存不影响他人、老库免回填可读、回填幂等、dry-run 不写、索引齐全。
+
 ## 1.11.4 - 2026-11-20
 
 + [新增] **生成失败自动标异常**（系统设置 → 基础设置，默认关闭）：定时巡检每个账号的**累计生成失败次数**，达到阈值（默认 20，可改）就把状态自动改成「异常」，不再参与取号。巡检间隔默认 60 分钟，改完不用重启（每轮重新读配置）。**只改状态、不清额度**，累计失败数也不清零 —— 手动改回「正常」可以继续用，如果还是坏的下一轮会再次被标。另外提供「立即检测一次」入口，不用等定时器。

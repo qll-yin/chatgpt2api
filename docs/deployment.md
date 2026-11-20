@@ -158,9 +158,32 @@ DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
 > **无论 `STORAGE_BACKEND` 是什么都会走数据库** —— `DATABASE_URL` 才是关键那项。
 > 没配 `DATABASE_URL` 时回退到本地 SQLite：`sqlite:////app/data/chatgpt2api.db`。
 
-**账号（号池）**：`STORAGE_BACKEND=postgres` 时账号存在 `accounts` 表里
-（一行一个账号，`data` 列是完整 JSON；只有 `access_token` 建了唯一索引）。
-从 `json` 切到 `postgres` **不会自动导入**，需要跑一次迁移脚本，否则你会看到空号池：
+**账号（号池）**：`STORAGE_BACKEND=postgres` 时账号存在 `accounts` 表里。
+结构已从「`data` 一列存整个 JSON」拆成真列：
+
+| 列 | 说明 |
+| --- | --- |
+| `access_token` | 唯一键 |
+| `email` / `type` / `status` / `source_type` | 建了索引，可直接 SQL 筛选 |
+| `quota` / `success` / `fail` / `invalid_count` | 数值列 |
+| `proxy` / `user_id` / `created_at` / `last_used_at` / `restore_at` / `default_model_slug` / `export_type` | 标量列 |
+| `extra` | 冷字段 JSON（`limits_progress`、各种 refresh 错误时间等） |
+| `data` | 完整 JSON 快照（老数据兜底 + 回滚用，新写入仍会填） |
+
+索引：`access_token` 唯一索引、`email`、`status`、`source_type`、`(status, quota)` 复合索引。
+
+- **补列 / 补索引在应用启动时自动完成**（纯 DDL，幂等，很快）
+- **老数据回填**需要跑一次脚本（几十万行不适合卡在启动流程里）：
+
+```bash
+docker compose exec app python scripts/migrate_accounts_columns.py --dry-run   # 先看会动多少行
+docker compose exec app python scripts/migrate_accounts_columns.py             # 真正回填
+```
+
+脚本幂等（只处理 `created_at IS NULL` 的老行）。**不跑也不会错** —— 未回填的行读的时候
+会回退到 `data` 快照，字段一个不少；回填只是让列和索引可用。
+
+从 `json` 切到 `postgres` 仍需先导数据，否则会看到空号池：
 
 ```bash
 python scripts/migrate_storage.py --from json --to postgres

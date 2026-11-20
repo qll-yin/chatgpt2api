@@ -171,6 +171,23 @@ class AccountService:
         # 账号结构/额度/状态变了 → 候选索引必须失效
         self._invalidate_image_index()
 
+    def _persist_account(self, access_token: str) -> None:
+        """只落盘**一个**账号。
+
+        ⚠️ 为什么需要：`_save_accounts()` 会把整个号池重新序列化 + 整表 UPSERT。
+        生图每次成功都要扣一次额度 —— 号池 2000 个号时，一张图就要写 2000 行。
+        数据库后端支持单行 upsert，就只碰这一行；JSON 后端只能整文件重写，回退。
+        """
+        access_token = self._resolve_access_token_locked(access_token)
+        saver = getattr(self.storage, "save_account", None)
+        if callable(saver):
+            account = self._accounts.get(access_token)
+            if account is not None:
+                saver(account)
+                self._invalidate_image_index()
+                return
+        self._save_accounts()
+
     def _invalidate_image_index(self) -> None:
         """账号有任何变化（增删/改额度/改状态/换 token）时调用。
 
@@ -1468,7 +1485,8 @@ class AccountService:
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            # 单账号变更 → 只写这一行（数据库后端），避免整表重写
+            self._persist_account(access_token)
             # 手动改额度/状态后，等在队列里的请求要立刻重新判断，别傻等满 15 秒
             self._image_slot_condition.notify_all()
             if not quiet:
@@ -1528,7 +1546,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
-                self._save_accounts()
+                self._persist_account(access_token)
             if should_defer:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
@@ -1583,8 +1601,9 @@ class AccountService:
                 self._image_slot_condition.notify_all()
                 return None
             self._accounts[access_token] = account
-            # _save_accounts 内部会让候选索引失效（额度变了）
-            self._save_accounts()
+            # 每张图成功/失败都会走到这里 —— 只写这一行，
+            # 不能把整个号池重新序列化（几千个号时那是一张图写几千行）。
+            self._persist_account(access_token)
             # ⚠️ 额度变化必须唤醒等待者：额度由 1 → 0 时，等在队列里的请求要
             #    立刻醒来发现「没号了」并返回 429，而不是继续傻等到超时上限。
             self._image_slot_condition.notify_all()
