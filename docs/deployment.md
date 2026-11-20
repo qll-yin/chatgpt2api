@@ -166,7 +166,7 @@ DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
 | `access_token` | 唯一键 |
 | `email` / `status` / `source_type` | 建了索引，可直接 SQL 筛选 |
 | `type` | 订阅类型（free / Plus / Pro / Team…） |
-| `quota` / `success` / `fail` / `invalid_count` | 数值列 |
+| `quota` / `success` / `fail` / `invalid_count` | 数值列（`quota` 是「上次刷新快照 − 本地成功次数」，不是实时值，见 [账号额度说明](account-quota.md)） |
 | `proxy` / `user_id` / `created_at` / `last_used_at` / `restore_at` / `default_model_slug` / `export_type` | 标量列 |
 | `extra` | 冷字段 JSON（`limits_progress`、各种 refresh 错误时间等） |
 | `data` | 完整 JSON 快照（老数据兜底 + 回滚用，新写入仍会填） |
