@@ -32,6 +32,7 @@ from services.storage.runtime_models import (
     ImageRecordModel,
     ImageTagModel,
     ImageTaskModel,
+    LogModel,
     create_runtime_tables,
 )
 
@@ -641,3 +642,155 @@ def recover_unfinished_editable_file_tasks() -> int:
             .values(status="error", error="服务已重启，未完成的任务已中断")
         )
         return int(result.rowcount or 0)
+
+
+# ─────────────────────────── 系统日志 ───────────────────────────
+#
+# 日志以前是 data/logs.jsonl（一行一条），日志页每次都要把整个文件读进内存
+# 再倒扫。要按「账号邮箱」查某个号的生成记录时，这个代价尤其明显。
+# 现在落库（运行态库，和图片任务同一套连接），邮箱单独成列并建索引。
+
+
+def _log_values(item: dict[str, Any]) -> dict[str, Any]:
+    from datetime import datetime
+
+    time_text = str(item.get("time") or "")
+    time_ts = item.get("time_ts")
+    if time_ts is None and time_text:
+        try:
+            time_ts = datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            time_ts = None
+    detail = item.get("detail")
+    if detail is None:
+        detail_json = None
+    elif isinstance(detail, str):
+        detail_json = detail
+    else:
+        detail_json = dumps(detail)
+    email = str(item.get("account_email") or "").strip()
+    if not email and isinstance(detail, dict):
+        email = str(detail.get("account_email") or "").strip()
+    return {
+        "id": str(item.get("id") or ""),
+        "time": time_text,
+        "time_ts": time_ts,
+        "type": str(item.get("type") or ""),
+        "summary": str(item.get("summary") or ""),
+        "detail": detail_json,
+        "account_email": email or None,
+    }
+
+
+def _log_from_row(row: Any) -> dict[str, Any]:
+    from datetime import datetime
+
+    time_text = str(getattr(row, "time", "") or "")
+    time_ts = getattr(row, "time_ts", None)
+    if not time_text and time_ts:
+        try:
+            time_text = datetime.fromtimestamp(float(time_ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            time_text = ""
+    return {
+        "id": str(getattr(row, "id", "") or ""),
+        "time": time_text,
+        "type": str(getattr(row, "type", "") or ""),
+        "summary": str(getattr(row, "summary", "") or ""),
+        "detail": loads(getattr(row, "detail", None), {}) or {},
+    }
+
+
+def insert_log(item: dict[str, Any]) -> None:
+    values = _log_values(item)
+    if not values["id"]:
+        return
+    with runtime_session_scope() as session:
+        _upsert(session, LogModel, values, ["id"])
+
+
+def bulk_insert_logs(items: list[dict[str, Any]]) -> int:
+    added = 0
+    if not items:
+        return 0
+    with runtime_session_scope() as session:
+        for item in items:
+            values = _log_values(item)
+            if not values["id"]:
+                continue
+            _upsert(session, LogModel, values, ["id"])
+            added += 1
+    return added
+
+
+def count_logs() -> int:
+    with runtime_session_scope() as session:
+        return int(session.execute(select(func.count()).select_from(LogModel)).scalar_one() or 0)
+
+
+def _log_time_bounds(start_date: str, end_date: str) -> tuple[float | None, float | None]:
+    """把 YYYY-MM-DD 转成时间戳区间（含当天整天）。走 ix_logs_*_ts 索引。"""
+    from datetime import datetime, timedelta
+
+    start_ts: float | None = None
+    end_ts: float | None = None
+    if start_date:
+        try:
+            start_ts = datetime.strptime(start_date, "%Y-%m-%d").timestamp()
+        except ValueError:
+            start_ts = None
+    if end_date:
+        try:
+            end_ts = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).timestamp()
+        except ValueError:
+            end_ts = None
+    return start_ts, end_ts
+
+
+def list_logs(
+    type: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    account_email: str = "",
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """按类型 / 日期区间 / 账号邮箱（模糊）查日志，最新在前。
+
+    ⚠️ 邮箱用的是 `lower(col) LIKE %x%`：
+      · 相等/前缀能吃到 `ix_logs_email_ts`
+      · 任意位置的「包含」在 B-tree 上用不到索引（PG 需要 pg_trgm 才行），
+        但已经比「读整个 JSONL 文件逐行扫」快得多，而且有 limit 兜底。
+    """
+    start_ts, end_ts = _log_time_bounds(start_date, end_date)
+    email = str(account_email or "").strip().lower()
+    with runtime_session_scope() as session:
+        stmt = select(LogModel)
+        if type:
+            stmt = stmt.where(LogModel.type == type)
+        if start_ts is not None:
+            stmt = stmt.where(LogModel.time_ts >= start_ts)
+        if end_ts is not None:
+            stmt = stmt.where(LogModel.time_ts < end_ts)
+        if email:
+            stmt = stmt.where(func.lower(LogModel.account_email).contains(email, autoescape=True))
+        stmt = stmt.order_by(LogModel.time_ts.desc(), LogModel.id.desc()).limit(max(1, int(limit)))
+        return [_log_from_row(row) for row in session.execute(stmt).scalars()]
+
+
+def delete_logs(ids: list[str]) -> int:
+    target = [str(item) for item in (ids or []) if str(item or "").strip()]
+    if not target:
+        return 0
+    with runtime_session_scope() as session:
+        result = session.execute(sa_delete(LogModel).where(LogModel.id.in_(target)))
+        return int(result.rowcount or 0)
+
+
+def export_logs_jsonl() -> bytes:
+    """导出成 logs.jsonl 格式（备份用，恢复端格式不变）。"""
+    with runtime_session_scope() as session:
+        stmt = select(LogModel).order_by(LogModel.time_ts.asc(), LogModel.id.asc())
+        lines = []
+        for row in session.execute(stmt).scalars():
+            lines.append(json.dumps(_log_from_row(row), ensure_ascii=False, separators=(",", ":")))
+    return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")

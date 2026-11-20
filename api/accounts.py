@@ -24,6 +24,7 @@ from api.support import (
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
@@ -329,6 +330,27 @@ def create_router() -> APIRouter:
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.json"'},
         )
+
+    @router.get("/api/accounts/fail-guard")
+    async def get_fail_guard(authorization: str | None = Header(default=None)):
+        """失败巡检的当前配置 + 最近一次结果。"""
+        require_admin(authorization)
+        from services import fail_guard
+
+        return {
+            "enabled": config.fail_guard_enabled,
+            "threshold": config.fail_guard_threshold,
+            "interval_minute": config.fail_guard_interval_minute,
+            "last": fail_guard.last_result(),
+        }
+
+    @router.post("/api/accounts/fail-guard/run")
+    async def run_fail_guard(authorization: str | None = Header(default=None)):
+        """立刻跑一次巡检（不用等定时器），返回本轮标记了哪些号。"""
+        require_admin(authorization)
+        from services import fail_guard
+
+        return await run_in_threadpool(fail_guard.scan_once)
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):

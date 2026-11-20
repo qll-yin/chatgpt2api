@@ -154,9 +154,23 @@ DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
 | `json` | 本地 JSON 文件（账号数据用 `data/accounts.json`） |
 | `git` | Git 私有仓库存储账号数据 |
 
-> ⚠️ 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、注册数据）
+> ⚠️ 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、**系统日志**、注册数据）
 > **无论 `STORAGE_BACKEND` 是什么都会走数据库** —— `DATABASE_URL` 才是关键那项。
 > 没配 `DATABASE_URL` 时回退到本地 SQLite：`sqlite:////app/data/chatgpt2api.db`。
+
+**账号（号池）**：`STORAGE_BACKEND=postgres` 时账号存在 `accounts` 表里
+（一行一个账号，`data` 列是完整 JSON；只有 `access_token` 建了唯一索引）。
+从 `json` 切到 `postgres` **不会自动导入**，需要跑一次迁移脚本，否则你会看到空号池：
+
+```bash
+python scripts/migrate_storage.py --from json --to postgres
+```
+
+**日志**：`logs` 表存日志（`type` / `time_ts` / `account_email` 有索引），
+日志页按账号邮箱筛选走的是 `account_email` 列。老版本留下的 `data/logs.jsonl`
+会在升级后首次访问日志时**自动导入一次**（按 id 去重，可重复执行），导入进度记在
+`data/.logs_db_imported`（已导入字节数）。文件很大时首次打开日志页会慢一次，之后就正常。
+备份归档里仍然叫 `data/logs.jsonl`（从库里导出），恢复端格式不变。
 
 **为什么默认 Postgres 而不是 SQLite**：运行态数据写入非常频繁，SQLite 在高并发写
 + WAL 模式下容易出现 `database is locked`；日均几万张图的量级下 Postgres 明显更稳。

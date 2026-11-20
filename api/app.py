@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from api import accounts, ai, auto_register, image_tasks, register, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
-from services import auto_register_guardian
+from services import auto_register_guardian, fail_guard
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
@@ -29,6 +29,9 @@ def create_app() -> FastAPI:
         # 号池自动补充守护：独立生命周期（不共用 stop_event），
         # 这样配置里关掉再打开后无需重启进程即可恢复。
         auto_register_guardian.start()
+        # 生成失败巡检：累计失败次数达阈值的号自动标异常（默认关闭，
+        # 在系统设置里开启；线程常驻但每轮都会重新读配置）
+        fail_guard.start()
         try:
             yield
         finally:
@@ -37,6 +40,7 @@ def create_app() -> FastAPI:
             cleanup_thread.join(timeout=1)
             backup_service.stop()
             auto_register_guardian.stop()
+            fail_guard.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

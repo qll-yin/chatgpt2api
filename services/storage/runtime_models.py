@@ -168,6 +168,37 @@ class EditableFileTaskModel(RuntimeBase):
     )
 
 
+class LogModel(RuntimeBase):
+    """系统日志（对应旧 data/logs.jsonl 的一行）。
+
+    为什么要拆成真列：日志页要按「类型 + 日期区间 + 账号邮箱」筛选，
+    账号邮箱以前埋在 detail JSON 里，只能把整个文件读进内存逐行扫。
+    拆成列 + 索引后，筛选直接走 SQL。
+
+    - `time` 保留原来 `YYYY-MM-DD HH:MM:SS` 的字符串（前端直接显示）
+    - `time_ts` 是同一时刻的时间戳，用于范围查询/排序（字符串比较慢且依赖格式）
+    - `account_email` 从 detail 里提出来单独存一份，仅用于筛选，detail 保持原样
+    """
+
+    __tablename__ = "logs"
+
+    id = Column(String(64), primary_key=True)
+    time = Column(String(32), nullable=False, default="")
+    time_ts = Column(Float, nullable=True, index=True)
+    type = Column(String(16), nullable=False, default="", index=True)
+    summary = Column(Text, nullable=True, default="")
+    detail = Column(Text, nullable=True)
+    # 调用日志的账号邮箱（账号类日志通常为空）
+    account_email = Column(String(255), nullable=True, index=True)
+
+    __table_args__ = (
+        # 日志页的主查询：WHERE type=? ORDER BY time_ts DESC
+        Index("ix_logs_type_ts", "type", "time_ts"),
+        # 按账号查生成记录：WHERE account_email=? ORDER BY time_ts DESC
+        Index("ix_logs_email_ts", "account_email", "time_ts"),
+    )
+
+
 def create_runtime_tables(engine) -> None:
     """建表 + 建索引 + 补列。幂等，可重复调用。
 

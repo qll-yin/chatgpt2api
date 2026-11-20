@@ -664,7 +664,16 @@ class BackupService:
             if include.get("sub2api"):
                 self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
             if include.get("logs"):
-                self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
+                # 日志已从 logs.jsonl 迁到数据库，备份时从库里导出，
+                # 归档里的路径与格式保持不变（恢复端无需改动）。
+                # 数据库不可用时 export_jsonl_bytes 会回退读老文件。
+                from services.log_service import log_service
+
+                self._add_bytes_to_archive(
+                    archive,
+                    "data/logs.jsonl",
+                    log_service.export_jsonl_bytes(),
+                )
             if include.get("image_tasks"):
                 # 图片任务与图片索引已从 JSON 文件迁到数据库，
                 # 备份时从数据库导出，归档里的路径与格式保持不变（恢复端无需改动）。

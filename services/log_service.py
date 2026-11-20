@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,9 +25,94 @@ INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
 
 
 class LogService:
+    """系统日志。
+
+    ⚠️ 历史上日志写在 `data/logs.jsonl`（一行一条），日志页每次都要把整个
+    文件读进内存、倒着扫到 200 条。想「查某个账号的生成记录」时，邮箱又埋在
+    detail JSON 里，只能逐行反序列化 —— 数据一多就明显变慢。
+
+    现在日志落库（运行态库，和图片任务同一套连接），`account_email` 单独成列
+    并建索引。文件保留两件事：
+      1. **兜底**：数据库不可用时照旧写文件，不丢日志
+      2. **一次性导入**：启动后第一次访问时把老的 logs.jsonl 增量导入（按 id
+         upsert，可重复执行），导入进度记在 `.logs_db_imported`（已导入字节数）
+    """
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_ready = False
+        self._db_retry_at = 0.0
+        self._db_lock = threading.Lock()
+        self._import_marker = self.path.parent / ".logs_db_imported"
+
+    # ── 数据库可用性 ──
+
+    def _ensure_db(self) -> bool:
+        """确保日志表可用（首次调用时建表 + 导入老文件）。失败则降级到文件。"""
+        if self._db_ready:
+            return True
+        now = time.monotonic()
+        if now < self._db_retry_at:
+            return False
+        with self._db_lock:
+            if self._db_ready:
+                return True
+            if time.monotonic() < self._db_retry_at:
+                return False
+            try:
+                from services.storage import runtime_store
+
+                runtime_store.ensure_tables()
+                self._import_legacy_file(runtime_store)
+                self._db_ready = True
+                return True
+            except Exception as exc:  # noqa: BLE001
+                # 数据库还没起来 / 连接串错 → 30 秒内不重试，期间写文件
+                self._db_retry_at = time.monotonic() + 30
+                print(f"[logs] database unavailable, falling back to file: {exc}")
+                return False
+
+    def _read_imported_size(self) -> int:
+        try:
+            return max(0, int(self._import_marker.read_text(encoding="utf-8").strip() or 0))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _import_legacy_file(self, store) -> None:
+        """把 logs.jsonl 里尚未导入的部分灌进数据库（按 id upsert，幂等）。"""
+        if not self.path.exists():
+            return
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        imported = self._read_imported_size()
+        if size <= imported:
+            return
+        items: list[dict[str, Any]] = []
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                file.seek(imported)
+                for offset, raw_line in enumerate(file):
+                    item = self._parse_line(raw_line, imported + offset)
+                    if item is not None:
+                        items.append(item)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[logs] import legacy file failed: {exc}")
+            return
+        if items:
+            try:
+                store.bulk_insert_logs(items)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[logs] import legacy file failed: {exc}")
+                return
+        try:
+            self._import_marker.write_text(str(size), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ── 文件兜底 ──
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -48,6 +134,84 @@ class LogService:
     def _serialize_item(item: dict[str, Any]) -> str:
         return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
+    def _append_file(self, item: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as file:
+            file.write(self._serialize_item(item) + "\n")
+
+    # ── 对外接口 ──
+
+    def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
+        item = {
+            "id": uuid4().hex,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": type,
+            "summary": summary,
+            "detail": detail or data,
+        }
+        if self._ensure_db():
+            try:
+                from services.storage import runtime_store
+
+                runtime_store.insert_log(item)
+                return
+            except Exception as exc:  # noqa: BLE001
+                # 写库失败不能让业务崩，也不能丢日志 → 落文件，30 秒后再试数据库
+                self._db_ready = False
+                self._db_retry_at = time.monotonic() + 30
+                print(f"[logs] insert failed, falling back to file: {exc}")
+        self._append_file(item)
+
+    def list(
+        self,
+        type: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        account_email: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if self._ensure_db():
+            try:
+                from services.storage import runtime_store
+
+                return runtime_store.list_logs(
+                    type=type,
+                    start_date=start_date,
+                    end_date=end_date,
+                    account_email=account_email,
+                    limit=limit,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._db_ready = False
+                self._db_retry_at = time.monotonic() + 30
+                print(f"[logs] query failed, falling back to file: {exc}")
+        return self._list_from_file(type, start_date, end_date, account_email, limit)
+
+    def _list_from_file(
+        self,
+        type: str,
+        start_date: str,
+        end_date: str,
+        account_email: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        email = str(account_email or "").strip().lower()
+        items: list[dict[str, Any]] = []
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        for line_number in range(len(lines) - 1, -1, -1):
+            item = self._parse_line(lines[line_number], line_number)
+            if item is None:
+                continue
+            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+                continue
+            if email and email not in str((item.get("detail") or {}).get("account_email") or "").lower():
+                continue
+            items.append(item)
+            if len(items) >= limit:
+                break
+        return items
+
     @staticmethod
     def _matches_filters(item: dict[str, Any], *, type: str = "", start_date: str = "", end_date: str = "") -> bool:
         t = str(item.get("time") or "")
@@ -60,36 +224,23 @@ class LogService:
             return False
         return True
 
-    def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
-        item = {
-            "id": uuid4().hex,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "type": type,
-            "summary": summary,
-            "detail": detail or data,
-        }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
-
-    def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
-            if len(items) >= limit:
-                break
-        return items
-
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
+        if not target_ids:
+            return {"removed": 0}
+        if self._ensure_db():
+            try:
+                from services.storage import runtime_store
+
+                return {"removed": runtime_store.delete_logs(list(target_ids))}
+            except Exception as exc:  # noqa: BLE001
+                self._db_ready = False
+                self._db_retry_at = time.monotonic() + 30
+                print(f"[logs] delete failed, falling back to file: {exc}")
+        return self._delete_from_file(target_ids)
+
+    def _delete_from_file(self, target_ids: set[str]) -> dict[str, int]:
+        if not self.path.exists():
             return {"removed": 0}
         lines = self.path.read_text(encoding="utf-8").splitlines()
         kept_lines: list[str] = []
@@ -108,6 +259,19 @@ class LogService:
             content += "\n"
         self.path.write_text(content, encoding="utf-8")
         return {"removed": removed}
+
+    def export_jsonl_bytes(self) -> bytes:
+        """导出成 logs.jsonl 格式（备份用，归档里的路径与格式保持不变）。"""
+        if self._ensure_db():
+            try:
+                from services.storage import runtime_store
+
+                return runtime_store.export_logs_jsonl()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[logs] export failed, falling back to file: {exc}")
+        if not self.path.exists():
+            return b""
+        return self.path.read_bytes()
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")

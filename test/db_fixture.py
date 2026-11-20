@@ -66,6 +66,7 @@ def reset_database_state() -> None:
         ImageRecordModel,
         ImageTagModel,
         ImageTaskModel,
+        LogModel,
     )
     from sqlalchemy import delete
 
@@ -74,3 +75,4 @@ def reset_database_state() -> None:
         session.execute(delete(ImageRecordModel))
         session.execute(delete(ImageTagModel))
         session.execute(delete(EditableFileTaskModel))
+        session.execute(delete(LogModel))

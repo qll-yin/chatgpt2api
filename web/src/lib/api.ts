@@ -210,6 +210,10 @@ export type SettingsConfig = {
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
+  /** 累计失败次数达到阈值就自动把账号标「异常」（默认关闭） */
+  fail_guard_enabled?: boolean;
+  fail_guard_threshold?: number | string;
+  fail_guard_interval_minute?: number | string;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   proxy_runtime?: ProxyRuntimeSettings;
@@ -769,11 +773,18 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: {
+  type?: string;
+  start_date?: string;
+  end_date?: string;
+  /** 账号邮箱（模糊包含） */
+  account_email?: string;
+}) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
+  if (filters.account_email) params.set("account_email", filters.account_email);
   return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
 }
 
@@ -782,6 +793,35 @@ export async function deleteSystemLogs(ids: string[]) {
     method: "POST",
     body: { ids },
   });
+}
+
+export type FailGuardMarked = {
+  email: string;
+  fail: number;
+  reason: string;
+};
+
+export type FailGuardStatus = {
+  enabled: boolean;
+  threshold: number;
+  interval_minute: number;
+  last: {
+    checked: number;
+    marked: FailGuardMarked[];
+    threshold: number;
+    ran_at: string;
+  };
+};
+
+export async function fetchFailGuardStatus() {
+  return httpRequest<FailGuardStatus>("/api/accounts/fail-guard");
+}
+
+export async function runFailGuardNow() {
+  return httpRequest<{ checked: number; marked: FailGuardMarked[]; threshold: number; ran_at: string }>(
+    "/api/accounts/fail-guard/run",
+    { method: "POST" },
+  );
 }
 
 export async function fetchUserKeys() {

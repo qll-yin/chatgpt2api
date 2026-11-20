@@ -906,6 +906,34 @@ class ConfigStore:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    # ── 生成失败自动标异常 ──
+    # 号池里有些号额度没用完，但一直生成失败（既浪费调度又拖慢整体）。
+    # 这里按**累计失败次数**（账号的 fail 字段）定时巡检，超过阈值就标成「异常」。
+    # 默认关闭：升级后不会突然把历史失败多的号批量标掉，需要用户手动打开。
+
+    @property
+    def fail_guard_enabled(self) -> bool:
+        value = self.data.get("fail_guard_enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @property
+    def fail_guard_threshold(self) -> int:
+        """累计失败次数达到这个值就标异常（默认 20）。"""
+        try:
+            return max(1, min(100000, int(self.data.get("fail_guard_threshold", 20))))
+        except (TypeError, ValueError):
+            return 20
+
+    @property
+    def fail_guard_interval_minute(self) -> int:
+        """巡检间隔（分钟，默认 60）。"""
+        try:
+            return max(1, min(7 * 24 * 60, int(self.data.get("fail_guard_interval_minute", 60))))
+        except (TypeError, ValueError):
+            return 60
+
     @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
@@ -989,6 +1017,9 @@ class ConfigStore:
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
+        data["fail_guard_enabled"] = self.fail_guard_enabled
+        data["fail_guard_threshold"] = self.fail_guard_threshold
+        data["fail_guard_interval_minute"] = self.fail_guard_interval_minute
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words

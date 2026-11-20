@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
@@ -54,6 +55,8 @@ function LogsContent() {
   const [type, setType] = useState<string>(LogType.Call);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  // 按账号邮箱筛选（模糊包含）：想看某个号的生成记录时用
+  const [accountEmail, setAccountEmail] = useState("");
   const [detailLog, setDetailLog] = useState<SystemLog | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
@@ -77,7 +80,12 @@ function LogsContent() {
   const loadLogs = async () => {
     setIsLoading(true);
     try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const data = await fetchSystemLogs({
+        type,
+        start_date: startDate,
+        end_date: endDate,
+        account_email: accountEmail.trim(),
+      });
       setItems(data.items);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
       setPage(1);
@@ -91,6 +99,7 @@ function LogsContent() {
   const clearFilters = () => {
     setStartDate("");
     setEndDate("");
+    setAccountEmail("");
   };
 
   const openDetail = (item: SystemLog) => {
@@ -132,7 +141,6 @@ function LogsContent() {
   useEffect(() => {
     void loadLogs();
   }, [type, startDate, endDate]);
-
   return (
     <section className="space-y-5">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
@@ -148,6 +156,15 @@ function LogsContent() {
               <SelectItem value={LogType.Account}>账号管理日志</SelectItem>
             </SelectContent>
           </Select>
+          <Input
+            value={accountEmail}
+            onChange={(event) => setAccountEmail(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void loadLogs();
+            }}
+            placeholder="按账号邮箱筛选（模糊）"
+            className="h-10 w-[220px] rounded-xl border-stone-200 bg-white"
+          />
           <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
           <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
             清除筛选条件

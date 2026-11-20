@@ -11,6 +11,7 @@ import { ApiDocsCard } from "./components/api-docs-card";
 import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
+import { FailGuardCard } from "./components/fail-guard-card";
 import { ImportBrowserDialog } from "./components/import-browser-dialog";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
@@ -88,7 +89,10 @@ function SettingsPageContent() {
           </TabsList>
         </div>
         <TabsContent value="basic">
-          <ConfigCard />
+          <div className="space-y-5">
+            <ConfigCard />
+            <FailGuardCard />
+          </div>
         </TabsContent>
         <TabsContent value="proxy">
           <ProxyRuntimeCard />
