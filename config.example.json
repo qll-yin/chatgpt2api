@@ -71,6 +71,7 @@
     }
   },
   "image_account_concurrency": 3,
+  "image_quota_wait_secs": 15,
   "default_image_model": "gpt-image-2",
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,

@@ -768,6 +768,27 @@ class ConfigStore:
             return 3
 
     @property
+    def image_quota_wait_secs(self) -> float:
+        """请求过来时没有「剩余额度 > 在途」的账号，最多排队等多久（秒）。
+
+        账号的额度是「成功一次 -1」，在途期间额度还没扣。所以一个额度只剩 1
+        的号如果同时接两个请求，第二个必然被上游以额度不足拒掉。选号因此要求
+        `剩余额度 > 在途数`。
+
+        没有这样的号时有两种选择：
+          · 立刻返回 429 —— 并发稍高就会误杀（前一个请求几秒后就结束）
+          · 排队等一会儿，等某个在途请求结束再重新判断
+
+        这里就是「等多久」的上限。0 = 不排队（立刻 429）。
+        默认 15 秒：足够覆盖「前一个请求失败/成功立刻让位」，又不至于把客户端
+        和线程池一起拖死。
+        """
+        try:
+            return max(0.0, float(self.data.get("image_quota_wait_secs", 15)))
+        except (TypeError, ValueError):
+            return 15.0
+
+    @property
     def custom_image_models(self) -> list[str]:
         """兼容旧配置；新版本由自动拉取的 image_models_cache 管理模型列表。"""
         return _normalize_custom_image_models(self.data.get("custom_image_models"))
@@ -958,6 +979,7 @@ class ConfigStore:
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_quota_wait_secs"] = self.image_quota_wait_secs
         data["custom_image_models"] = self.custom_image_models
         data["image_models"] = self.image_models
         data["image_models_source"] = self.image_models_source

@@ -86,6 +86,16 @@ class AccountService:
         self._image_inflight: dict[str, int] = {}
         self._image_cooldown_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
+        # ── 候选索引 ──
+        # 每次生图请求都要从「状态正常 + 额度 > 在途 + 不在冷却 + 符合 plan 过滤」
+        # 的账号里挑一个。账号数一多，每请求全表扫就白费了。
+        # 这里缓存「按过滤条件算好的候选 token 元组」：
+        #   · _accounts_rev 每次账号发生变化就 +1（见 _invalidate_image_index）
+        #   · 缓存条目带 rev，rev 不一致才重扫
+        # 在途数变化**不**影响候选集合（在途/额度是选中时逐个判断的），
+        # 所以稳态下每请求就是「取缓存 + 从游标往后找第一个有容量的」。
+        self._accounts_rev = 0
+        self._image_ready_cache: dict[tuple[str, str, tuple[str, ...]], tuple[int, tuple[str, ...]]] = {}
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -158,6 +168,17 @@ class AccountService:
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
+        # 账号结构/额度/状态变了 → 候选索引必须失效
+        self._invalidate_image_index()
+
+    def _invalidate_image_index(self) -> None:
+        """账号有任何变化（增删/改额度/改状态/换 token）时调用。
+
+        只 bump 版本号 + 清缓存，不做全表重算 —— 重算推迟到下一次真正取号时，
+        这样批量改账号（导入/刷新）不会卡在重复扫描上。
+        """
+        self._accounts_rev += 1
+        self._image_ready_cache.clear()
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -1019,6 +1040,65 @@ class AccountService:
                and token not in excluded
         ]
 
+    @staticmethod
+    def _image_ready_cache_key(
+            plan_type: str | None,
+            source_type: str | None,
+            plan_types: set[str] | tuple[str, ...] | None,
+    ) -> tuple[str, str, tuple[str, ...]]:
+        return (
+            str(plan_type or "").strip().lower(),
+            str(source_type or "").strip().lower(),
+            tuple(sorted(str(item or "").strip().lower() for item in (plan_types or ()))),
+        )
+
+    def _image_ready_tokens(
+            self,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> tuple[str, ...]:
+        """按过滤条件返回「基本可用的候选 token」，带版本号缓存。
+
+        ⚠️ 这里**不**过滤在途/冷却 —— 那两项每次取号都在变，缓存它们等于没有缓存。
+        调用方（_acquire_next_candidate_token）会逐个判断容量，dict 查询 O(1)。
+        """
+        key = self._image_ready_cache_key(plan_type, source_type, plan_types)
+        cached = self._image_ready_cache.get(key)
+        if cached is not None and cached[0] == self._accounts_rev:
+            return cached[1]
+        tokens = tuple(self._list_ready_candidate_tokens(None, plan_type, source_type, plan_types))
+        # 不同 plan/source 组合理论上有限，但防御性清一下，避免异常入参把缓存撑爆
+        if len(self._image_ready_cache) > 64:
+            self._image_ready_cache.clear()
+        self._image_ready_cache[key] = (self._accounts_rev, tokens)
+        return tokens
+
+    @staticmethod
+    def _image_slot_capacity(quota: object, max_concurrency: int) -> int:
+        """这个号还能同时接几个在途请求 = min(并发上限, 剩余额度)。
+
+        ⚠️ 额度是「成功一次 -1」，在途期间还没扣。所以额度只剩 1 的号如果同时
+        接 2 个请求，第 2 个必然被上游以额度不足拒掉（用户实测：返回 free 号
+        生图额度不够）。这里把额度也算进容量，等价于「只有 额度 > 在途 才能被选中」。
+        """
+        try:
+            quota_value = int(quota or 0)
+        except (TypeError, ValueError):
+            quota_value = 0
+        return min(max(1, int(max_concurrency)), max(0, quota_value))
+
+    def _image_token_has_slot(self, token: str, max_concurrency: int, now: float) -> bool:
+        if float(self._image_cooldown_until.get(token, 0.0)) > now:
+            return False
+        account = self._accounts.get(token)
+        if account is None:
+            return False
+        capacity = self._image_slot_capacity(account.get("quota"), max_concurrency)
+        if capacity <= 0:
+            return False
+        return int(self._image_inflight.get(token, 0)) < capacity
+
     def _list_available_candidate_tokens(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1028,12 +1108,25 @@ class AccountService:
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         now = time.monotonic()
+        excluded = set(excluded_tokens or set())
         return [
             token
-            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < max_concurrency
-               and float(self._image_cooldown_until.get(token, 0.0)) <= now
+            for token in self._image_ready_tokens(plan_type, source_type, plan_types)
+            if token not in excluded and self._image_token_has_slot(token, max_concurrency, now)
         ]
+
+    @staticmethod
+    def _no_image_quota_error(
+            plan_type: str | None = None,
+            source_type: str | None = None,
+    ) -> RuntimeError:
+        # ⚠️ 文案里必须同时出现 "no available" 和 "image quota"：
+        #    log_service 靠这两个子串映射成 429 insufficient_quota，改文案会变成 502。
+        message = (
+            f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
+            if plan_type or source_type else "no available image quota"
+        )
+        return RuntimeError(message)
 
     def _acquire_next_candidate_token(
             self,
@@ -1042,20 +1135,41 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        wait_secs = float(config.image_quota_wait_secs or 0.0)
+        excluded = set(excluded_tokens or set())
+        deadline = time.monotonic() + wait_secs if wait_secs > 0 else 0.0
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
-                    raise RuntimeError(
-                        f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
-                        if plan_type or source_type else "no available image quota"
-                    )
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-                if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
-                    self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
-                    return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                tokens = self._image_ready_tokens(plan_type, source_type, plan_types)
+                if not tokens:
+                    # 池子里根本没有（可用的）账号 —— 等也没用，直接判没额度
+                    raise self._no_image_quota_error(plan_type, source_type)
+                now = time.monotonic()
+                start = self._index
+                has_eligible = False
+                for offset in range(len(tokens)):
+                    token = tokens[(start + offset) % len(tokens)]
+                    if token in excluded:
+                        continue
+                    has_eligible = True
+                    if not self._image_token_has_slot(token, max_concurrency, now):
+                        continue
+                    # 游标越过刚选中的这个，下一次从它后面开始（负载均衡）
+                    self._index = (start + offset + 1) % len(tokens)
+                    self._image_inflight[token] = int(self._image_inflight.get(token, 0)) + 1
+                    return token
+                if not has_eligible:
+                    # 所有候选都被本请求排除过了（已经挨个试过）→ 等也不会变
+                    raise self._no_image_quota_error(plan_type, source_type)
+                # 有账号但都满了（在途吃满额度 / 并发上限 / 冷却中）：
+                # 等某个在途请求结束再重新判断，超过等待上限就明确判没额度。
+                if not deadline:
+                    raise self._no_image_quota_error(plan_type, source_type)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._no_image_quota_error(plan_type, source_type)
+                self._image_slot_condition.wait(timeout=min(1.0, remaining))
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -1074,14 +1188,17 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
+
+        excluded_tokens：本次请求里已经试过/已经超时的号，优先避开。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = {str(t or "") for t in (excluded_tokens or set()) if t}
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1352,6 +1469,8 @@ class AccountService:
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
+            # 手动改额度/状态后，等在队列里的请求要立刻重新判断，别傻等满 15 秒
+            self._image_slot_condition.notify_all()
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
@@ -1460,9 +1579,15 @@ class AccountService:
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                # 额度/状态变了 → 唤醒等在「没号可用」上的请求重新判断
+                self._image_slot_condition.notify_all()
                 return None
             self._accounts[access_token] = account
+            # _save_accounts 内部会让候选索引失效（额度变了）
             self._save_accounts()
+            # ⚠️ 额度变化必须唤醒等待者：额度由 1 → 0 时，等在队列里的请求要
+            #    立刻醒来发现「没号了」并返回 429，而不是继续傻等到超时上限。
+            self._image_slot_condition.notify_all()
             return dict(account)
         return None
 

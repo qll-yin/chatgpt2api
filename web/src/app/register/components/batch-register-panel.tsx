@@ -132,7 +132,12 @@ export function BatchRegisterPanel() {
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logIdRef = useRef(0);
-  const logEndRef = useRef<HTMLDivElement | null>(null);
+  // ⚠️ 日志滚动必须只滚日志块本身。
+  //    以前用 logEndRef.scrollIntoView()，它会滚动**所有祖先容器（含 window）**，
+  //    所以只要一进注册管理页、日志有输出，整个浏览器窗口就被拉到日志区。
+  const logBoxRef = useRef<HTMLDivElement | null>(null);
+  // 用户是否还「贴在底部」：主动往上翻看历史时不要把他拽回底部
+  const logStickRef = useRef(true);
 
   const selectedProvider = providers.find((p) => p.kind === mailSource) ?? null;
 
@@ -306,10 +311,19 @@ export function BatchRegisterPanel() {
     return unsubscribe;
   }, [pushLog]);
 
-  // 日志滚动到底
+  // 日志滚动到底（只滚日志块内部，不动页面/浏览器窗口）
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const box = logBoxRef.current;
+    if (!box || !logStickRef.current) return;
+    box.scrollTop = box.scrollHeight;
   }, [logs]);
+
+  // 记录用户是否贴在底部：往上翻看历史时暂停自动滚动
+  const handleLogScroll = () => {
+    const box = logBoxRef.current;
+    if (!box) return;
+    logStickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  };
 
   const handleStart = async () => {
     setBusy(true);
@@ -332,6 +346,7 @@ export function BatchRegisterPanel() {
         // ⚠️ 不能用 `|| 3` —— 那会把「0 = 不重试」覆盖掉。
         max_retries: Math.max(0, Math.min(20, Number(maxRetries) || 0)),
       });
+      logStickRef.current = true;
       setLogs([]);
       toast.success("批量注册已启动");
     } catch (error) {
@@ -674,7 +689,10 @@ export function BatchRegisterPanel() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => setLogs([])}
+            onClick={() => {
+              logStickRef.current = true;
+              setLogs([]);
+            }}
             disabled={logs.length === 0}
           >
             <Eraser className="size-4" />
@@ -682,7 +700,11 @@ export function BatchRegisterPanel() {
           </Button>
         </CardHeader>
         <CardContent className="flex-1 overflow-hidden">
-          <div className="h-[calc(100vh-300px)] min-h-[440px] overflow-y-auto rounded-2xl bg-stone-950 p-4 font-mono text-xs leading-relaxed text-stone-200">
+          <div
+            ref={logBoxRef}
+            onScroll={handleLogScroll}
+            className="h-[calc(100vh-300px)] min-h-[440px] overflow-y-auto rounded-2xl bg-stone-950 p-4 font-mono text-xs leading-relaxed text-stone-200"
+          >
             {logs.length === 0 ? (
               <div className="text-stone-500">暂无日志。点击「开始」启动批量注册。</div>
             ) : (
@@ -703,7 +725,6 @@ export function BatchRegisterPanel() {
                 </div>
               ))
             )}
-            <div ref={logEndRef} />
           </div>
         </CardContent>
       </Card>

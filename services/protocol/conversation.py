@@ -72,8 +72,42 @@ class ImageGenerationError(Exception):
         return error_dict
 
 
+# 生图超时对外的统一文案。
+# ⚠️ 这是给终端用户看的，不能带内部细节（已等待多少秒、去改哪个配置项、
+#    账号是否被限流）—— 这些只写服务端日志。状态码仍为 502。
+IMAGE_TIMEOUT_MESSAGE = "Image generation timed out, please try again"
+
+# 生图超时的文案特征。
+# ⚠️ 有几种路径会把异常包成 ImageGenerationError 或直接转成字符串，
+#    那时类型信息已经丢了，只能靠文案兜底。
+_IMAGE_TIMEOUT_HINTS = (
+    "生图超时",
+    "图片生成流已超过硬上限",
+    "image poll timeout",
+    "image stream hard timeout",
+    "image generation timed out",
+)
+
+
+def is_image_timeout_error(exc: object) -> bool:
+    """这个异常/文案是不是「生图超时」。
+
+    ⚠️ 只用于生图链路。文件下载超时（"ChatGPT 文件下载超时"）**不算** ——
+    那是另一类问题，文案保留原样。
+    """
+    if isinstance(exc, (ImagePollTimeoutError, ImageStreamHardTimeoutError)):
+        return True
+    text = str(exc or "")
+    if not text:
+        return False
+    lower = text.lower()
+    return any(hint in text or hint in lower for hint in _IMAGE_TIMEOUT_HINTS)
+
+
 def public_image_error_message(message: str) -> str:
     text = str(message or "").strip()
+    if is_image_timeout_error(text):
+        return IMAGE_TIMEOUT_MESSAGE
     lower = text.lower()
     if any(item in lower for item in ("backend-api/", "status=", "body=", "chatgpt.com", "upstreamhttperror")):
         return "The image generation request failed. Please try again later."
@@ -1826,6 +1860,8 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     concurrency_retry_count = 0
+    # 本次请求已经用过的账号（超出额度的、或超时后换号重试时避开它们）
+    tried_tokens: set[str] = set()
     account_email = ""
     # 动图是逐帧生成，沿用静态图的 120 秒会在最后一帧前被掐断。
     image_timeout_secs = float(config.image_poll_timeout_secs)
@@ -1846,13 +1882,30 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
-            token = account_service.get_available_access_token(
-                plan_type=plan_type,
-                source_type="codex" if codex_model else None,
-                plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-            )
+            pick_kwargs = {
+                "plan_type": plan_type,
+                "source_type": "codex" if codex_model else None,
+                "plan_types": ("plus", "team", "pro") if codex_model and not plan_type else None,
+            }
+            try:
+                token = account_service.get_available_access_token(
+                    excluded_tokens=set(tried_tokens),
+                    **pick_kwargs,
+                )
+            except RuntimeError:
+                # ⚠️ 排除到「一个号都不剩」时（池里只有一两个号），不能当成
+                #    「没额度」报给用户 —— 宁可重试刚超时那个号。
+                #    清空排除再取一次；还是拿不到才是真的没号/没额度。
+                if not tried_tokens:
+                    raise
+                tried_tokens.clear()
+                token = account_service.get_available_access_token(**pick_kwargs)
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
+
+        # 记住试过的号：超时/失败后重试时避开它（否则会反复挑回同一个号，
+        # 把剩下的时间全烧在同一个出口上）
+        tried_tokens.add(token)
 
         emitted_for_token = False
         returned_message = False

@@ -180,10 +180,32 @@ def _request_excerpt(text: object, limit: int = 1000) -> str:
 
 
 def _image_error_response(exc: Exception) -> JSONResponse:
-    from services.protocol.conversation import public_image_error_message
+    from services.protocol.conversation import (
+        IMAGE_TIMEOUT_MESSAGE,
+        is_image_timeout_error,
+        public_image_error_message,
+    )
+
+    # 生图超时：状态码仍是 502，但对外只说一句「超时了，请重试」。
+    # ⚠️ 秒数、config 提示、账号是否被限流都属于内部细节，只写服务端日志。
+    if is_image_timeout_error(exc):
+        return openai_error_response(
+            {
+                "error": {
+                    "message": IMAGE_TIMEOUT_MESSAGE,
+                    "type": "server_error",
+                    "param": None,
+                    "code": "image_timeout",
+                }
+            },
+            502,
+        )
 
     message = public_image_error_message(str(exc))
-    if "no available image quota" in message.lower():
+    # ⚠️ 不能只匹配 "no available image quota"：带 plan 的文案是
+    #    "no available plus image quota"，那样会漏判、变成 502。
+    _lower_message = message.lower()
+    if "no available" in _lower_message and "image quota" in _lower_message:
         return openai_error_response(
             {
                 "error": {
