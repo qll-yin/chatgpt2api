@@ -164,7 +164,8 @@ DATABASE_URL=postgresql://chatgpt2api:chatgpt2api@db:5432/chatgpt2api
 | 列 | 说明 |
 | --- | --- |
 | `access_token` | 唯一键 |
-| `email` / `type` / `status` / `source_type` | 建了索引，可直接 SQL 筛选 |
+| `email` / `status` / `source_type` | 建了索引，可直接 SQL 筛选 |
+| `type` | 订阅类型（free / Plus / Pro / Team…） |
 | `quota` / `success` / `fail` / `invalid_count` | 数值列 |
 | `proxy` / `user_id` / `created_at` / `last_used_at` / `restore_at` / `default_model_slug` / `export_type` | 标量列 |
 | `extra` | 冷字段 JSON（`limits_progress`、各种 refresh 错误时间等） |
@@ -342,16 +343,25 @@ docker logs -f chatgpt2api
 
 ### 本次升级的注意事项
 
-- **需要重新构建镜像**：新增了 `boto3` 依赖（Cloudflare R2 / S3 存储），
-  `uv.lock` 已更新。`docker compose up -d --build` 会自动装上。
-- **`image_storage` 配置结构变了，但老配置不用改**：
-  - `mode` 从 `local / webdav / both` 改成 `local / remote / both`
-  - 新增 `provider`（`webdav` / `s3`）表示远端协议
-  - `webdav_root_path` 改名为 `remote_root_path`（两个协议共用）
-  - 后端读取时会自动把老结构映射成新结构，**已有的 WebDAV 配置照常生效**
-- **图片索引表会自动补列**：数据库启动时自动给 `image_records` 加远端相关字段并
-  迁移老数据，不需要手工执行 SQL。
-- 如果升级前用的是 WebDAV，升级后远端存储类型默认仍保持 WebDAV，不受影响。
+- **需要重新构建镜像**（代码有改动）：`docker compose up -d --build`。
+- **`accounts` 表会在启动时自动补列 + 补索引**（纯 DDL、幂等、不影响现有数据）。
+  老行的 `data` JSON 需要回填到新列才用得上索引，跑一次脚本即可（可不跑，不影响使用）：
+
+  ```bash
+  docker compose exec app python scripts/migrate_accounts_columns.py --dry-run
+  docker compose exec app python scripts/migrate_accounts_columns.py
+  ```
+
+- **系统日志改为存数据库**（`logs` 表会自动创建）。老的 `data/logs.jsonl` 会在
+  首次打开日志页时自动导入一次，导入进度记在 `data/.logs_db_imported`。
+  文件很大时首次打开会慢一次，之后正常。
+- **新增可选配置**（不配就用默认值）：`image_quota_wait_secs`（默认 15）、
+  `fail_guard_enabled`（默认关）、`fail_guard_threshold`（默认 20）、
+  `fail_guard_interval_minute`（默认 60）。
+- **`image_account_concurrency` 的语义变了**：以前只限制「同时在途数」，现在还会
+  受剩余额度约束（额度 1 的号同时只接 1 个请求）。日志里看到请求在等号属于正常排队。
+- 回滚到旧版本时，`accounts.data` 仍然保留完整 JSON，旧代码只读 `data` 也能跑；
+  `logs` 表旧版本不会读（日志页会退回读 `data/logs.jsonl`，那份文件仍在）。
 
 ## 升级：源码运行
 
@@ -423,6 +433,19 @@ docker compose restart
 
 ```bash
 docker image prune
+```
+
+账号表拆列回填（幂等，可反复跑；先 `--dry-run` 看行数）：
+
+```bash
+docker compose exec app python scripts/migrate_accounts_columns.py --dry-run
+docker compose exec app python scripts/migrate_accounts_columns.py
+```
+
+存储后端之间搬账号（例如 `json` → `postgres`）：
+
+```bash
+docker compose exec app python scripts/migrate_storage.py --from json --to postgres
 ```
 
 不要直接删除 `data/`、`config.json`、`.env`，除非已经确认有可用备份。

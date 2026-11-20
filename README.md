@@ -124,13 +124,35 @@ bun install && bun run build
 
 支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
 
-- `postgres` - 外部 PostgreSQL / 内置 Postgres 容器（**默认**）
+- `postgres` - 外部 PostgreSQL / 内置 Postgres 容器（**compose 默认**）
 - `sqlite` - 本地 SQLite 数据库
-- `json` - 本地 JSON 文件
+- `json` - 本地 JSON 文件（直接跑代码且未设置该变量时的回退值）
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
 
-> 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、注册数据）
+> 运行态数据（生图任务状态、图片索引、标签、可编辑文件任务、**系统日志**、注册数据）
 > **无论 `STORAGE_BACKEND` 是什么都会走数据库** —— 所以 `DATABASE_URL` 才是关键那项。
+
+各类数据实际存在哪：
+
+| 数据 | 位置 | 说明 |
+| --- | --- | --- |
+| 账号（号池） / 鉴权密钥 | 由 `STORAGE_BACKEND` 决定 | `postgres`/`sqlite` → `accounts`、`auth_keys` 表；`json` → `data/accounts.json`、`data/auth_keys.json` |
+| 生图任务 / 图片索引 / 标签 / 可编辑文件任务 | 固定数据库 | 与 `STORAGE_BACKEND` 无关 |
+| 系统日志 | 固定数据库 | `logs` 表（`type` / `time_ts` / `account_email` 有索引）；老 `data/logs.jsonl` 首次访问时自动导入一次 |
+| 注册管理数据 | 固定数据库 | 注册批次 / 注册结果 / 代理池 / 邮箱池 / Remail 订单 |
+
+**`accounts` 表结构**：热字段已从 `data` 单列 JSON 拆成真列（`email` / `type` / `status` /
+`quota` / `success` / `fail` / `source_type` / `proxy` / `user_id` / `created_at` /
+`last_used_at` / `restore_at` 等）并建立索引；冷字段放 `extra`，完整快照仍保留在 `data`
+（老数据兜底 + 回滚用）。升级后启动会**自动补列 + 补索引**（纯 DDL、幂等）；
+老数据回填跑一次脚本即可（不跑也不会错，未回填的行读时会回退到 `data` 快照）：
+
+```bash
+python scripts/migrate_accounts_columns.py --dry-run   # 先看会动多少行
+python scripts/migrate_accounts_columns.py             # 真正回填
+```
+
+详见 [docs/deployment.md](docs/deployment.md)。
 
 示例：改用外部 PostgreSQL
 
@@ -175,6 +197,8 @@ environment:
 - 支持服务端缓存图片URL
 - 图片生成进度追踪，超时后可继续等待
 - 图片懒加载与滚动位置记忆，优化大量图片场景性能
+- **选号按「剩余额度 > 在途请求」分配**：额度只剩 1 的号不会被两个请求同时占用（以前第 2 个请求必然被上游拒成「额度不足」）。没有这样的账号时请求先排队，由 `image_quota_wait_secs`（默认 15 秒，0 = 不排队）决定最多等多久，超时才返回 `429 insufficient_quota`
+- **生图超时的对外提示**：状态码仍为 `502`，message 统一为 `Image generation timed out, please try again`，不再把「已等待多少秒」「去改哪个配置」这类内部细节返回给用户（仍写服务端日志）
 
 ### 图片存储：Cloudflare R2 / S3 兼容
 
